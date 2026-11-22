@@ -98,7 +98,9 @@ type adoptWorld struct {
 	all                              []Project
 	term                             map[int]claudecode.TermEnv
 	panes                            map[string][3]string
-	windowPanes                      map[string]int // by window id; 1 when absent
+	windowPanes                      map[string]int   // by window id; 1 when absent
+	notFg                            map[string]bool  // tmux windows whose pane's foreground is another job
+	paneErr                          map[string]error // tmux windows whose pane's foreground cannot be read
 	agterm                           *adoptTerm
 	untrusted                        map[string]bool
 	logged                           []route.Record
@@ -230,6 +232,9 @@ func (w *adoptWorld) deps() AdoptDeps {
 				return n, nil
 			}
 			return 1, nil
+		},
+		PaneRuns: func(_ context.Context, wid string, _ int) (bool, error) {
+			return !w.notFg[wid] && w.paneErr[wid] == nil, w.paneErr[wid]
 		},
 		TermOf: func(pid int) (claudecode.TermEnv, error) { return w.term[pid], nil },
 		Live: func() (map[string]claudecode.LiveSession, error) {
@@ -502,13 +507,13 @@ func TestRenderCandidatesTabColumn(t *testing.T) {
 		{Launcher: "agterm", ID: "s-1", Name: "Shop - CC", Foreground: "claude --resume " + c.SessionID},
 		{Launcher: "agterm", ID: "s-2", Name: "notes", Foreground: "vim"},
 	}}}
-	termOf := func(pid int) (claudecode.TermEnv, error) {
+	termOf := func(_ context.Context, pid int) (claudecode.TermEnv, error) {
 		if pid == c.PID {
 			return claudecode.TermEnv{AgtermSession: "s-1"}, nil
 		}
 		return claudecode.TermEnv{AgtermSession: "s-2"}, nil // inherited: not this session's tab
 	}
-	LabelTabs(cands, wss, termOf)
+	LabelTabs(context.Background(), cands, wss, termOf)
 	if cands[0].Tab != "Shop v2 / Shop - CC" {
 		t.Fatalf("tab = %q", cands[0].Tab)
 	}

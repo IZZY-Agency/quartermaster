@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"context"
 	"errors"
 	"testing"
 )
@@ -36,7 +37,7 @@ func TestTermEnvOfBySystem(t *testing.T) {
 		}
 		return []byte("AGTERM_SESSION_ID=lin\x00"), nil
 	}
-	psEnv = func(pid int) (string, error) {
+	psEnv = func(_ context.Context, pid int) (string, error) {
 		if pid != 42 {
 			return "", errors.New("wrong pid")
 		}

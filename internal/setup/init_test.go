@@ -446,6 +446,151 @@ func TestWrapQuotesQMPathWithSpace(t *testing.T) {
 	}
 }
 
+// A status line wrapped by another qm (an earlier install) is repointed to
+// this qm, and the undo still puts back the command from before the first init.
+func TestInitRepointsStatusLineOfAnotherQM(t *testing.T) {
+	settings := env(t)
+	dir := t.TempDir()
+	oldExe, newExe := filepath.Join(dir, "old", "qm"), filepath.Join(dir, "new", "qm")
+	executable = func() (string, error) { return oldExe, nil }
+	writeFile(t, settings, `{"statusLine":{"type":"command","command":"mine --x"}}`)
+	run := func(undo bool) string {
+		var out bytes.Buffer
+		st := Streams{In: strings.NewReader(""), Out: &out}
+		var err error
+		if undo {
+			err = Undo(context.Background(), st, Options{Yes: true, SettingsPath: settings})
+		} else {
+			err = Init(context.Background(), st, Options{Yes: true, SettingsPath: settings})
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	command := func() string {
+		b, err := os.ReadFile(settings)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd, _ := statusLineCommand(b)
+		return cmd
+	}
+	run(false)
+	if want := oldExe + " statusline -- 'mine --x'"; command() != want {
+		t.Fatalf("first init wrote %q, want %q", command(), want)
+	}
+	executable = func() (string, error) { return newExe, nil }
+	out := run(false)
+	if want := newExe + " statusline -- 'mine --x'"; command() != want {
+		t.Fatalf("second init left %q, want %q\n%s", command(), want, out)
+	}
+	if out = run(false); !strings.Contains(out, "already runs qm statusline") {
+		t.Errorf("third init does not say the status line is already wrapped:\n%s", out)
+	}
+	run(true)
+	if command() != "mine --x" {
+		t.Errorf("undo left %q, want the command from before the first init", command())
+	}
+}
+
+// Repointing keeps the first init's backup as the record's reference, gives
+// the extra backup a name of its own (even within the same second), and the
+// undo puts back the original bytes, an explicit statusLine null included.
+func TestRepointKeepsFirstBackupAndUndoRestoresOriginalBytes(t *testing.T) {
+	settings := env(t)
+	dir := t.TempDir()
+	exeA, exeB := filepath.Join(dir, "a", "qm"), filepath.Join(dir, "b", "qm")
+	original := "{\n  \"statusLine\": null,\n  \"theme\": \"dark\"\n}\n"
+	writeFile(t, settings, original)
+	old := backupStamp
+	backupStamp = func() int64 { return 1_800_000_000 } // every backup in the same second
+	t.Cleanup(func() { backupStamp = old })
+	init := func(exe string) {
+		t.Helper()
+		executable = func() (string, error) { return exe, nil }
+		if err := Init(context.Background(), Streams{In: strings.NewReader(""), Out: &bytes.Buffer{}}, Options{Yes: true, SettingsPath: settings}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	init(exeA)
+	rec, _ := readRecord()
+	first := rec.SettingsBackup
+	init(exeB)
+	rec, _ = readRecord()
+	if rec.SettingsBackup != first {
+		t.Fatalf("repoint replaced the backup reference %q with %q", first, rec.SettingsBackup)
+	}
+	if b, err := os.ReadFile(first); err != nil || string(b) != original {
+		t.Fatalf("first backup %q: %q, %v", first, b, err)
+	}
+	if all := backups(t, settings); len(all) != 2 {
+		t.Fatalf("backups %v, want the first and one more under its own name", all)
+	}
+	// Undone by yet another qm: the wrapper names exeB, not this one.
+	executable = func() (string, error) { return filepath.Join(dir, "c", "qm"), nil }
+	if err := Undo(context.Background(), Streams{In: strings.NewReader(""), Out: &bytes.Buffer{}}, Options{Yes: true, SettingsPath: settings}); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(settings); string(b) != original {
+		t.Fatalf("undo left %q, want the original bytes %q", b, original)
+	}
+}
+
+func TestRepointStatusLineLeavesOthersAlone(t *testing.T) {
+	env(t)
+	executable = func() (string, error) { return "/opt/x/bin/qm", nil }
+	for _, cmd := range []string{"mine", "qm statusline -- 'mine'", "/opt/x/bin/qm statusline -- 'mine'", "/a/qmx statusline"} {
+		in := []byte(`{"statusLine":{"command":` + jsonString(cmd) + `}}`)
+		if _, _, changed := RepointStatusLine(in); changed {
+			t.Errorf("%q was repointed", cmd)
+		}
+	}
+	in := []byte(`{"statusLine":{"command":"'/old dir/qm' statusline"}}`)
+	got, _, changed := RepointStatusLine(in)
+	if want := `{"statusLine":{"command":"/opt/x/bin/qm statusline"}}`; !changed || string(got) != want {
+		t.Errorf("got %s (changed %v), want %s", got, changed, want)
+	}
+}
+
+// Every wrapper qm init emits is recognised again: a path with an apostrophe
+// (shellWord's '\” escape) and a wrapped command with a newline.
+func TestWrapperParserAcceptsWhatShellWordEmits(t *testing.T) {
+	env(t)
+	apos := filepath.Join(t.TempDir(), "it's here", "qm")
+	executable = func() (string, error) { return apos, nil }
+	inner := "one\ntwo 'three'"
+	wrapped, _, changed := WrapStatusLine([]byte(`{"statusLine":{"command":` + jsonString(inner) + `}}`))
+	if !changed {
+		t.Fatal("not wrapped")
+	}
+	// The same qm again: already wrapped, never wrapped a second time.
+	if again, _, changed := WrapStatusLine(wrapped); changed {
+		t.Fatalf("wrapped twice: %s", again)
+	}
+	if again, _, changed := RepointStatusLine(wrapped); changed {
+		t.Fatalf("repointed to itself: %s", again)
+	}
+	// Another install: repointed, the command (newline included) untouched.
+	newExe := "/opt/new/bin/qm"
+	executable = func() (string, error) { return newExe, nil }
+	got, _, changed := RepointStatusLine(wrapped)
+	if !changed {
+		t.Fatalf("an apostrophe path was not recognised: %s", wrapped)
+	}
+	cmd, _ := statusLineCommand(got)
+	if want := newExe + " statusline -- " + shellQuote(inner); cmd != want {
+		t.Fatalf("got %q, want %q", cmd, want)
+	}
+	// A path without an apostrophe wrapping a command with a newline.
+	executable = func() (string, error) { return "/opt/x/bin/qm", nil }
+	in := []byte(`{"statusLine":{"command":` + jsonString("/old/qm statusline -- 'a\nb'") + `}}`)
+	got, _, changed = RepointStatusLine(in)
+	if cmd, _ := statusLineCommand(got); !changed || cmd != "/opt/x/bin/qm statusline -- 'a\nb'" {
+		t.Fatalf("newline in the wrapped command: changed %v, got %q", changed, cmd)
+	}
+}
+
 func TestInitMarketplaceFlag(t *testing.T) {
 	settings := env(t)
 	var out bytes.Buffer

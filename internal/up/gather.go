@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -254,6 +255,15 @@ func lineStarts(p *Project, recs []route.Record) map[string]time.Time {
 		out[sid] = start
 	}
 	return out
+}
+
+// effectiveSessions are the terminal sessions p records as Gather reads
+// them: p.Sessions, and for a session with none there that p never dropped,
+// its newest worker Record's (seedSessions). p is not changed.
+func effectiveSessions(p Project, recs []route.Record) map[string]launch.SessionRef {
+	p.Sessions = maps.Clone(p.Sessions)
+	seedSessions(&p, recs)
+	return p.Sessions
 }
 
 // seedSessions loads into p.Sessions the terminal session of each worker

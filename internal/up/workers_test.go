@@ -152,3 +152,24 @@ func TestUpRefusesAdoptedWorkerWorktree(t *testing.T) {
 		t.Errorf("a Record tied to no project read as a worker's worktree")
 	}
 }
+
+// A hand-started worker adopted later under the name of a recorded one is
+// older than it: qm up done marks the newest by start, not the last listed.
+func TestUpDoneNewestAcrossRecordedAndHandStarted(t *testing.T) {
+	w := newWorld(t)
+	w.project.Adopted = map[string]AdoptedSession{
+		smallID: {Name: "w1", Cwd: filepath.Join(w.root, "worktrees", "small"), Started: now.Add(-4 * time.Hour)},
+	}
+	recs := []route.Record{profiled(w, warmID, "w1", "warm", now.Add(-time.Hour))}
+	cands, err := Gather(&w.project, recs, w.env(t, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	marked, err := MarkDone(&w.project, cands, "w1", now)
+	if err != nil || marked != warmID {
+		t.Fatalf("MarkDone = %v, %v; want the newer recorded worker %s", marked, err, warmID)
+	}
+	if _, ok := w.project.Done[smallID]; ok {
+		t.Errorf("the older hand-started worker was marked too: %v", w.project.Done)
+	}
+}

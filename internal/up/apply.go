@@ -56,6 +56,73 @@ type Deps struct {
 	// Progress prints a line while Apply waits for claude to start in the
 	// reused tabs (nil: silent).
 	Progress func(line string)
+	// CoordinatorArgs reads the running coordinator's claude arguments off
+	// its process (LiveArgs), right before a worker starts: live is false
+	// when the session does not run. A worker's permission is capped at
+	// them while the coordinator runs, at the saved ClaudeArgs when it does
+	// not (nil: the saved ones always).
+	CoordinatorArgs func(sessionID string) (args []string, live bool, err error)
+}
+
+// coordinatorCap is the claude arguments a worker's permission flags are
+// capped at: the project's saved ones, lowered to the running coordinator's
+// own when it runs stricter (spawn.LowerPermission of both). A live read can
+// only lower what the saved arguments allow, so prompt text misread as a
+// flag cannot raise the cap, and neither can a coordinator not seen running
+// (its session file unreadable, say): the saved arguments are then the cap,
+// as before live reads. The coordinator is any of ids, the sessions this
+// restore's coordinator step stands for (coordinatorIDs), and the saved
+// coordinator; when several run, the weakest of their flags. When a running
+// coordinator's flags cannot be read it fails rather than fall back on the
+// saved ones, which could allow more than the coordinator has.
+func coordinatorCap(p *Project, ids []string, d Deps) ([]string, error) {
+	if d.CoordinatorArgs == nil {
+		return p.ClaudeArgs, nil
+	}
+	var capArgs []string
+	running := false
+	for _, id := range ids {
+		args, live, err := d.CoordinatorArgs(id)
+		switch {
+		case err != nil:
+			return nil, fmt.Errorf("the coordinator %s's permission flags were not read, so no worker is started (the saved ones could allow it more than the coordinator has): %w", p.Coordinator.Name, err)
+		case !live:
+			continue
+		case running:
+			if capArgs, err = spawn.LowerPermission(capArgs, args); err != nil {
+				return nil, fmt.Errorf("the running sessions of the coordinator %s: %w, so no worker is started", p.Coordinator.Name, err)
+			}
+		default:
+			capArgs, running = args, true
+		}
+	}
+	if !running {
+		return p.ClaudeArgs, nil
+	}
+	lowered, err := spawn.LowerPermission(capArgs, p.ClaudeArgs)
+	if err != nil {
+		return nil, fmt.Errorf("the running coordinator %s's permission flags against its saved ones: %w, so no worker is started", p.Coordinator.Name, err)
+	}
+	return lowered, nil
+}
+
+// coordinatorIDs are the sessions the coordinator may run as once its step
+// o is done: the session the step left or resumed, the one it stands in
+// for, a fresh start's new id, and the saved coordinator's id.
+func coordinatorIDs(p *Project, o *Outcome) []string {
+	var ids []string
+	add := func(id string) {
+		if id != "" && !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	if o != nil {
+		add(o.Step.SessionID)
+		add(o.Step.Instead)
+		add(o.NewSessionID)
+	}
+	add(p.Coordinator.ID)
+	return ids
 }
 
 func (d Deps) now() time.Time {
@@ -112,6 +179,9 @@ func Apply(ctx context.Context, p *Project, steps []Step, d Deps) []Outcome {
 		pruneStale(p, order, sp, launcherKind(d.Launcher))
 	}
 	outs := make([]Outcome, 0, len(order))
+	// The coordinator's step comes first (rank): the workers' permission cap
+	// reads the sessions it stands for.
+	coordIDs := coordinatorIDs(p, nil)
 	for _, s := range order {
 		o := Outcome{Step: s}
 		switch s.Action {
@@ -120,7 +190,7 @@ func Apply(ctx context.Context, p *Project, steps []Step, d Deps) []Outcome {
 				o.Ref = repin(ctx, p, s, d)
 			}
 		case Resume, Fresh:
-			start(ctx, p, order, s, d, sp, &o)
+			start(ctx, p, order, s, d, sp, coordIDs, &o)
 			if w := warnings[s.SessionID]; len(w) > 0 {
 				o.Ref.Warning = strings.Join(append(w, nonEmpty(o.Ref.Warning)...), "; ")
 			}
@@ -131,6 +201,9 @@ func Apply(ctx context.Context, p *Project, steps []Step, d Deps) []Outcome {
 				id = o.NewSessionID
 			}
 			logUp(d, p, o.Step, id, d.now(), &o)
+		}
+		if s.Role == RoleCoordinator {
+			coordIDs = coordinatorIDs(p, &o)
 		}
 		outs = append(outs, o)
 	}
@@ -288,6 +361,8 @@ func RenderStale(sp *StalePlan) string {
 
 // closeStale closes the stale tmux windows of sp. It returns warnings by session
 // id: sp's own, and a close that failed.
+// Each window is listed again right before it is closed (staleNow): the plan
+// was shown before asking, and a window that changed meanwhile is left.
 func closeStale(ctx context.Context, sp *StalePlan, d Deps) map[string][]string {
 	warn := map[string][]string{}
 	for id, w := range sp.Warn {
@@ -297,11 +372,43 @@ func closeStale(ctx context.Context, sp *StalePlan, d Deps) map[string][]string 
 		return warn
 	}
 	for _, s := range sp.Close {
+		gone, why := staleNow(ctx, s.Ref, d)
+		if gone {
+			continue
+		}
+		if why != "" {
+			warn[s.Step.SessionID] = append(warn[s.Step.SessionID], fmt.Sprintf("stale session %s left open: %s", s.Ref.ID, why))
+			continue
+		}
 		if err := d.Closer.Close(ctx, s.Ref); err != nil && !errors.Is(err, launch.ErrGone) {
 			warn[s.Step.SessionID] = append(warn[s.Step.SessionID], fmt.Sprintf("stale session %s not closed: %v", s.Ref.ID, err))
 		}
 	}
 	return warn
+}
+
+// staleNow lists stale window ref's workspace again: gone when the window
+// is no longer listed as the same window (its id and name), so there is
+// nothing to close; else why it is left open now when it is no longer an
+// idle window of the panes it was planned with ("" to close it).
+func staleNow(ctx context.Context, ref launch.SessionRef, d Deps) (gone bool, why string) {
+	if d.Lister == nil {
+		return false, "its workspace cannot be listed again"
+	}
+	listed, err := d.Lister.Sessions(ctx, ref.Workspace)
+	if err != nil {
+		return false, "its workspace was not listed again: " + err.Error()
+	}
+	for _, l := range listed {
+		if l.Launcher != ref.Launcher || !sameWindow(ref, l) {
+			continue
+		}
+		if !l.Idle || l.Panes != ref.Panes {
+			return false, "it runs something now, or has another pane"
+		}
+		return false, ""
+	}
+	return true, ""
 }
 
 // pruneStale drops from p.Sessions the refs of launcher kind that the
@@ -338,7 +445,7 @@ func repin(ctx context.Context, p *Project, s Step, d Deps) launch.SessionRef {
 // d.Live it first reads the running sessions again: a session that started
 // running while qm up asked (resumed by hand) is left, and o.Step becomes a
 // leave with a warning; a failed read starts nothing.
-func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *StalePlan, o *Outcome) {
+func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *StalePlan, coordIDs []string, o *Outcome) {
 	if d.Launcher != nil && d.Live != nil {
 		live, err := d.Live()
 		if err != nil {
@@ -382,11 +489,24 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 			err = fmt.Errorf("hand-started worker %s: name %q is not a usable session name: resume it by hand: cd %s && claude --resume %s", s.SessionID, s.Name, launch.Quote(s.Cwd), s.SessionID)
 			break
 		}
+		var capArgs []string
+		if capArgs, err = coordinatorCap(p, coordIDs, d); err != nil {
+			break
+		}
 		env := map[string]string{"QM_PROJECT_ID": p.ID, "QM_WORKSPACE": p.Workspace}
-		script = spawn.PlainResumeScript(adoptedArgs(s.Adopted.Args, p.ClaudeArgs), env, s.Name, sid, s.Cwd, qmDirOf(d.Exe))
+		var args []string
+		if args, err = adoptedArgs(s.Adopted.Args, capArgs); err != nil {
+			err = fmt.Errorf("hand-started worker %s: not started, %w", s.Name, err)
+			break
+		}
+		script = spawn.PlainResumeScript(args, env, s.Name, sid, s.Cwd, qmDirOf(d.Exe))
 	default:
+		var capArgs []string
+		if capArgs, err = coordinatorCap(p, coordIDs, d); err != nil {
+			break
+		}
 		var prof route.Profile
-		if prof, err = workerProfile(p, s, d.Exe); err != nil {
+		if prof, err = workerProfile(p, s, d.Exe, capArgs); err != nil {
 			break
 		}
 		tier, qmDir := s.Record.Decision.Tier, qmDirOf(d.Exe)

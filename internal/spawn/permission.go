@@ -89,67 +89,67 @@ func PermissionOf(args []string, pid int) ([]string, string) {
 	return nil, fmt.Sprintf("coordinator (pid %d) has no permission flag: worker will prompt", pid)
 }
 
-// CapPermission is a resumed worker's permission flags (design 5.5): its
-// logged flags, lowered to the coordinator's when they are stronger (bypass,
-// then --permission-mode X, then none); a mode other than the coordinator's
-// becomes the coordinator's. coordinator is the coordinator's full claude
-// arguments, read with PermissionOf.
-func CapPermission(logged, coordinator []string) []string {
-	have, _ := PermissionOf(logged, 0)
-	limit, _ := PermissionOf(coordinator, 0)
-	rank := func(flags []string) int {
-		switch {
-		case len(flags) == 0:
-			return 0
-		case flags[0] == bypass:
-			return 2
-		}
-		return 1
+// below holds, for each permission level qm knows, the levels that allow no
+// more than it without asking: plan (read-only exploration) and dontAsk
+// (denies every call that would prompt) below default (asks before editing
+// or running), then acceptEdits, auto (a classifier approves routine
+// actions) and bypass. plan and dontAsk are not ordered: plan stops edits an
+// allowed tool may make under dontAsk, and dontAsk denies what plan would
+// ask about. A mode qm does not know is below bypass only.
+var below = map[string][]string{
+	"plan":        nil,
+	"dontAsk":     nil,
+	"default":     {"plan", "dontAsk"},
+	"acceptEdits": {"default", "plan", "dontAsk"},
+	"auto":        {"acceptEdits", "default", "plan", "dontAsk"},
+}
+
+// level is the permission level of flags read with PermissionOf: "bypass",
+// "default" for no flag (or the manual alias), else the mode.
+func level(flags []string) string {
+	switch {
+	case len(flags) == 0:
+		return "default"
+	case flags[0] == bypass:
+		return "bypass"
+	case flags[1] == "manual":
+		return "default"
 	}
-	if rank(have) > rank(limit) || (rank(have) == 1 && rank(limit) == 1 && !slices.Equal(have, limit)) {
-		return limit
+	return flags[1]
+}
+
+// atMost reports whether level a allows no more than level b.
+func atMost(a, b string) bool {
+	return a == b || b == "bypass" || slices.Contains(below[b], a)
+}
+
+// describe names flags read with PermissionOf for an error.
+func describe(flags []string) string {
+	if len(flags) == 0 {
+		return "no permission flag"
 	}
-	return have
+	return strings.Join(flags, " ")
 }
 
 // LowerPermission is a session's own permission flags or the coordinator's,
-// whichever is weaker, in the order plan < default (no flag, or
-// --permission-mode default) < acceptEdits < any other mode < bypass. It is
-// for a session the user configured (an adopted hand-started worker): its
-// own weaker mode is never replaced by the coordinator's stronger one. Two
-// different modes of the same rank (both unknown) give no flag. own and
-// coordinator are full claude arguments, read with PermissionOf.
-func LowerPermission(own, coordinator []string) []string {
+// whichever allows less (the order of below): a worker's flags are never
+// raised to the coordinator's, and a session the user configured (an adopted
+// hand-started worker) keeps its own weaker mode. When both stand for
+// default, own's are kept. Two levels neither of which allows no more than
+// the other (plan and dontAsk, or a mode qm does not know against any but
+// itself and bypass) have no mode in common that is safe for both: that is
+// an error, and the session is not started. own and coordinator are full
+// claude arguments, read with PermissionOf.
+func LowerPermission(own, coordinator []string) ([]string, error) {
 	have, _ := PermissionOf(own, 0)
 	limit, _ := PermissionOf(coordinator, 0)
-	rank := func(flags []string) int {
-		switch {
-		case len(flags) == 0:
-			return 1
-		case flags[0] == bypass:
-			return 4
-		}
-		switch flags[1] {
-		case "plan":
-			return 0
-		case "default":
-			return 1
-		case "acceptEdits":
-			return 2
-		}
-		return 3
+	switch lh, ll := level(have), level(limit); {
+	case atMost(lh, ll):
+		return have, nil
+	case atMost(ll, lh):
+		return limit, nil
 	}
-	switch rh, rl := rank(have), rank(limit); {
-	case rh < rl:
-		return have
-	case rh > rl:
-		return limit
-	case slices.Equal(have, limit):
-		return have
-	case rh == 1:
-		return have
-	}
-	return nil
+	return nil, fmt.Errorf("%s and %s have no permission mode in common that allows no more than either", describe(have), describe(limit))
 }
 
 // PS returns a process's command line (its arguments joined by spaces) and

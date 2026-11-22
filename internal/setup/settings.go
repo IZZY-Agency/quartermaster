@@ -43,6 +43,12 @@ func shellWord(s string) string {
 // runs qm statusline, a statusLine with no command string, and a file that is
 // not a JSON object are left alone (changed false). diff shows the change.
 func WrapStatusLine(settings []byte) (updated []byte, diff string, changed bool) {
+	return wrapStatusLine(settings, qmStatusLine())
+}
+
+// wrapStatusLine is WrapStatusLine with qm's command prefix (qmStatusLine's
+// shape: the path as a shell word, then " statusline") given.
+func wrapStatusLine(settings []byte, qm string) (updated []byte, diff string, changed bool) {
 	doc := settings
 	if len(bytes.TrimSpace(doc)) == 0 {
 		doc = []byte("{}\n")
@@ -53,7 +59,7 @@ func WrapStatusLine(settings []byte) (updated []byte, diff string, changed bool)
 	}
 	sl, ok := find(top.members, "statusLine")
 	if !ok || string(doc[sl.valStart:sl.valEnd]) == "null" {
-		value := "{\"type\": \"command\", \"command\": " + jsonString(qmStatusLine()) + "}"
+		value := "{\"type\": \"command\", \"command\": " + jsonString(qm) + "}"
 		var out []byte
 		if ok {
 			out = splice(doc, sl.valStart, sl.valEnd, value)
@@ -70,10 +76,46 @@ func WrapStatusLine(settings []byte) (updated []byte, diff string, changed bool)
 	if json.Unmarshal(doc[cmd.valStart:cmd.valEnd], &old) != nil || providers.Wrapped(old) {
 		return settings, "", false
 	}
-	wrapped := qmStatusLine() + " -- " + shellQuote(old)
+	wrapped := qm + " -- " + shellQuote(old)
 	diff = "- statusLine.command: " + string(doc[cmd.valStart:cmd.valEnd]) + "\n" +
 		"+ statusLine.command: " + jsonString(wrapped) + "\n"
 	return splice(doc, cmd.valStart, cmd.valEnd, jsonString(wrapped)), diff, true
+}
+
+// RepointStatusLine returns settings with a status line that runs qm
+// statusline through another path than this qm's own changed to this qm's
+// path; the wrapped command is untouched. A status line that is not wrapped,
+// that names qm without a path (found on PATH), or that already names this
+// qm, is left alone (changed false). diff shows the change.
+func RepointStatusLine(settings []byte) (updated []byte, diff string, changed bool) {
+	top, err := topObject(settings)
+	if err != nil {
+		return settings, "", false
+	}
+	sl, ok := find(top.members, "statusLine")
+	if !ok {
+		return settings, "", false
+	}
+	cmd, ok := commandMember(settings, sl)
+	if !ok {
+		return settings, "", false
+	}
+	var old string
+	if json.Unmarshal(settings[cmd.valStart:cmd.valEnd], &old) != nil {
+		return settings, "", false
+	}
+	exe, err := executable()
+	if err != nil {
+		return settings, "", false
+	}
+	path, rest, ok := providers.ParseWrapper(old)
+	if !ok || !strings.Contains(path, "/") || path == exe {
+		return settings, "", false
+	}
+	repointed := shellWord(exe) + rest
+	diff = "- statusLine.command: " + string(settings[cmd.valStart:cmd.valEnd]) + "\n" +
+		"+ statusLine.command: " + jsonString(repointed) + "\n"
+	return splice(settings, cmd.valStart, cmd.valEnd, jsonString(repointed)), diff, true
 }
 
 // statusLineCommand is statusLine.command of a settings file; ok is false

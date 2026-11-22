@@ -24,4 +24,4 @@ description: Rules for a worker session started by qm spawn worker. Use at the s
    workers with `qm spawn worker`.
 6. **Hand off before the context fills.** When a note says the context is
    high, finish the current step, write the handoff note to the path it
-   gives, and report to the coordinator.
+   gives, then send the coordinator a message with `SendMessage`.

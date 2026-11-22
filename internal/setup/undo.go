@@ -12,6 +12,7 @@ import (
 
 	"github.com/IZZY-Agency/quartermaster/internal/config"
 	"github.com/IZZY-Agency/quartermaster/internal/declog"
+	"github.com/IZZY-Agency/quartermaster/internal/providers"
 )
 
 // Undo is qm init --undo: it puts the status line back (asking when it was
@@ -101,7 +102,7 @@ func restoreStatusLine(p prompter, path string, rec Record) error {
 		}
 	}
 	if backup != nil {
-		if wrapped, _, changed := WrapStatusLine(backup); changed && bytes.Equal(wrapped, settings) {
+		if wrapped, _, changed := wrapStatusLine(backup, wrapperPrefix(settings)); changed && bytes.Equal(wrapped, settings) {
 			if err := writeFileAtomic(path, backup, mode); err != nil {
 				return err
 			}
@@ -171,4 +172,15 @@ func emptySettings(path string) bool {
 	}
 	o, err := topObject(b)
 	return err == nil && len(o.members) == 0
+}
+
+// wrapperPrefix is the "<qm> statusline" the status line of settings runs
+// (whichever qm a repoint named); this qm's own when it is not a wrapper.
+func wrapperPrefix(settings []byte) string {
+	if cmd, ok := statusLineCommand(settings); ok {
+		if path, _, ok := providers.ParseWrapper(cmd); ok {
+			return shellWord(path) + " statusline"
+		}
+	}
+	return qmStatusLine()
 }

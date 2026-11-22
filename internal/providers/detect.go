@@ -9,11 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/IZZY-Agency/quartermaster/internal/config"
 	"github.com/IZZY-Agency/quartermaster/internal/launch"
@@ -195,13 +195,66 @@ func detectPermission(env func(string) string) Status {
 	return Status{Name: "permission", On: flags != nil, Why: why}
 }
 
-// wrappedRe matches a status-line command that already runs qm statusline:
-// qm by name, by path, or by a single-quoted path.
-var wrappedRe = regexp.MustCompile(`^(?:'[^']*/qm'|(?:\S*/)?qm) statusline(\s|$)`)
+// ParseWrapper splits a status-line command that runs qm statusline into the
+// path qm runs by, as the shell reads it (quotes taken off; "qm" for plain
+// qm), and the rest from the whitespace before "statusline" on, byte for
+// byte: it reads every word qm init writes (a path in single quotes, an
+// apostrophe in it written '\”, no quotes for a safe path) and a rest of any
+// shape, a newline included. ok is false for a command that does not run qm
+// statusline; a program named something else is not qm, and neither is
+// "echo qm statusline".
+func ParseWrapper(cmd string) (path, rest string, ok bool) {
+	s := strings.TrimLeftFunc(cmd, unicode.IsSpace)
+	var b strings.Builder
+	i := 0
+scan:
+	for i < len(s) {
+		switch c := s[i]; {
+		case c == '\'':
+			j := strings.IndexByte(s[i+1:], '\'')
+			if j < 0 {
+				return "", "", false
+			}
+			b.WriteString(s[i+1 : i+1+j])
+			i += j + 2
+		case c == '\\' && i+1 < len(s) && s[i+1] == '\'':
+			b.WriteByte('\'')
+			i += 2
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			break scan
+		case c == '\\' || c == '"':
+			return "", "", false
+		default:
+			b.WriteByte(c)
+			i++
+		}
+	}
+	path, rest = b.String(), s[i:]
+	if path != "qm" && !strings.HasSuffix(path, "/qm") {
+		return "", "", false
+	}
+	word := strings.TrimLeft(rest, " \t")
+	after, found := strings.CutPrefix(word, "statusline")
+	if !found || len(word) == len(rest) || (after != "" && !unicode.IsSpace(rune(after[0]))) {
+		return "", "", false
+	}
+	return path, rest, true
+}
+
+// wrappedPath is the path a wrapped status line runs qm by, or "" when it
+// names qm without a path or is not wrapped.
+func wrappedPath(cmd string) string {
+	path, _, ok := ParseWrapper(cmd)
+	if !ok || !strings.Contains(path, "/") {
+		return ""
+	}
+	return path
+}
 
 // Wrapped reports whether a status-line command already runs qm statusline.
 func Wrapped(cmd string) bool {
-	return wrappedRe.MatchString(strings.TrimSpace(cmd))
+	_, _, ok := ParseWrapper(cmd)
+	return ok
 }
 
 func detectStatusLine() Status {
@@ -221,6 +274,11 @@ func detectStatusLine() Status {
 	}
 	if json.Unmarshal(b, &s) != nil || !Wrapped(s.StatusLine.Command) {
 		return Status{Name: "statusline", Why: off}
+	}
+	if qm := wrappedPath(s.StatusLine.Command); qm != "" {
+		if _, err := os.Stat(qm); err != nil {
+			return Status{Name: "statusline", Why: "Claude limits unknown: the status line runs " + qm + ", which is gone; qm init repoints it"}
+		}
 	}
 	return Status{Name: "statusline", On: true, Why: "status-line wrapper on"}
 }

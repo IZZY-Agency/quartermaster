@@ -79,6 +79,28 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook turn-start",
+            "timeout": 25
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook turn-stop",
+            "timeout": 25
+          }
+        ]
+      }
     ]
   }
 }

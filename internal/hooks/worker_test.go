@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -96,7 +97,7 @@ func countCommands(t *testing.T) *atomic.Int32 {
 	t.Helper()
 	var n atomic.Int32
 	old := runCommand
-	runCommand = func(_ []string) error { n.Add(1); return nil }
+	runCommand = func(_ context.Context, _ []string) error { n.Add(1); return nil }
 	t.Cleanup(func() { runCommand = old })
 	return &n
 }
@@ -188,7 +189,7 @@ func TestReadBudgetSoftensAfterThree(t *testing.T) {
 	cfg.Notify = []string{"notifier", "--title", "quartermaster"}
 	var got [][]string
 	old := runCommand
-	runCommand = func(argv []string) error { got = append(got, argv); return nil }
+	runCommand = func(_ context.Context, argv []string) error { got = append(got, argv); return nil }
 	t.Cleanup(func() { runCommand = old })
 	t.Setenv("QM_SESSION_NAME", "task-a")
 
@@ -469,7 +470,7 @@ func TestContextLimit(t *testing.T) {
 	want(t, out, "note")
 	state := os.Getenv("XDG_STATE_HOME")
 	wantNote := "Context is at 175000 tokens. Finish the current step, write the handoff note to " +
-		filepath.Join(state, "quartermaster", "handoff", "task-a.md") + ", and report to the coordinator."
+		filepath.Join(state, "quartermaster", "handoff", "task-a.md") + ", then send the coordinator a message with SendMessage."
 	if c := decode(t, out).HookSpecificOutput["additionalContext"]; c != wantNote {
 		t.Errorf("note %q\nwant %q", c, wantNote)
 	}

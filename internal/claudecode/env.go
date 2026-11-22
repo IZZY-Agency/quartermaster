@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -31,8 +32,8 @@ var readEnviron = func(pid int) ([]byte, error) {
 
 // psEnv returns ps's command column with the environment appended (macOS's
 // ps eww); tests replace it.
-var psEnv = func(pid int) (string, error) {
-	out, err := exec.Command("ps", "eww", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
+var psEnv = func(ctx context.Context, pid int) (string, error) {
+	out, err := exec.CommandContext(ctx, "ps", "eww", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
 	if err != nil {
 		return "", err
 	}
@@ -43,6 +44,15 @@ var psEnv = func(pid int) (string, error) {
 // environment: on Linux the NUL-separated /proc/PID/environ, elsewhere
 // ps eww -o command= -p PID.
 func TermEnvOf(pid int) (TermEnv, error) {
+	return TermEnvOfCtx(context.Background(), pid)
+}
+
+// TermEnvOfCtx is TermEnvOf with ps's run cancelled when ctx ends (the
+// Linux read is a single /proc file).
+func TermEnvOfCtx(ctx context.Context, pid int) (TermEnv, error) {
+	if err := ctx.Err(); err != nil {
+		return TermEnv{}, err
+	}
 	if goos == "linux" {
 		b, err := readEnviron(pid)
 		if err != nil {
@@ -50,7 +60,7 @@ func TermEnvOf(pid int) (TermEnv, error) {
 		}
 		return ParseEnviron(b), nil
 	}
-	line, err := psEnv(pid)
+	line, err := psEnv(ctx, pid)
 	if err != nil {
 		return TermEnv{}, fmt.Errorf("environment of %d: %w", pid, err)
 	}

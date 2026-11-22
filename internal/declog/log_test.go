@@ -149,3 +149,33 @@ func TestAppendDecision(t *testing.T) {
 		t.Errorf("record %+v", r)
 	}
 }
+
+// A line cut short (a full disk, say) does not swallow the next record: the
+// append starts on a new line, and Read finds it.
+func TestAppendAfterPartialLine(t *testing.T) {
+	path := isolate(t)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"kind":"up","rule":"cut`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 11, 22, 9, 0, 0, 0, time.UTC)
+	if err := Append(route.Record{Time: at, Kind: "adopt", Rule: "after"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Append(route.Record{Time: at, Kind: "adopt", Rule: "next"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Read(time.Time{})
+	if err != nil || len(got) != 2 || got[0].Rule != "after" || got[1].Rule != "next" {
+		t.Fatalf("Read = %+v, %v; want the two records appended after the cut line", got, err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b[len(b)-1] != '\n' {
+		t.Errorf("log does not end with a newline: %q", b)
+	}
+}

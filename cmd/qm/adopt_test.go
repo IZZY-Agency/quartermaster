@@ -81,13 +81,13 @@ func newAdoptMachine(t *testing.T) *adoptMachine {
 	m.agterm = &adoptAgterm{root: m.root}
 	m.live(t, 411, adoptCoordID, "proj-coord", "claude -n proj-coord --model opus")
 	m.live(t, 413, adoptHandID, "w-hand", "claude --model haiku --plugin-dir /p")
-	swap(t, &upProcs, func() ([]claudecode.Proc, error) { return m.procs, nil })
+	swapProcs(t, func() ([]claudecode.Proc, error) { return m.procs, nil })
 	swap(t, &upAgtermCtl, launch.Agterm{Bin: "agtermctl", Run: m.agterm.run})
 	swap(t, &upTmuxCtl, launch.Tmux{Bin: "tmux", Run: func(context.Context, string, ...string) ([]byte, error) {
 		return nil, fmt.Errorf("no tmux")
 	}})
 	terms := map[int]string{411: "s-c", 413: "s-h", 414: "s-x"}
-	swap(t, &upTermOf, func(pid int) (claudecode.TermEnv, error) {
+	swap(t, &upTermOf, func(_ context.Context, pid int) (claudecode.TermEnv, error) {
 		return claudecode.TermEnv{AgtermSession: terms[pid]}, nil
 	})
 	swap(t, &upSelfPID, func([]claudecode.Proc) int { return m.self })
@@ -138,7 +138,7 @@ func TestUpAdoptFlagsUsage(t *testing.T) {
 		}
 	}
 	m.project(t)
-	for _, f := range []string{"--adopt", "--new", "--adopt-coordinator=0000"} {
+	for _, f := range []string{"--new", "--adopt-coordinator=0000"} {
 		if code, _, errs := runQM("up", f); code != 2 || !strings.Contains(errs, "first run") {
 			t.Fatalf("%s on a project with state: exit %d, stderr %q", f, code, errs)
 		}

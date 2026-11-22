@@ -59,6 +59,24 @@ func (refTerms) Sessions(ctx context.Context, launcher, workspace string) ([]lau
 	return ls.Sessions(ctx, workspace)
 }
 
+// PaneRuns says whether tmux window ref's pane runs session sessionID's
+// process in its foreground; false when the session does not run.
+func (refTerms) PaneRuns(ctx context.Context, ref launch.SessionRef, sessionID string) (bool, error) {
+	live, err := upLive()
+	if err != nil {
+		return false, err
+	}
+	l, ok := live[sessionID]
+	if !ok {
+		return false, nil
+	}
+	target := ref.ID
+	if ref.Workspace != "" {
+		target = "=" + ref.Workspace + ":" + ref.ID
+	}
+	return upPaneRuns(ctx, target, l.PID)
+}
+
 func (refTerms) Close(ctx context.Context, ref launch.SessionRef) error {
 	l, err := upPick(ref.Launcher)
 	if err != nil {
@@ -117,7 +135,7 @@ func downMain(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	steps, _, notes, err := upPlan(&p, recs, false, "closed")
+	steps, _, notes, _, err := upPlan(&p, recs, false, "closed")
 	if err != nil {
 		return err
 	}

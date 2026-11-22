@@ -28,14 +28,29 @@ type fakeCloser struct {
 	renamed  map[string]string // id: the name the listing shows instead
 	busy     map[string]bool   // listed as running something (not Idle)
 	other    map[string]bool   // its foreground is not the session's claude
+	notFg    map[string]bool   // a tmux window whose pane's foreground is another job
 	listErr  error
 	listed   []string // launcher/workspace of each listing
+	// later changes a listed window from the launcher's second listing on,
+	// the one Down makes right before it closes the window; laterErr fails
+	// those listings.
+	later    map[string]func(*launch.SessionRef)
+	laterErr error
+	count    map[string]int
 }
 
 func (f *fakeCloser) Sessions(_ context.Context, launcher, ws string) ([]launch.SessionRef, error) {
 	f.listed = append(f.listed, launcher+"/"+ws)
 	if f.listErr != nil {
 		return nil, f.listErr
+	}
+	if f.count == nil {
+		f.count = map[string]int{}
+	}
+	f.count[launcher]++
+	again := f.count[launcher] > 1
+	if again && f.laterErr != nil {
+		return nil, f.laterErr
 	}
 	var out []launch.SessionRef
 	for sid, ref := range f.p.Sessions {
@@ -48,10 +63,17 @@ func (f *fakeCloser) Sessions(_ context.Context, launcher, ws string) ([]launch.
 			if n, ok := f.renamed[ref.ID]; ok {
 				ref.Name = n
 			}
+			if change := f.later[ref.ID]; again && change != nil {
+				change(&ref)
+			}
 			out = append(out, ref)
 		}
 	}
 	return out, nil
+}
+
+func (f *fakeCloser) PaneRuns(_ context.Context, ref launch.SessionRef, _ string) (bool, error) {
+	return !f.notFg[ref.ID], nil
 }
 
 func (f *fakeCloser) Close(_ context.Context, ref launch.SessionRef) error {
@@ -256,8 +278,8 @@ func TestDownClosesOnlyListedSessions(t *testing.T) {
 	if got := strings.Join(c.closed, ","); got != "t-w2,t-c" {
 		t.Errorf("closed %s, want only the listed sessions", got)
 	}
-	if slices.Sort(c.listed); strings.Join(c.listed, ",") != "agterm/proj,tmux/proj" {
-		t.Errorf("listings %v, want one per launcher", c.listed)
+	if slices.Sort(c.listed); strings.Join(slices.Compact(c.listed), ",") != "agterm/proj,tmux/proj" {
+		t.Errorf("listings %v, want the launchers' workspaces", c.listed)
 	}
 	for _, o := range outs {
 		if o.Err != nil || o.Step.Name == "w1" && o.Ref.ID != "" {
@@ -469,4 +491,105 @@ func TestDownLeaveTabRunsSomethingElse(t *testing.T) {
 	if closable(leave, launch.SessionRef{Launcher: "tmux", ID: "@1", Panes: 2}) || !closable(leave, launch.SessionRef{Launcher: "tmux", ID: "@1", Panes: 1}) {
 		t.Error("a running session's tmux window: closable only with one pane")
 	}
+}
+
+// A running worker's tmux window of one pane is closed only when that pane
+// runs the worker in its foreground: a job the user started there (the
+// worker suspended, or the window inherited) is left open.
+func TestDownTmuxWindowForegroundElsewhereLeftOpen(t *testing.T) {
+	p, steps := downFixture(t)
+	p.Sessions["w1"] = launch.SessionRef{Launcher: "tmux", ID: "@7", Name: "w1"}
+	c := &fakeCloser{p: p, notFg: map[string]bool{"@7": true}}
+	outs := Down(context.Background(), p, steps, c, false)
+	if slices.Contains(c.closed, "@7") {
+		t.Fatalf("closed %v: the window running another job was closed", c.closed)
+	}
+	for _, o := range outs {
+		if o.Step.SessionID == "w1" && o.Ref.Warning != LeftOpen {
+			t.Errorf("w1 outcome %+v, want LeftOpen", o)
+		}
+	}
+	p, steps = downFixture(t)
+	p.Sessions["w1"] = launch.SessionRef{Launcher: "tmux", ID: "@7", Name: "w1"}
+	c = &fakeCloser{p: p}
+	Down(context.Background(), p, steps, c, false)
+	if !slices.Contains(c.closed, "@7") {
+		t.Fatalf("closed %v: the window running the worker was left", c.closed)
+	}
+}
+
+// Down lists a window again right before it closes it (as qm up does a stale
+// one): a pane split or a job started there while earlier windows closed is
+// not closed with the window.
+func TestDownRelistsEachWindowBeforeClosingIt(t *testing.T) {
+	tmux := func(t *testing.T) (*Project, []Step) {
+		p, steps := downFixture(t)
+		p.Sessions["w1"] = launch.SessionRef{Launcher: "tmux", ID: "@7", Name: "w1"}
+		p.Sessions["w2"] = launch.SessionRef{Launcher: "tmux", ID: "@8", Name: "w2"}
+		return p, steps
+	}
+	left := func(t *testing.T, outs []Outcome, sid string) {
+		t.Helper()
+		for _, o := range outs {
+			if o.Step.SessionID == sid && (o.Err != nil || o.Ref.Warning != LeftOpen) {
+				t.Errorf("%s outcome %+v, want LeftOpen", sid, o)
+			}
+		}
+	}
+	t.Run("a running session's window gained a pane", func(t *testing.T) {
+		p, steps := tmux(t)
+		c := &fakeCloser{p: p, later: map[string]func(*launch.SessionRef){"@7": func(r *launch.SessionRef) { r.Panes = 2 }}}
+		outs := Down(context.Background(), p, steps, c, false)
+		if slices.Contains(c.closed, "@7") || !slices.Contains(c.closed, "@8") {
+			t.Errorf("closed %v, want @8 and not @7", c.closed)
+		}
+		left(t, outs, "w1")
+	})
+	t.Run("a stopped session's window runs a job now", func(t *testing.T) {
+		p, steps := tmux(t)
+		c := &fakeCloser{p: p, later: map[string]func(*launch.SessionRef){"@8": func(r *launch.SessionRef) { r.Idle = false }}}
+		outs := Down(context.Background(), p, steps, c, false)
+		if slices.Contains(c.closed, "@8") || !slices.Contains(c.closed, "@7") {
+			t.Errorf("closed %v, want @7 and not @8", c.closed)
+		}
+		left(t, outs, "w2")
+	})
+	t.Run("an agterm tab's foreground changed", func(t *testing.T) {
+		p, steps := downFixture(t)
+		c := &fakeCloser{p: p, later: map[string]func(*launch.SessionRef){"t-w1": func(r *launch.SessionRef) { r.Foreground = "npm run dev" }}}
+		outs := Down(context.Background(), p, steps, c, false)
+		if slices.Contains(c.closed, "t-w1") || !slices.Contains(c.closed, "t-c") {
+			t.Errorf("closed %v, want t-c and not t-w1", c.closed)
+		}
+		left(t, outs, "w1")
+	})
+	t.Run("a window is another one now", func(t *testing.T) {
+		p, steps := tmux(t)
+		c := &fakeCloser{p: p, later: map[string]func(*launch.SessionRef){"@7": func(r *launch.SessionRef) { r.Name = "other" }}}
+		outs := Down(context.Background(), p, steps, c, false)
+		if slices.Contains(c.closed, "@7") {
+			t.Errorf("closed %v: a window with another name was closed", c.closed)
+		}
+		if _, ok := p.Sessions["w1"]; ok {
+			t.Error("the ref of a window that is gone was kept")
+		}
+		for _, o := range outs {
+			if o.Step.SessionID == "w1" && o.Err != nil {
+				t.Errorf("w1: %v", o.Err)
+			}
+		}
+	})
+	t.Run("the listing fails", func(t *testing.T) {
+		p, steps := downFixture(t)
+		c := &fakeCloser{p: p, laterErr: errors.New("agtermctl: not running")}
+		outs := Down(context.Background(), p, steps, c, false)
+		if len(c.closed) != 0 || len(p.Sessions) != 3 {
+			t.Errorf("closed %v, kept %v: want nothing closed, every ref kept", c.closed, p.Sessions)
+		}
+		for _, o := range outs {
+			if o.Err == nil || !strings.Contains(o.Err.Error(), "not listed again") {
+				t.Errorf("%s: err %v", o.Step.Name, o.Err)
+			}
+		}
+	})
 }

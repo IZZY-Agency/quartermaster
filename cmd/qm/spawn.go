@@ -204,6 +204,6 @@ func reportStarted(res spawn.Result, stdout, stderr io.Writer) error {
 	if res.Ref.Warning != "" {
 		_, _ = fmt.Fprintf(stderr, "qm spawn: warning: %s\n", res.Ref.Warning)
 	}
-	_, err := fmt.Fprintf(stdout, "started %s %s (%s)\n%s\n", res.Ref.Launcher, res.Ref.ID, res.Ref.Name, decisionLine(res.Decision))
+	_, err := fmt.Fprintf(stdout, "started %s %s (%s)\n%s\nwatch it: qm watch\n", res.Ref.Launcher, res.Ref.ID, res.Ref.Name, decisionLine(res.Decision))
 	return err
 }

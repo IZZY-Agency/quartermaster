@@ -85,6 +85,10 @@ optional (see [Optional providers](#optional-providers)).
    qm init
    ```
 
+   Run it again after you install `qm` another way (from source, then from
+   Homebrew): it offers to repoint a status line that still runs the earlier
+   `qm`, and `qm status` says so when that one is gone.
+
 2. Inside Claude Code, add this repository as a plugin marketplace and install
    the coordinator plugin (`qm init` prints these two lines; a `qm` you built
    yourself and run from the checkout's `bin/` prints the checkout's path in
@@ -189,7 +193,10 @@ one). The decision is appended to the decision log.
 `qm spawn review --prompt FILE` routes a review. By default the round (1 for a
 first review, 2 and up for a re-check) is counted from qm's decision log for the
 branch, and the size of the diff from `git diff --numstat BASE...HEAD`; `--round`
-and `--base` override them. The first row that matches wins:
+and `--base` override them. Both are read for the branch checked out in the
+folder qm runs in (`--repo` names another), so a review of a branch that lives in
+a worktree runs there; when that branch has no diff against its base, qm prints a
+note. The first row that matches wins:
 
 | Condition | Codex | Claude, when Codex is off or fails |
 |---|---|---|
@@ -254,7 +261,8 @@ do not block) or `off`; a rule not listed is on.
 | `explorer-model` | worker | runs explorer sub-agents on Haiku |
 | `lsp-note` | worker | notes that the LSP tool is there when a search looks like a symbol lookup |
 | `write-note` | worker | notes that `Edit` is for changes to a large existing file |
-| `context-limit` | worker | at 70% of the compact window, tells the worker to finish the step, write a handoff note and report |
+| `context-limit` | worker | at 70% of the compact window, tells the worker to finish the step, write a handoff note and send the coordinator a message |
+| `turn-start`, `turn-stop` | worker | record, silently and in their own files, whether the worker's turn is open, for [qm watch](#watching-workers-qm-watch); they act only in workers (`QM_ROLE=worker`) |
 
 The `read-budget` and `raw-launch-gate` rules, after blocking work three times
 in one phase, soften to a note for the rest of the phase or 30 minutes,
@@ -350,13 +358,17 @@ worker, without permission prompts.
 | `worker_window` | `{"sonnet": 250000, "opus": 400000, "fable": 400000}` | each worker model's auto-compact window, in tokens |
 | `typesafe_api_key` | unset | the TypeSafe key; the `TYPESAFE_API_KEY` environment variable wins, and `qm init` never stores a key it read from there |
 | `launcher` | `"auto"` | `auto`, `agterm` or `tmux` |
-| `notify` | `[]` | a command that receives a message as its last argument (as `<title>: <text>`) when a rule softens; no shell is used |
+| `notify` | `[]` | a command that receives a message as its last argument (as `<title>: <text>`) when a rule softens or `qm watch` reports a worker (its name and state, never a path); no shell is used |
 | `report.worker_markers` | `[]` | extra regexes that mark a session as a worker for `qm report --baseline`, next to the built-in ones |
 | `up.claude_args` | `[]` | `claude` arguments for a new project's coordinator when `qm up` gets none after `--` |
+| `watch.silent_minutes` | `10` | minutes without a write to a worker's transcript after which `qm watch` and `qm status` call it silent; a whole number of at least 1 (`0` or a negative number is an error `qm watch` and the Workers section show; a value of the wrong type, like any key's, fails the whole config) |
 
 `launcher: auto` picks agterm when `AGTERM_SESSION_ID` is set and tmux when
 `TMUX` is set; `qm up` also tries a running agterm, then a `tmux` command. With
 neither, `qm spawn worker` stops with an error that names both and this key.
+
+The tmux launcher is experimental: it is covered by the automated tests, and
+agterm is the launcher qm is used with day to day. Report what breaks.
 
 State, the decision log and everything else qm records live in
 `~/.local/state/quartermaster/` (`XDG_STATE_HOME` moves it).
@@ -457,16 +469,36 @@ stays yours and qm never touches it.
   subfolder is listed but cannot be adopted. In agterm the project's workspace
   is the one the coordinator's tab is in, and adopted workers in other
   workspaces are moved into it (a move restarts nothing). qm records a tab for
-  a session only when agterm shows that session's own claude process in it.
+  a session only when agterm shows that session's own claude process in it,
+  and never a tab a project already records for another session.
 - A worker you started by hand keeps its own settings: on a later restore it is
   resumed with its `--model`, `--effort` and permission flags only (never more
-  permission than the coordinator has) and is never started fresh.
+  permission than the coordinator has: its saved arguments, lowered to the
+  flags of its own process while it runs; a worker whose mode has nothing in
+  common with the coordinator's, such as `plan` against `dontAsk`, is not
+  started) and is never started fresh.
 - Until its next restart, an adopted coordinator has no project variables in
   its environment. `qm spawn worker` run by the coordinator, or by a session
   the project already holds, finds the project from the folder (a spawn from
   any other session stays untied), `qm up done` and `qm down` find it the same
   way, and `qm up handoff`, for the coordinator only, prints where it writes
   its handoff note.
+- **Later.** `qm up --adopt` on a project that already has state adds sessions
+  you started by hand since: the running ones in the project's folders that the
+  project does not hold (its coordinator, adopted sessions, and the workers it
+  has recorded, finished ones included). It adopts workers only and restores
+  nothing. In a terminal it lists them and asks which (row numbers, `a` for all
+  the rows, `q` for the ones `qm spawn worker` started, empty for none), then
+  asks to confirm. With `--yes`, or without a terminal, it adopts only the
+  sessions a worker Record names and lists the rest as not adopted, so a script
+  never takes over a session nobody named. `--adopt-coordinator`, `--new`,
+  `--full` and coordinator arguments after `--` do not go with it. A plain
+  `qm up` prints one line when such sessions are running, pointing at
+  `qm up --adopt`.
+- Two adoptions never take the same session: after the confirmation each one
+  checks again, under one lock for the machine, which sessions other projects
+  hold, and leaves those with a note. When the decision log cannot be
+  written, an adoption saves nothing and moves no tab.
 
 **Terminals.** In agterm, qm pins every session it starts to a plain shell on
 agterm's own restore, so `qm up` is the only thing that restores a session.
@@ -488,18 +520,75 @@ them and never starts them twice.
 workers come from the decision log. `qm up` and `qm down` never write Claude
 Code's own files.
 
+## Watching workers: qm watch
+
+A worker that ends its turn without a message (it handed off at its context
+limit, asked a question, crashed) leaves the coordinator waiting. `qm watch`
+ends when that happens, so a coordinator runs it in the background and its
+exit wakes it; the `qm-coordinator` spawning skill says to, and
+`qm spawn worker` prints `watch it: qm watch` after each launch.
+
+The workers are those of the project the working folder belongs to (found
+the way `qm up done` finds it): the ones `qm up` would restore, without the
+ones marked done or replaced. Each has a state:
+
+| State | When |
+|---|---|
+| `gone` | no live Claude process runs its session (a worker spawned less than 2 minutes ago counts as `working` until its process shows) |
+| `stopped` | its turn ended (the `turn-stop` hook of this very process recorded it) |
+| `silent` | the process lives, but nothing was written to its transcript, or its sub-agents' transcripts, for `watch.silent_minutes` (10) or longer; a long tool call looks the same, and so does a worker interrupted with Esc (an interrupt fires no stop hook) |
+| `working` | otherwise |
+| `unknown` | the process list could not be read |
+
+A worker without the `qm-worker` plugin (adopted, started by hand) has no turn
+hooks, so it is never `stopped`: it goes from `working` to `silent`. After
+`/clear` or a compaction a worker's process runs a new session id; qm follows
+it through Claude Code's PID file.
+
+`qm status` lists them after its other sections:
+
+```
+Workers (<project id>):
+  NAME           STATE     SINCE  CONTEXT  MODEL        FOLDER
+  later-adopt-2  working   20s    95k      sonnet/high  .claude/worktrees/later-adopt
+  watch          stopped   12m    180k     opus/high    .claude/worktrees/watch
+    handoff note: ~/.local/state/quartermaster/handoff/<project id>/watch.md
+```
+
+`qm watch` prints the same table, then checks every 15 seconds (`--interval`)
+and exits 0 at the first check where it reported a watched worker that is
+`stopped`, `silent` or `gone`, with one line per worker it reported (an event
+another watch reported first is that watch's; this one keeps waiting); your
+`notify` command gets the worker's name and state, without paths:
+
+```
+watch stopped 12s ago; handoff note: ~/.local/state/quartermaster/handoff/<project id>/watch.md
+later-adopt-2 silent for 10 min
+```
+
+Each stop, silence and disappearance is reported once, by the first watch that
+sees it, even one that happened before the watch started; a later watch lists
+it as `(reported)` and does not wait for it until the worker works again (qm
+keeps these marks in `~/.local/state/quartermaster/watch/`). Keep one watch per
+project; restart it after dealing with what it reported. Without names it watches every worker;
+with names, only those. `--silent` overrides the threshold for one run, and
+`--timeout` gives up after a while, exiting 0: it is one deadline for the
+whole watch, the marks lock and the notifier included. It runs no daemon and
+types into no session.
+
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `qm init [--yes] [--undo] [--marketplace PATH\|OWNER/REPO]` | set up qm, or put back what it changed |
-| `qm status [--json]` | what is on and off and why: providers, rules, compact windows, Claude limits, Codex |
+| `qm status [--json]` | what is on and off and why: providers, rules, compact windows, Claude limits, Codex, and the project's workers |
 | `qm route worker\|review ...` | print the decision a spawn would make; writes no log |
 | `qm spawn worker ...` | route, launch a worker and log it (`--dry-run` launches nothing) |
 | `qm spawn review ...` | route, run a review and return structured findings |
 | `qm report [--since DAY] [--baseline [--before DAY] [--project TEXT]]` | what workers cost and how their reviews went, by tier and by worker; with `--baseline`, flags rows that did worse than your earlier sessions |
 | `qm statusline [-- COMMAND]` | record Claude's usage limits from the status line, then run your own status-line command |
 | `qm up`, `qm up done NAME`, `qm down` | see [Projects](#projects-qm-up-and-qm-down) |
+| `qm watch [--silent D] [--timeout D] [--interval D] [NAME...]` | wait until a worker of this project stops, goes silent or goes away; see [Watching workers](#watching-workers-qm-watch) |
 | `qm version` | print the version and commit |
 
 `qm hook NAME` and `qm feedback-analyze` are run by the plugins; you never run

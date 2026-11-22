@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -143,13 +142,12 @@ func TestAdoptSaveFailsMovesNothing(t *testing.T) {
 	if len(ap.Moves) != 1 {
 		t.Fatalf("moves %+v", ap.Moves)
 	}
-	blocked := filepath.Join(t.TempDir(), "file")
-	if err := os.WriteFile(blocked, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("XDG_STATE_HOME", blocked)
-	if err := Adopt(context.Background(), &ap, w.deps()); err == nil {
-		t.Fatal("Adopt succeeded with an unwritable state")
+	// The state file alone is blocked: the adoption lock beside it works, so
+	// the run fails at the save itself.
+	blockSave(t, ProjectID(w.repo))
+	err = Adopt(context.Background(), &ap, w.deps())
+	if err == nil || strings.Contains(err.Error(), "lock") {
+		t.Fatalf("Adopt err %v, want the save's", err)
 	}
 	for _, v := range w.agterm.verbs() {
 		if v != "tree" {

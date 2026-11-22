@@ -19,6 +19,10 @@ func (x agtermTerms) Sessions(ctx context.Context, _, ws string) ([]launch.Sessi
 	return x.a.Sessions(ctx, ws)
 }
 
+func (agtermTerms) PaneRuns(context.Context, launch.SessionRef, string) (bool, error) {
+	return false, nil // agterm only: no tmux window
+}
+
 func (x agtermTerms) Close(ctx context.Context, ref launch.SessionRef) error {
 	return x.a.Close(ctx, ref)
 }

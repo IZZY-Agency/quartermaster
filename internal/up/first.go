@@ -32,7 +32,11 @@ func CheckClaudeArgs(args []string) error {
 // session id and no prompt, and saves the project. Without a launcher it
 // writes the script and saves the project with no terminal session, so the
 // coordinator the printed line starts is the one the next qm up knows; it
-// returns launch.ErrNoLauncher with the Outcome naming the script.
+// returns launch.ErrNoLauncher with the Outcome naming the script. It holds
+// the adoption lock from the workspace's naming to the save: an adoption in
+// another project rechecks under that lock which sessions and workspaces
+// the saved projects hold, so it never takes this coordinator, running
+// before its project is saved, as a worker, nor this workspace.
 func Start(ctx context.Context, root string, args []string, d Deps) (Project, Outcome, error) {
 	if err := CheckClaudeArgs(args); err != nil {
 		return Project{}, Outcome{}, err
@@ -52,6 +56,11 @@ func Start(ctx context.Context, root string, args []string, d Deps) (Project, Ou
 			return Project{}, Outcome{}, fmt.Errorf("%w: run claude in %s once and accept the trust dialog", spawn.ErrUntrusted, root)
 		}
 	}
+	unlock, err := AdoptLock()
+	if err != nil {
+		return Project{}, Outcome{}, fmt.Errorf("coordinator not started: %w", err)
+	}
+	defer unlock()
 	all, err := All()
 	if err != nil {
 		return Project{}, Outcome{}, err
@@ -85,10 +94,15 @@ func Start(ctx context.Context, root string, args []string, d Deps) (Project, Ou
 	if err != nil {
 		return p, o, err
 	}
+	// The project is saved, with the coordinator's id reserved and no terminal
+	// session, before the coordinator starts: a start that fails, a failed
+	// second save or a qm that exits after the start leaves a project that
+	// knows the id, as one that never ran (Gather), not a live coordinator no
+	// project holds.
+	if err := Save(p); err != nil {
+		return p, o, err
+	}
 	if d.Launcher == nil {
-		if err := Save(p); err != nil {
-			return p, o, err
-		}
 		return p, o, launch.ErrNoLauncher
 	}
 	if o.Ref, err = d.Launcher.Spawn(ctx, launch.LaunchSpec{Name: p.Coordinator.Name, Cwd: root, Script: o.Script, WorkspaceName: ws}); err != nil {
@@ -97,7 +111,7 @@ func Start(ctx context.Context, root string, args []string, d Deps) (Project, Ou
 	}
 	p.Sessions[id] = stored(o.Ref)
 	if err := Save(p); err != nil {
-		o.Err = fmt.Errorf("coordinator started (%s %s), but the project was not saved: %w", o.Ref.Launcher, o.Ref.ID, err)
+		o.Err = fmt.Errorf("coordinator started (%s %s), but its terminal session was not saved: %w", o.Ref.Launcher, o.Ref.ID, err)
 		return p, o, o.Err
 	}
 	logUp(d, &p, o.Step, id, now, &o)

@@ -113,6 +113,17 @@ func newReview(r reviewRequest, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if in.DiffLines == 0 && in.DiffFiles == 0 {
+		// A review started in the wrong folder (the main checkout, for a
+		// branch that lives in a worktree) is sized and counted for the
+		// wrong branch; say so, the reviewer may still be given the diff
+		// by its prompt.
+		counted := "its round is counted for that branch"
+		if branch == "" {
+			counted = "with no --round its round is 1, a detached HEAD having no branch history to count"
+		}
+		_, _ = fmt.Fprintf(stderr, "note: %s has no diff against its base, so the review is sized without one and %s; run qm spawn review in the folder of the branch under review, or pass --repo\n", branchLabel(branch), counted)
+	}
 
 	deps, err := routeDeps()
 	if err != nil {
@@ -302,4 +313,12 @@ func runnerAlive(dir string) bool {
 		return true
 	}
 	return !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
+}
+
+// branchLabel names a branch in a note; a detached HEAD has none.
+func branchLabel(branch string) string {
+	if branch == "" {
+		return "this checkout (detached HEAD)"
+	}
+	return "branch " + branch
 }

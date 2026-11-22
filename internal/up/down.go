@@ -20,6 +20,9 @@ type Terminals interface {
 	// Sessions lists the sessions of launcher's workspace (agterm) or tmux
 	// session called workspaceName.
 	Sessions(ctx context.Context, launcher, workspaceName string) ([]launch.SessionRef, error)
+	// PaneRuns says whether listed tmux window ref (of one pane) runs
+	// session sessionID's process in its foreground.
+	PaneRuns(ctx context.Context, ref launch.SessionRef, sessionID string) (bool, error)
 	Close(ctx context.Context, ref launch.SessionRef) error
 }
 
@@ -33,7 +36,7 @@ type Terminals interface {
 // is closed too, with no Record.
 //
 // Before closing, Down lists the project's workspace (agterm) or tmux
-// session once per launcher, and closes only a recorded session still in
+// session once per launcher and again right before each close, and closes only a recorded session still in
 // it, through the listed ref: a tmux window id restarts with the server, so
 // an id alone may name a window of another tmux session. A recorded session
 // the listing no longer shows is dropped from p.Sessions, whatever session
@@ -44,7 +47,8 @@ type Terminals interface {
 //
 // A running session's terminal session is closed only when it runs that
 // session (closable): an agterm tab whose foreground is it, a tmux window
-// of one pane. A recorded session whose Claude session is not running (any
+// of one pane whose foreground is its process (Terminals.PaneRuns, read
+// right before the close). A recorded session whose Claude session is not running (any
 // step but a leave) is closed only when the listing marks it Idle: an idle shell
 // (agterm), or a dead or shell pane alone in its window (tmux). Since a
 // reused or adopted tab outlives its session, it may run something else by
@@ -100,15 +104,37 @@ func Down(ctx context.Context, p *Project, steps []Step, terms Terminals, keepOp
 			outs[i].Err = errors.Join(outs[i].Err, fmt.Errorf("%s: %s %s not closed: the workspace %s was not listed: %w", outs[i].Step.Name, ref.Launcher, ref.ID, p.Workspace, err))
 			continue
 		}
-		l := listed[ref.Launcher][ref.ID]
-		if !closable(outs[i].Step, l) {
+		// The workspace is listed again right before this close (as qm up
+		// does a stale window): the first listing was read before the earlier
+		// closes, and a pane split or a job started meanwhile would die with
+		// the window. A window that is no longer the recorded one is gone.
+		l, found, err := relisted(ctx, p, ref, terms)
+		if err != nil {
+			outs[i].Err = errors.Join(outs[i].Err, fmt.Errorf("%s: %s %s not closed: the workspace %s was not listed again: %w", outs[i].Step.Name, ref.Launcher, ref.ID, p.Workspace, err))
+			continue
+		}
+		if !found {
+			p.drop(id)
+			changed = true
+			continue
+		}
+		runs := true
+		if closable(outs[i].Step, l) && outs[i].Step.Action == Leave && l.Launcher == "tmux" {
+			// Right before the close: the window's pane still runs the
+			// session in its foreground, not a job started there since.
+			if runs, err = terms.PaneRuns(ctx, l, id); err != nil {
+				outs[i].Err = errors.Join(outs[i].Err, fmt.Errorf("%s: tmux %s not closed: the foreground of its pane not read: %w", outs[i].Step.Name, ref.ID, err))
+				continue
+			}
+		}
+		if !runs || !closable(outs[i].Step, l) {
 			outs[i].Ref = stored(ref)
 			outs[i].Ref.Warning = LeftOpen
 			p.drop(id)
 			changed = true
 			continue
 		}
-		err := terms.Close(ctx, l)
+		err = terms.Close(ctx, l)
 		if err != nil && !errors.Is(err, launch.ErrGone) {
 			outs[i].Err = errors.Join(outs[i].Err, fmt.Errorf("%s: close %s %s: %w", outs[i].Step.Name, ref.Launcher, ref.ID, err))
 			continue
@@ -123,6 +149,23 @@ func Down(ctx context.Context, p *Project, steps []Step, terms Terminals, keepOp
 		}
 	}
 	return outs
+}
+
+// relisted lists recorded session rec's workspace again and returns the
+// listed window that is rec (same id, and for tmux the same name), found false
+// when none is.
+func relisted(ctx context.Context, p *Project, rec launch.SessionRef, terms Terminals) (l launch.SessionRef, found bool, err error) {
+	refs, err := terms.Sessions(ctx, rec.Launcher, p.Workspace)
+	if err != nil {
+		return l, false, err
+	}
+	for _, r := range refs {
+		if r.ID == rec.ID && (r.Launcher == "" || r.Launcher == rec.Launcher) && sameWindow(rec, r) {
+			r.Launcher = rec.Launcher
+			return r, true, nil
+		}
+	}
+	return l, false, nil
 }
 
 // LeftOpen is the warning on a terminal session qm down leaves open.

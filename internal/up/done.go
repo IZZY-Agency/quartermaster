@@ -142,13 +142,18 @@ func defaultBranch(ctx context.Context, run DirRunner, dir string) string {
 // currentBranch is the branch checked out in dir; "" when run is nil, dir is
 // empty or missing, or git names none (a detached HEAD, not a repository).
 func currentBranch(run DirRunner, dir string) string {
+	return currentBranchCtx(context.Background(), run, dir)
+}
+
+// currentBranchCtx is currentBranch under ctx's deadline too.
+func currentBranchCtx(parent context.Context, run DirRunner, dir string) string {
 	if run == nil || dir == "" {
 		return ""
 	}
 	if _, err := os.Stat(dir); err != nil {
 		return ""
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), checkTimeout)
+	ctx, cancel := context.WithTimeout(parent, checkTimeout)
 	defer cancel()
 	out, err := run(ctx, dir, "git", "symbolic-ref", "--short", "HEAD")
 	if err != nil {

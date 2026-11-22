@@ -246,22 +246,34 @@ func offerStatusLine(p prompter, path string, settings []byte, existed bool, rec
 		return nil
 	}
 	updated, diff, changed := WrapStatusLine(settings)
+	repoint := false
 	if !changed {
-		if cmd, ok := statusLineCommand(settings); ok && providers.Wrapped(cmd) {
-			say(p.out, "Status line: already runs qm statusline\n")
-		} else {
+		cmd, ok := statusLineCommand(settings)
+		if !ok || !providers.Wrapped(cmd) {
 			say(p.out, "Status line: has no command to wrap; left alone\n")
+			return nil
 		}
-		return nil
+		if updated, diff, repoint = RepointStatusLine(settings); !repoint {
+			say(p.out, "Status line: already runs qm statusline\n")
+			return nil
+		}
+		say(p.out, "Status line: it runs qm statusline through another qm than this one. Change to %s:\n%s", path, diff)
+	} else {
+		say(p.out, "Status line: qm statusline records your Claude usage limits. Change to %s\n(qm runs by its absolute path, so the status line does not depend on PATH):\n%s", path, diff)
 	}
-	say(p.out, "Status line: qm statusline records your Claude usage limits. Change to %s\n(qm runs by its absolute path, so the status line does not depend on PATH):\n%s", path, diff)
 	if !p.ask("Write this change?") {
 		say(p.out, "Status line: left as it is\n")
 		return nil
 	}
 	var before *string
+	// A repoint of the wrap an earlier init wrote keeps that init's "before"
+	// and its backup, so the undo still puts back the user's own file.
+	inherited := false
 	if cmd, ok := statusLineCommand(settings); ok {
 		before = &cmd
+		if repoint && rec.StatusLineAfter == cmd {
+			before, inherited = rec.StatusLineBefore, true
+		}
 	}
 	mode := fs.FileMode(0o600)
 	backup := ""
@@ -271,11 +283,16 @@ func offerStatusLine(p prompter, path string, settings []byte, existed bool, rec
 			return err
 		}
 		mode = fi.Mode().Perm()
-		backup = path + ".qm-backup-" + strconv.FormatInt(time.Now().Unix(), 10)
+		backup = freeBackupName(path)
 		if err := writeFileAtomic(backup, settings, mode); err != nil {
 			return fmt.Errorf("back up %s: %w", path, err)
 		}
 		say(p.out, "Backup: %s\n", backup)
+		if inherited && rec.SettingsBackup != "" {
+			// The undo restores from the first init's backup, the one that
+			// holds the file as the user had it; this one is a safety copy.
+			backup = rec.SettingsBackup
+		}
 	} else if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -697,4 +714,20 @@ func appendNew(list []string, s string) []string {
 		return list
 	}
 	return append(list, s)
+}
+
+// backupStamp is the number a backup's name ends in: Unix seconds.
+var backupStamp = func() int64 { return time.Now().Unix() }
+
+// freeBackupName is <path>.qm-backup-<seconds>, with -2, -3, ... added while
+// that name is taken, so a backup never overwrites an earlier one.
+func freeBackupName(path string) string {
+	base := path + ".qm-backup-" + strconv.FormatInt(backupStamp(), 10)
+	name := base
+	for n := 2; ; n++ {
+		if _, err := os.Lstat(name); errors.Is(err, fs.ErrNotExist) {
+			return name
+		}
+		name = base + "-" + strconv.Itoa(n)
+	}
 }

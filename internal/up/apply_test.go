@@ -1188,10 +1188,19 @@ func TestAdoptedArgsCapped(t *testing.T) {
 		{"default kept under acceptEdits", []string{"--permission-mode", "default"}, acceptEdits, "--permission-mode default"},
 		{"plan kept under bypass", []string{"--permission-mode=plan"}, []string{"--dangerously-skip-permissions"}, "--permission-mode plan"},
 		{"acceptEdits lowered to plan", []string{"--permission-mode", "acceptEdits"}, []string{"--permission-mode", "plan"}, "--permission-mode plan"},
+		{"acceptEdits lowered to dontAsk", []string{"--permission-mode", "acceptEdits"}, []string{"--permission-mode", "dontAsk"}, "--permission-mode dontAsk"},
+		{"dontAsk kept under acceptEdits", []string{"--permission-mode", "dontAsk"}, acceptEdits, "--permission-mode dontAsk"},
 	}
 	for _, tc := range cases {
-		if got := strings.Join(adoptedArgs(tc.args, tc.coord), " "); got != tc.want {
-			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
+		args, err := adoptedArgs(tc.args, tc.coord)
+		if got := strings.Join(args, " "); err != nil || got != tc.want {
+			t.Errorf("%s: %q, %v, want %q", tc.name, got, err, tc.want)
+		}
+	}
+	// plan and dontAsk have no mode in common: refused, in both orders.
+	for _, pair := range [][2]string{{"plan", "dontAsk"}, {"dontAsk", "plan"}} {
+		if got, err := adoptedArgs([]string{"--permission-mode", pair[0]}, []string{"--permission-mode", pair[1]}); err == nil {
+			t.Errorf("%s under %s: %q, want a refusal", pair[0], pair[1], got)
 		}
 	}
 }
@@ -1241,8 +1250,9 @@ func TestUpResumesHandStarted(t *testing.T) {
 
 func TestAdoptedArgsDropsUnkept(t *testing.T) {
 	args := []string{"--settings", `{"permissions":{"defaultMode":"bypassPermissions"}}`, "--allowedTools", "Bash", "--model=opus", "--effort", "high", "--verbose"}
-	if got := strings.Join(adoptedArgs(args, nil), " "); got != "--model=opus --effort high" {
-		t.Errorf("adoptedArgs = %q, want only the kept flags", got)
+	kept, err := adoptedArgs(args, nil)
+	if got := strings.Join(kept, " "); err != nil || got != "--model=opus --effort high" {
+		t.Errorf("adoptedArgs = %q, %v, want only the kept flags", got, err)
 	}
 }
 
@@ -1262,6 +1272,57 @@ func TestUpHandStartedBadNameNotStarted(t *testing.T) {
 	for _, v := range f.verbs() {
 		if strings.HasPrefix(v, "session new") {
 			t.Errorf("started %v", f.verbs())
+		}
+	}
+}
+
+// seqLister lists each of lists in turn, the last again after that.
+type seqLister struct {
+	lists [][]launch.SessionRef
+	n     int
+}
+
+func (s *seqLister) Sessions(context.Context, string) ([]launch.SessionRef, error) {
+	l := s.lists[min(s.n, len(s.lists)-1)]
+	s.n++
+	return l, nil
+}
+
+// A stale tmux window is listed again right before it is closed: one that
+// started a job, gained a pane or is another window by now (the prompt was
+// open meanwhile) is left open.
+func TestUpStaleWindowRecheckedBeforeClose(t *testing.T) {
+	before := launch.SessionRef{Launcher: "tmux", ID: "@4", Name: "repo-coord", Workspace: "repo", Idle: true, Panes: 1}
+	busy, pane, renamed := before, before, before
+	busy.Idle = false
+	pane.Idle, pane.Panes = false, 2
+	renamed.Name = "vim"
+	for _, c := range []struct {
+		name   string
+		now    launch.SessionRef
+		closed bool
+		warns  bool
+	}{
+		{"still idle", before, true, false},
+		{"a job started", busy, false, true},
+		{"a pane added", pane, false, true},
+		{"another window", renamed, false, false},
+	} {
+		w := newWorld(t)
+		w.project.Sessions = map[string]launch.SessionRef{coordID: {Launcher: "tmux", ID: "@4", Name: "repo-coord"}}
+		steps := []Step{{Candidate: Candidate{Role: RoleCoordinator, SessionID: coordID, Name: "repo-coord"}, Action: Resume}}
+		closer := &fakeCloser{p: &w.project}
+		d := Deps{Lister: &seqLister{lists: [][]launch.SessionRef{{before}, {c.now}}}, Closer: closer}
+		sp := PlanStale(context.Background(), &w.project, steps, d)
+		if len(sp.Close) != 1 {
+			t.Fatalf("%s: planned closes %v", c.name, sp.Close)
+		}
+		warn := closeStale(context.Background(), sp, d)
+		if got := slices.Contains(closer.closed, "@4"); got != c.closed {
+			t.Errorf("%s: closed %v, want %v", c.name, closer.closed, c.closed)
+		}
+		if got := len(warn[coordID]) > 0; got != c.warns {
+			t.Errorf("%s: warnings %q, want some: %v", c.name, warn[coordID], c.warns)
 		}
 	}
 }

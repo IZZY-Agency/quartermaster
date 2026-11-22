@@ -7,7 +7,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/IZZY-Agency/quartermaster/internal/claudecode"
 	"github.com/IZZY-Agency/quartermaster/internal/launch"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
 )
@@ -114,5 +116,109 @@ func TestUpFirstRunNoLauncherSavesTheProject(t *testing.T) {
 	}
 	if !strings.Contains(readFile(t, o.Script), "--session-id "+p.Coordinator.ID) || len(logged) != 0 {
 		t.Errorf("script or Records wrong: %d Records", len(logged))
+	}
+}
+
+// lockProbe is a launcher that reads, as it starts a session, whether the
+// adoption lock is held.
+type lockProbe struct {
+	launch.Launcher
+	held *bool
+}
+
+func (l lockProbe) Spawn(ctx context.Context, s launch.LaunchSpec) (launch.SessionRef, error) {
+	unlock, err := AdoptLock()
+	if err == nil {
+		unlock()
+	}
+	*l.held = errors.Is(err, ErrAdoptBusy)
+	return l.Launcher.Spawn(ctx, s)
+}
+
+// A first run starts its coordinator and saves its project under the
+// adoption lock: an adoption in another project, which rechecks under it
+// what the saved projects hold, never sees the coordinator running before
+// it is saved, so never takes it as a worker. The lock is free afterwards.
+func TestUpFirstRunStartsUnderTheAdoptionLock(t *testing.T) {
+	var logged []route.Record
+	d := upDeps(t, &fakeAgterm{}, &logged)
+	held := false
+	d.Launcher = lockProbe{d.Launcher, &held}
+	old := adoptLockWait
+	adoptLockWait = 20 * time.Millisecond
+	t.Cleanup(func() { adoptLockWait = old })
+	if _, _, err := Start(context.Background(), t.TempDir(), nil, d); err != nil {
+		t.Fatal(err)
+	}
+	if !held {
+		t.Error("the coordinator started without the adoption lock held")
+	}
+	unlock, err := AdoptLock()
+	if err != nil {
+		t.Fatalf("the lock was left held after the run: %v", err)
+	}
+	unlock()
+}
+
+// saveProbe is a launcher that reads, as it starts a session, what the
+// project's state file holds.
+type saveProbe struct {
+	launch.Launcher
+	root  string
+	saved *Project
+	ok    *bool
+}
+
+func (l saveProbe) Spawn(ctx context.Context, s launch.LaunchSpec) (launch.SessionRef, error) {
+	*l.saved, *l.ok, _ = Load(l.root)
+	return l.Launcher.Spawn(ctx, s)
+}
+
+// A first run saves the project, with the coordinator's id reserved and no
+// terminal session, before it starts the coordinator: a crash or a failed
+// save after the start leaves a project that knows the live coordinator's id.
+func TestUpFirstRunSavesTheProjectBeforeStartingTheCoordinator(t *testing.T) {
+	var logged []route.Record
+	d := upDeps(t, &fakeAgterm{}, &logged)
+	root := t.TempDir()
+	var before Project
+	var ok bool
+	d.Launcher = saveProbe{d.Launcher, root, &before, &ok}
+	p, _, err := Start(context.Background(), root, nil, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || before.Coordinator.ID != p.Coordinator.ID || len(before.Sessions) != 0 {
+		t.Errorf("state when the coordinator started = %+v, %v; want the id saved with no terminal session", before, ok)
+	}
+	saved, _, _ := Load(root)
+	if saved.Sessions[p.Coordinator.ID].ID != "s-1" {
+		t.Errorf("saved after the start = %+v, want the terminal session pinned", saved.Sessions)
+	}
+}
+
+// A coordinator that fails to start leaves its project saved as never run: no
+// terminal session, the id reserved, and the next Gather reads it as a
+// session that is not running and has no transcript.
+func TestUpFirstRunFailedStartLeavesTheProjectNeverRun(t *testing.T) {
+	var logged []route.Record
+	f := &fakeAgterm{}
+	d := upDeps(t, f, &logged)
+	root := t.TempDir()
+	f.fail = map[string]bool{filepath.Base(root) + "-coord": true}
+	p, _, err := Start(context.Background(), root, nil, d)
+	if err == nil {
+		t.Fatal("a failed start returned no error")
+	}
+	saved, ok, err := Load(root)
+	if err != nil || !ok || saved.Coordinator.ID != p.Coordinator.ID || len(saved.Sessions) != 0 || len(logged) != 0 {
+		t.Fatalf("saved = %+v, %v, %v, %d Records; want the id saved, no session, nothing logged", saved, ok, err, len(logged))
+	}
+	cs, err := Gather(&saved, nil, Env{Live: map[string]claudecode.LiveSession{}, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cs) != 1 || cs[0].SessionID != p.Coordinator.ID || cs[0].Live || cs[0].Transcript != "" {
+		t.Errorf("candidates = %+v, want the never-run coordinator", cs)
 	}
 }

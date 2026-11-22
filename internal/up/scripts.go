@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/IZZY-Agency/quartermaster/internal/claudecode"
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
 	"github.com/IZZY-Agency/quartermaster/internal/policy"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
@@ -77,8 +78,9 @@ func qmDirOf(exe string) string {
 // workerProfile is the logged launch profile of a worker step, re-resolved
 // for today (spec 5.5): the qm-worker plugin folder found again (BuildProfile
 // puts it first), the permission flags capped at the coordinator's current
-// ones, and the project tie in the environment.
-func workerProfile(p *Project, s Step, exe string) (route.Profile, error) {
+// ones (coordinator: its claude arguments, coordinatorCap), and the project
+// tie in the environment.
+func workerProfile(p *Project, s Step, exe string, coordinator []string) (route.Profile, error) {
 	if !hasProfile(s.Record) {
 		return route.Profile{}, fmt.Errorf("%s: no launch profile in its Record", s.Name)
 	}
@@ -96,7 +98,14 @@ func workerProfile(p *Project, s Step, exe string) (route.Profile, error) {
 	} else {
 		prof.PluginDirs = []string{dir}
 	}
-	prof.Permission = spawn.CapPermission(prof.Permission, p.ClaudeArgs)
+	// Never raised: the weaker of the worker's own flags and the
+	// coordinator's, as for a hand-started worker; not started when the two
+	// have no mode in common.
+	perm, err := spawn.LowerPermission(prof.Permission, coordinator)
+	if err != nil {
+		return route.Profile{}, fmt.Errorf("%s: not started, its own permission flags against the coordinator's: %w", s.Name, err)
+	}
+	prof.Permission = perm
 	if prof.Env == nil {
 		prof.Env = map[string]string{}
 	}
@@ -116,8 +125,9 @@ const (
 // coordinator's (spawn.LowerPermission), then --allow-dangerously-skip-permissions when it
 // had it and the coordinator runs with bypass or carries it too, then its
 // --model and --effort in order. Every other argument is dropped, so
-// nothing outside the kept list reaches the resume line.
-func adoptedArgs(args, coordinator []string) []string {
+// nothing outside the kept list reaches the resume line. An error when its
+// own permission flags and the coordinator's have no mode in common.
+func adoptedArgs(args, coordinator []string) ([]string, error) {
 	var perm, rest []string
 	allow := false
 	for i := 0; i < len(args); i++ {
@@ -141,11 +151,15 @@ func adoptedArgs(args, coordinator []string) []string {
 			rest = append(rest, a)
 		}
 	}
-	out := slices.Clone(spawn.LowerPermission(perm, coordinator))
+	lowered, err := spawn.LowerPermission(perm, coordinator)
+	if err != nil {
+		return nil, fmt.Errorf("its own permission flags against the coordinator's: %w", err)
+	}
+	out := slices.Clone(lowered)
 	if limit, _ := spawn.PermissionOf(coordinator, 0); allow && (slices.Contains(limit, bypassFlag) || slices.Contains(coordinator, allowFlag)) {
 		out = append(out, allowFlag)
 	}
-	return append(out, rest...)
+	return append(out, rest...), nil
 }
 
 // writeSummary builds the restart summary of a fresh coordinator (spec 7)
@@ -236,4 +250,66 @@ func sweepNotes(dir string, age time.Duration) {
 			_ = os.Remove(filepath.Join(dir, e.Name()))
 		}
 	}
+}
+
+// LiveArgs are the permission flags of running session id, read off its
+// process in procs (livePermission): live is false when id is not in live; an error when its
+// process is not listed or does not run claude.
+func LiveArgs(id string, live map[string]claudecode.LiveSession, procs []claudecode.Proc) (args []string, ok bool, err error) {
+	l, ok := live[id]
+	if !ok {
+		return nil, false, nil
+	}
+	for _, pr := range procs {
+		if pr.PID != l.PID {
+			continue
+		}
+		if args, isClaude := claudecode.IsClaude(pr.Cmd); isClaude {
+			flags, err := livePermission(args)
+			if err != nil {
+				return nil, true, fmt.Errorf("the claude arguments of its process %d: %w", l.PID, err)
+			}
+			return flags, true, nil
+		}
+		break
+	}
+	return nil, true, fmt.Errorf("the claude arguments of its process %d not read", l.PID)
+}
+
+// livePermission is the permission flags read off a running claude's words:
+// the words up to --, and of every permission reading among them the weakest
+// (spawn.LowerPermission), so a prompt that names a stronger flag cannot
+// raise it. The process list keeps no argument boundaries, so a coordinator
+// with no permission flag whose prompt (without --) names one is still read
+// as having it: the same as reading its saved arguments did before.
+// --allow-dangerously-skip-permissions is never passed on from a live read.
+// An error when two readings have no mode in common.
+func livePermission(words []string) ([]string, error) {
+	if i := slices.Index(words, "--"); i >= 0 {
+		words = words[:i]
+	}
+	var out []string
+	seen := false
+	for i := 0; i < len(words); i++ {
+		var reading []string
+		switch a := words[i]; {
+		case a == bypassFlag || strings.HasPrefix(a, modeFlag+"="):
+			reading = []string{a}
+		case a == modeFlag && i+1 < len(words):
+			reading = []string{a, words[i+1]}
+			i++
+		default:
+			continue
+		}
+		flags, _ := spawn.PermissionOf(reading, 0)
+		if !seen {
+			out, seen = flags, true
+			continue
+		}
+		var err error
+		if out, err = spawn.LowerPermission(out, flags); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }

@@ -14,6 +14,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/IZZY-Agency/quartermaster/internal/claudecode"
@@ -35,10 +37,12 @@ const upUsage = `usage:
   handoff    print the coordinator's handoff note path (and create its
              folder), for a coordinator qm up adopted: it has no QM_HANDOFF
              until its next restart; it answers that coordinator only
-  --adopt   first run: adopt the live Claude sessions in the project's
+  --adopt    first run: adopt the live Claude sessions in the project's
              folders without asking; the coordinator is the session running
              qm up, else the one session in the project root that no worker
-             Record names
+             Record names. On a project with state: adopt running sessions
+             it does not hold as workers (it asks which; with --yes or no
+             terminal only the ones a worker Record names), restart nothing
   --adopt-coordinator ID
              first run: adopt the session with this id (or a unique prefix)
              as the coordinator; implies --adopt
@@ -63,12 +67,14 @@ var (
 			return err == nil
 		})
 	}
-	upProcs              = claudecode.Procs
-	upRun   up.DirRunner = up.ExecDir
+	upProcs = claudecode.Procs
+	// upProcsCtx lists the processes for a detection, ps stopped at its
+	// deadline.
+	upProcsCtx              = claudecode.ProcsCtx
+	upRun      up.DirRunner = up.ExecDir
 	// upTerminal says whether stdin is a terminal, where qm up can ask.
 	upTerminal = func() bool {
-		fi, err := os.Stdin.Stat()
-		return err == nil && fi.Mode()&os.ModeCharDevice != 0
+		return isTTY(os.Stdin.Fd())
 	}
 	upStdin io.Reader = os.Stdin
 	// upGhNote says why gh cannot tell merged workers ("" when it can):
@@ -83,8 +89,24 @@ var (
 	// adoption, whatever launcher was picked.
 	upAgtermCtl = launch.Agterm{Bin: "agtermctl", Run: launch.Exec}
 	upTmuxCtl   = launch.Tmux{Bin: "tmux", Run: launch.Exec}
+	// upPaneRuns says whether tmux target's pane runs process pid in its
+	// foreground: the pane's tty is pid's, and pid's process group is that
+	// tty's foreground group (a job started there, or pid suspended, is not).
+	upPaneRuns = func(ctx context.Context, target string, pid int) (bool, error) {
+		t := upTmuxCtl
+		out, err := t.Run(ctx, t.Bin, "display-message", "-p", "-t", target, "#{pane_tty}")
+		if err != nil {
+			return false, fmt.Errorf("tmux: %w", err)
+		}
+		tty, fg, err := claudecode.ForegroundOf(ctx, pid)
+		if err != nil {
+			return false, err
+		}
+		pane := strings.TrimPrefix(strings.TrimSpace(string(out)), "/dev/")
+		return fg && tty != "" && pane == tty, nil
+	}
 	// upTermOf reads a process's terminal session from its environment.
-	upTermOf = claudecode.TermEnvOf
+	upTermOf = claudecode.TermEnvOfCtx
 	// upSelfPID is the process qm up looks for its own claude session from:
 	// CLAUDE_PID when it names a claude process, else qm's parent.
 	upSelfPID = func(procs []claudecode.Proc) int {
@@ -139,6 +161,9 @@ type upOptions struct {
 	// new coordinator and adopt nothing.
 	adopt, newRun    bool
 	adoptCoordinator string
+	// coordinatorGiven says --adopt-coordinator was on the command line,
+	// whatever its value: it is a first-run flag.
+	coordinatorGiven bool
 	claudeArgs       []string
 	argsGiven        bool
 }
@@ -192,11 +217,15 @@ func parseUp(args []string, stderr io.Writer) (upOptions, error) {
 	fs.BoolVar(&o.dryRun, "dry-run", false, "print the plan; change nothing")
 	fs.BoolVar(&o.full, "full", false, "resume every unfinished session in full; start none fresh")
 	fs.StringVar(&o.launcher, "launcher", "", "agterm or tmux (default: the config's launcher)")
-	fs.BoolVar(&o.adopt, "adopt", false, "first run: adopt the running sessions without asking")
+	fs.BoolVar(&o.adopt, "adopt", false, "adopt the running sessions as the project's first run does, without asking; on a project with state, adopt workers only (asks which)")
 	fs.StringVar(&o.adoptCoordinator, "adopt-coordinator", "", "first run: adopt the session with this id (or unique prefix) as the coordinator; implies --adopt")
 	fs.BoolVar(&o.newRun, "new", false, "first run: start a new coordinator and adopt nothing")
 	if err := parseFlags(fs, flags); err != nil {
 		return o, err
+	}
+	fs.Visit(func(f *flag.Flag) { o.coordinatorGiven = o.coordinatorGiven || f.Name == "adopt-coordinator" })
+	if o.coordinatorGiven && o.adoptCoordinator == "" {
+		return o, fmt.Errorf("%w: --adopt-coordinator takes a session id (or a unique prefix), and got none", errUsage)
 	}
 	if o.adoptCoordinator != "" {
 		o.adopt = true
@@ -250,14 +279,21 @@ func upRunMain(args []string, stdout, stderr io.Writer) error {
 	if choice == "" {
 		choice = cfg.Launcher
 	}
+	if found && (o.coordinatorGiven || o.newRun) {
+		return fmt.Errorf("%w: --adopt-coordinator and --new are for a project's first run; %s has state already", errUsage, root)
+	}
+	if found && o.adopt {
+		// Workers only: nothing is started, so no launcher is picked.
+		if o.argsGiven || o.full {
+			return fmt.Errorf("%w: on a project with state, --adopt adopts workers only: it does not go with --full or coordinator arguments after --", errUsage)
+		}
+		return upAdoptLater(&p, recs, o, upDeps(nil, exe, cfg), stdout, stderr)
+	}
 	l, pickErr := upPick(choice)
 	if pickErr != nil && !errors.Is(pickErr, launch.ErrNoLauncher) {
 		return fmt.Errorf("%w: %v", errUsage, pickErr)
 	}
 	d := upDeps(l, exe, cfg)
-	if found && (o.adopt || o.newRun) {
-		return fmt.Errorf("%w: --adopt, --adopt-coordinator and --new are for a project's first run; %s has state already", errUsage, root)
-	}
 	if !found {
 		return upFirstRun(root, recs, o, d, stdout, stderr)
 	}
@@ -275,6 +311,9 @@ func upDeps(l launch.Launcher, exe string, cfg config.Config) up.Deps {
 		Run:     upRun,
 		Live:    upLive,
 		Sleep:   upSleep,
+		// A worker's permission is capped at the running coordinator's own
+		// flags, read off its process right before the worker starts.
+		CoordinatorArgs: upCoordinatorArgs,
 	}
 	if l == nil {
 		return d
@@ -301,6 +340,24 @@ func upLive() (map[string]claudecode.LiveSession, error) {
 		return nil, err
 	}
 	return claudecode.Live(dir, procs)
+}
+
+// upCoordinatorArgs reads the permission flags of running session id off
+// its process (up.LiveArgs); live is false when it does not run.
+func upCoordinatorArgs(id string) (args []string, live bool, err error) {
+	procs, err := upProcs()
+	if err != nil {
+		return nil, false, err
+	}
+	dir, err := paths.ClaudeDir()
+	if err != nil {
+		return nil, false, err
+	}
+	sessions, err := claudecode.Live(dir, procs)
+	if err != nil {
+		return nil, false, err
+	}
+	return up.LiveArgs(id, sessions, procs)
 }
 
 // selfSessions are the terminal sessions qm up runs in, which stale-shell
@@ -449,13 +506,16 @@ func upRestore(p *up.Project, recs []route.Record, o upOptions, d up.Deps, pickE
 	if o.argsGiven && !o.dryRun {
 		p.ClaudeArgs = append([]string{}, o.claudeArgs...)
 	}
-	steps, now, notes, err := upPlan(p, recs, o.full, "started")
+	steps, now, notes, procs, err := upPlan(p, recs, o.full, "started")
 	if err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(stdout, "project %s (%s), workspace %s, launcher %s\n", p.ID, p.Root, p.Workspace, launcherNote(d.Launcher))
 	_, _ = fmt.Fprint(stdout, up.Render(steps, now))
 	printNotes(stdout, notes)
+	if n := upUnheldNote(p, recs, procs); n != "" {
+		_, _ = fmt.Fprintf(stdout, "note: %s\n", n)
+	}
 	if pickErr == nil {
 		// The stale shells closed are shown, so the answer covers them.
 		d.Stale = up.PlanStale(context.Background(), p, steps, d)
@@ -531,14 +591,14 @@ func upRestore(p *up.Project, recs []route.Record, o upOptions, d up.Deps, pickE
 // decides each one; now is when it decided; notes say what it could read
 // only in part (spec 8). Without ps there is no duplicate guard, so a ps
 // failure is an error ("nothing <nothing>" says what was not done).
-func upPlan(p *up.Project, recs []route.Record, full bool, nothing string) ([]up.Step, time.Time, []string, error) {
+func upPlan(p *up.Project, recs []route.Record, full bool, nothing string) ([]up.Step, time.Time, []string, []claudecode.Proc, error) {
 	procs, err := upProcs()
 	if err != nil {
-		return nil, time.Time{}, nil, fmt.Errorf("%w; nothing %s (without ps qm cannot see which sessions run)", err, nothing)
+		return nil, time.Time{}, nil, nil, fmt.Errorf("%w; nothing %s (without ps qm cannot see which sessions run)", err, nothing)
 	}
 	claudeDir, err := paths.ClaudeDir()
 	if err != nil {
-		return nil, time.Time{}, nil, err
+		return nil, time.Time{}, nil, nil, err
 	}
 	var notes []string
 	if n := claudecode.SessionsNote(claudeDir); n != "" {
@@ -546,15 +606,15 @@ func upPlan(p *up.Project, recs []route.Record, full bool, nothing string) ([]up
 	}
 	live, err := claudecode.Live(claudeDir, procs)
 	if err != nil {
-		return nil, time.Time{}, nil, err
+		return nil, time.Time{}, nil, nil, err
 	}
 	cc, err := outcomes.DefaultClaude()
 	if err != nil {
-		return nil, time.Time{}, nil, err
+		return nil, time.Time{}, nil, nil, err
 	}
 	handoff, err := up.HandoffDir()
 	if err != nil {
-		return nil, time.Time{}, nil, err
+		return nil, time.Time{}, nil, nil, err
 	}
 	check, n := trustOnce()
 	if n != "" {
@@ -569,9 +629,9 @@ func upPlan(p *up.Project, recs []route.Record, full bool, nothing string) ([]up
 		Finished: up.Finished(*p, upRun), HandoffDir: handoff, Run: upRun,
 	})
 	if err != nil {
-		return nil, time.Time{}, nil, err
+		return nil, time.Time{}, nil, nil, err
 	}
-	return up.Plan(cands, full, now), now, notes, nil
+	return up.Plan(cands, full, now), now, notes, procs, nil
 }
 
 // printNotes prints the plan's notes, one per line.
@@ -694,15 +754,43 @@ func upDone(args []string, stdout io.Writer) error {
 // (adopt design 4.1), and returns the Claude folder it read them from.
 // Without ps it cannot tell, so a ps failure stops the run.
 func upCandidates(root string, all []up.Project, recs []route.Record) (up.Detected, string, error) {
-	procs, err := upProcs()
-	if err != nil {
-		return up.Detected{}, "", fmt.Errorf("%w; nothing started (without ps qm cannot see the running sessions it could adopt; qm up --new starts a new coordinator)", err)
+	ctx, cancel := context.WithTimeout(context.Background(), upDetectTimeout)
+	defer cancel()
+	det, claudeDir, err := upDetect(ctx, root, all, recs, nil, nil, false, "nothing started (without ps qm cannot see the running sessions it could adopt; qm up --new starts a new coordinator)")
+	if errors.Is(err, errDetectIncomplete) {
+		return det, claudeDir, fmt.Errorf("%w: nothing started (a running coordinator may be among the sessions not read); run qm up again, or qm up --new starts a new coordinator", err)
 	}
+	if err != nil {
+		return det, claudeDir, err
+	}
+	upLabelTabs(ctx, det.Candidates)
+	return det, claudeDir, nil
+}
+
+// upDetect reads the machine and detects the candidates of the project at
+// root, all under ctx's deadline; held are the sessions the project holds
+// already (nil on a first run). procs is the process list to use (nil: read
+// it); quick reads only what makes a session a candidate. psFail says what
+// was not done when ps fails, for the error.
+func upDetect(ctx context.Context, root string, all []up.Project, recs []route.Record, held map[string]bool, procs []claudecode.Proc, quick bool, psFail string) (up.Detected, string, error) {
 	claudeDir, err := paths.ClaudeDir()
 	if err != nil {
 		return up.Detected{}, "", err
 	}
-	live, err := claudecode.Live(claudeDir, procs)
+	if procs == nil {
+		// A ps that stalls stops at the deadline: the project lock is never
+		// held past it.
+		if procs, err = upProcsCtx(ctx); err != nil {
+			if ctx.Err() != nil {
+				return up.Detected{}, claudeDir, errDetectIncomplete
+			}
+			return up.Detected{}, "", fmt.Errorf("%w; %s", err, psFail)
+		}
+	}
+	live, err := claudecode.LiveCtx(ctx, claudeDir, procs)
+	if err != nil && ctx.Err() != nil {
+		return up.Detected{}, claudeDir, errDetectIncomplete
+	}
 	if err != nil {
 		return up.Detected{}, "", err
 	}
@@ -710,19 +798,184 @@ func upCandidates(root string, all []up.Project, recs []route.Record) (up.Detect
 	if err != nil {
 		return up.Detected{}, "", err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	det := up.Detect(root, all, recs, up.DetectEnv{
 		Procs: procs, Live: live, Worktrees: up.Worktrees(ctx, root, upRun),
-		TranscriptPath: cc.TranscriptPath, Run: upRun, SelfPID: upSelfPID(procs),
+		TranscriptPath: cc.TranscriptPath, Run: upRun, SelfPID: upSelfPID(procs), Held: held,
+		Ctx: ctx, Quick: quick,
 	})
-	// The tab names are for the list only; without agterm there are none.
-	if len(det.Candidates) > 0 {
-		if wss, err := upAgtermCtl.Workspaces(ctx); err == nil {
-			up.LabelTabs(det.Candidates, wss, upTermOf)
-		}
+	if ctx.Err() != nil {
+		// A probe cut short leaves the list empty or partial: never act on it.
+		return up.Detected{}, claudeDir, errDetectIncomplete
 	}
 	return det, claudeDir, nil
+}
+
+// upDetectTimeout bounds a first run's and a later adoption's detection,
+// and the tab labels that follow it.
+var upDetectTimeout = 10 * time.Second
+
+// errDetectIncomplete: the detection's deadline passed before it read every
+// running session, so its candidate list may be empty or partial.
+var errDetectIncomplete = errors.New("the running sessions in the project's folders were not all read before the deadline")
+
+// upLabelTabs names the tabs of the candidates, for the printed list only;
+// without agterm there are none. It runs under the detection's deadline.
+func upLabelTabs(ctx context.Context, cands []up.AdoptCandidate) {
+	if len(cands) == 0 {
+		return
+	}
+	if wss, err := upAgtermCtl.Workspaces(ctx); err == nil {
+		up.LabelTabs(ctx, cands, wss, upTermOf)
+	}
+}
+
+// upAdoptLater is qm up --adopt on a project with state (adopt design 4.8):
+// it adopts workers only and restores nothing. The project lock, held by the
+// caller unless this is a dry run, covers the questions.
+func upAdoptLater(p *up.Project, recs []route.Record, o upOptions, d up.Deps, stdout, stderr io.Writer) error {
+	all, err := up.All()
+	if err != nil {
+		return err
+	}
+	dctx, cancel := context.WithTimeout(context.Background(), upDetectTimeout)
+	defer cancel()
+	det, claudeDir, err := upDetect(dctx, p.Root, all, recs, up.Held(*p, recs), nil, false, "nothing adopted (without ps qm cannot see the running sessions it could adopt)")
+	if errors.Is(err, errDetectIncomplete) {
+		return fmt.Errorf("%w: nothing adopted; run qm up --adopt again", err)
+	}
+	if err != nil {
+		return err
+	}
+	if note := claudecode.SessionsNote(claudeDir); note != "" {
+		return fmt.Errorf("%s; qm up cannot see which sessions run in this project, so it adopts nothing", note)
+	}
+	cands := det.Candidates
+	if len(cands) == 0 {
+		return errors.New("no running session to adopt")
+	}
+	interactive := !o.yes && upTerminal()
+	var ids []string
+	if !interactive {
+		ids = up.RecordedWorkers(cands)
+	}
+	if interactive || len(ids) == 0 {
+		upLabelTabs(dctx, cands)
+	}
+	rows := up.RenderCandidates(cands, time.Now().UTC())
+	const hint = "run qm up --adopt in a terminal to pick it"
+	if !interactive && len(ids) == 0 {
+		_, _ = fmt.Fprintf(stderr, "qm up: running Claude sessions in the project's folders that the project does not hold:\n%s", rows)
+		if slices.ContainsFunc(cands, func(c up.AdoptCandidate) bool { return !c.Subfolder }) {
+			_, _ = fmt.Fprintf(stderr, "%s\n", hint)
+		}
+		return errors.New("no running session to adopt")
+	}
+	if interactive && o.dryRun {
+		_, err := fmt.Fprintf(stdout, "running Claude sessions in the project's folders that the project does not hold:\n%sqm up --adopt would ask which of these to adopt as workers\n(dry run: nothing adopted)\n", rows)
+		return err
+	}
+	var in *bufio.Reader
+	if interactive {
+		_, _ = fmt.Fprintf(stdout, "running Claude sessions in the project's folders that the project does not hold:\n%s", rows)
+		in = bufio.NewReader(upStdin)
+		if ids, err = up.AskWorkers(cands, in, stdout); err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			_, err := fmt.Fprintln(stdout, "nothing adopted")
+			return err
+		}
+	}
+	ad := upAdoptDeps(d, claudeDir)
+	ap, err := up.PlanAdoptWorkers(context.Background(), *p, all, cands, ids, ad)
+	if err != nil {
+		return err
+	}
+	if o.dryRun && !interactive {
+		// A dry run shows the rows as well as the plan (design 4.8).
+		upLabelTabs(dctx, cands)
+		_, _ = fmt.Fprintf(stdout, "running Claude sessions in the project's folders that the project does not hold:\n%s", up.RenderCandidates(cands, time.Now().UTC()))
+	}
+	_, _ = fmt.Fprint(stdout, up.RenderAdopt(ap))
+	if !interactive && slices.ContainsFunc(ap.Left, func(c up.AdoptCandidate) bool { return !c.Subfolder }) {
+		_, _ = fmt.Fprintln(stdout, hint)
+	}
+	if o.dryRun {
+		_, err := fmt.Fprintln(stdout, "(dry run: nothing adopted)")
+		return err
+	}
+	if in != nil {
+		_, _ = fmt.Fprint(stdout, "Proceed? [y/N] ")
+		line, _ := in.ReadString('\n')
+		// Piped input is not echoed: end the prompt's line, so the last line
+		// of the run stands alone.
+		_, _ = fmt.Fprintln(stdout)
+		if a := strings.ToLower(strings.TrimSpace(line)); a != "y" && a != "yes" {
+			_, err := fmt.Fprintln(stdout, "nothing adopted")
+			return err
+		}
+	}
+	planned := len(ap.Notes)
+	if err := up.Adopt(context.Background(), &ap, ad); err != nil {
+		return err
+	}
+	printNotes(stdout, ap.Notes[planned:])
+	_, err = fmt.Fprintf(stdout, "project %s: adopted %d worker(s); nothing restarted\n", p.ID, len(ap.Workers))
+	return err
+}
+
+// upNoteTimeout bounds the restore's note: its detection and every
+// subprocess of it share this one deadline (adopt design 4.8).
+var upNoteTimeout = 10 * time.Second
+
+// upNoteRunning counts the note's detections still running: one that
+// outlasts the deadline goes on (its subprocesses cancelled) after the
+// restore stops waiting for it, until the process exits. Tests wait on it
+// before they put back what it reads.
+var upNoteRunning sync.WaitGroup
+
+// upUnheldNote is the note a restore prints when running sessions in the
+// project's folders are not in the project (adopt design 4.8), "" when there
+// are none. It is a hint: any failure, and a detection that outlasts the
+// deadline (which cancels its subprocesses), give "". procs is the process
+// list the restore read already.
+func upUnheldNote(p *up.Project, recs []route.Record, procs []claudecode.Proc) string {
+	ctx, cancel := context.WithTimeout(context.Background(), upNoteTimeout)
+	defer cancel()
+	root, held := p.Root, up.Held(*p, recs)
+	res := make(chan int, 1)
+	upNoteRunning.Add(1)
+	go func() {
+		defer upNoteRunning.Done()
+		// The reads stop between files and sessions once ctx ends; a single
+		// read that stalls (a hung mount) keeps this goroutine until it
+		// returns or qm exits: the restore does not wait for it.
+		all, err := up.AllCtx(ctx)
+		if err != nil {
+			res <- 0
+			return
+		}
+		det, claudeDir, err := upDetect(ctx, root, all, recs, held, procs, true, "")
+		if err != nil || ctx.Err() != nil || claudecode.SessionsNote(claudeDir) != "" {
+			res <- 0
+			return
+		}
+		n := 0
+		for _, c := range det.Candidates {
+			if !c.Subfolder {
+				n++
+			}
+		}
+		res <- n
+	}()
+	select {
+	case n := <-res:
+		if n > 0 {
+			return fmt.Sprintf("%d running session(s) in the project's folders are not in the project: qm up --adopt lists them", n)
+		}
+	case <-ctx.Done():
+	}
+	return ""
 }
 
 // upAdoptDeps wires the machine into up.AdoptDeps: agterm and tmux through
@@ -730,13 +983,17 @@ func upCandidates(root string, all []up.Project, recs []route.Record) (up.Detect
 func upAdoptDeps(d up.Deps, claudeDir string) up.AdoptDeps {
 	a, t := upAgtermCtl, upTmuxCtl
 	return up.AdoptDeps{
-		Workspaces: a.Workspaces, Move: a.Move, Pin: a.Pin, PaneOf: t.PaneOf, TermOf: upTermOf,
+		Workspaces: a.Workspaces, Move: a.Move, Pin: a.Pin, PaneOf: t.PaneOf,
+		TermOf: func(pid int) (claudecode.TermEnv, error) { return upTermOf(context.Background(), pid) },
 		WindowPanes: func(ctx context.Context, windowID string) (int, error) {
 			out, err := t.Run(ctx, t.Bin, "display-message", "-p", "-t", windowID, "#{window_panes}")
 			if err != nil {
 				return 0, fmt.Errorf("tmux: %w", err)
 			}
 			return strconv.Atoi(strings.TrimSpace(string(out)))
+		},
+		PaneRuns: func(ctx context.Context, windowID string, pid int) (bool, error) {
+			return upPaneRuns(ctx, windowID, pid)
 		},
 		Live: func() (map[string]claudecode.LiveSession, error) {
 			procs, err := upProcs()
@@ -746,6 +1003,13 @@ func upAdoptDeps(d up.Deps, claudeDir string) up.AdoptDeps {
 			return claudecode.Live(claudeDir, procs)
 		},
 		Trusted: d.Trusted, Log: d.Log, Now: d.Now, Config: d.Coordinator,
+		Records: func() ([]route.Record, error) { return declog.Read(time.Time{}) },
+		// Signal 0 checks that the process exists; EPERM: it runs as
+		// another user.
+		Running: func(pid int) bool {
+			err := syscall.Kill(pid, 0)
+			return err == nil || errors.Is(err, syscall.EPERM)
+		},
 	}
 }
 
@@ -803,6 +1067,9 @@ func upAdopt(root string, all []up.Project, det up.Detected, claudeDir string, o
 	if in != nil {
 		_, _ = fmt.Fprint(stdout, "Proceed? [y/N] ")
 		line, _ := in.ReadString('\n')
+		// Piped input is not echoed: end the prompt's line, so the last line
+		// of the run stands alone.
+		_, _ = fmt.Fprintln(stdout)
 		if a := strings.ToLower(strings.TrimSpace(line)); a != "y" && a != "yes" {
 			_, err := fmt.Fprintln(stdout, "nothing adopted")
 			return err

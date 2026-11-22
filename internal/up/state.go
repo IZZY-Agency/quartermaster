@@ -5,6 +5,7 @@
 package up
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -277,6 +278,12 @@ func writeAtomic(path string, data []byte) (err error) {
 // All returns every recorded project, sorted by file name (the id). A
 // missing projects folder holds none.
 func All() ([]Project, error) {
+	return AllCtx(context.Background())
+}
+
+// AllCtx is All that stops between project files when ctx ends, with ctx's
+// error. A single read that stalls (a hung mount) is not cut short.
+func AllCtx(ctx context.Context) ([]Project, error) {
 	dir, err := projectsDir()
 	if err != nil {
 		return nil, fmt.Errorf("projects: %w", err)
@@ -289,6 +296,9 @@ func All() ([]Project, error) {
 	for _, f := range files {
 		if strings.HasPrefix(filepath.Base(f), ".") {
 			continue // a temporary file of Save, or another stray dotfile
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		p, err := readProject(f)
 		if errors.Is(err, fs.ErrNotExist) {
@@ -326,6 +336,53 @@ func Lock(id string) (unlock func(), err error) {
 			return nil, ErrBusy
 		}
 		return nil, fmt.Errorf("lock project: %w", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+// adoptLockWait bounds the wait for the adoption lock.
+var adoptLockWait = 10 * time.Second
+
+// ErrAdoptBusy: another adoption, or a first run starting its coordinator,
+// held the machine-wide adoption lock for longer than adoptLockWait.
+var ErrAdoptBusy = errors.New("another qm up is adopting sessions or starting a project: try again in a moment")
+
+// AdoptLock takes the machine-wide adoption lock, <state>/projects/.adopt.lock
+// (a dotfile, so All skips it), with flock(LOCK_EX), waiting up to
+// adoptLockWait: every adoption, in any project, rechecks which sessions the
+// other projects hold and saves its own under it, and an ordinary first run
+// starts its coordinator and saves its project under it, so two projects
+// never both take one session. unlock releases it; the lock also ends with the process.
+func AdoptLock() (unlock func(), err error) {
+	dir, err := projectsDir()
+	if err != nil {
+		return nil, fmt.Errorf("adoption lock: %w", err)
+	}
+	if err := ensureDir(dir); err != nil {
+		return nil, fmt.Errorf("adoption lock: %w", err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, ".adopt.lock"), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("adoption lock: %w", err)
+	}
+	deadline := time.Now().Add(adoptLockWait)
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			_ = f.Close()
+			return nil, fmt.Errorf("adoption lock: %w", err)
+		}
+		if time.Now().After(deadline) {
+			_ = f.Close()
+			return nil, ErrAdoptBusy
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	return func() {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)

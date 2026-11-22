@@ -4,6 +4,7 @@
 package claudecode
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,14 +52,53 @@ const startSlack = 2 * time.Second
 
 // Procs lists every running process with ps.
 func Procs() ([]Proc, error) {
-	cmd := exec.Command("ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart=", "-o", "command=")
+	return ProcsCtx(context.Background())
+}
+
+// ProcsCtx is Procs, with ps killed once ctx ends; the error then wraps
+// ctx's.
+func ProcsCtx(ctx context.Context) ([]Proc, error) {
+	cmd := exec.CommandContext(ctx, "ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart=", "-o", "command=")
 	// lstart's day and month names are English only in the C locale.
 	cmd.Env = append(os.Environ(), "LC_ALL=C")
 	out, err := cmd.Output()
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("ps: %w", ctx.Err())
+	}
 	if err != nil {
 		return nil, fmt.Errorf("ps: %w", err)
 	}
 	return ParseProcs(out), nil
+}
+
+// ForegroundOf reads, with ps, process pid's terminal and whether pid is
+// in that terminal's foreground process group: tty is the terminal's name
+// as ps prints it (ttys012, pts/3), "" when pid has none. A process
+// suspended, or under another job started in its terminal, is not in the
+// foreground.
+func ForegroundOf(ctx context.Context, pid int) (tty string, foreground bool, err error) {
+	out, err := exec.CommandContext(ctx, "ps", "-o", "tty=", "-o", "pgid=", "-o", "tpgid=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return "", false, fmt.Errorf("ps %d: %w", pid, err)
+	}
+	return parseForeground(out)
+}
+
+// parseForeground reads ps -o tty= -o pgid= -o tpgid= of one process.
+func parseForeground(out []byte) (tty string, foreground bool, err error) {
+	f := strings.Fields(string(out))
+	if len(f) != 3 {
+		return "", false, fmt.Errorf("ps: unexpected output %q", out)
+	}
+	pgid, err1 := strconv.Atoi(f[1])
+	tpgid, err2 := strconv.Atoi(f[2])
+	if err1 != nil || err2 != nil {
+		return "", false, fmt.Errorf("ps: unexpected output %q", out)
+	}
+	if f[0] == "??" || f[0] == "?" || f[0] == "-" {
+		return "", false, nil
+	}
+	return f[0], tpgid > 0 && pgid == tpgid, nil
 }
 
 // ParseProcs reads the output of ps -A -o pid= -o ppid= -o lstart= -o
@@ -117,11 +157,17 @@ type sessionFile struct {
 // or --session-id=ID. A missing sessions folder leaves (b) only; a session
 // file that cannot be read is skipped.
 func Live(claudeDir string, procs []Proc) (map[string]LiveSession, error) {
-	return live(claudeDir, procs, time.Local)
+	return live(context.Background(), claudeDir, procs, time.Local)
 }
 
-// live is Live with the zone ps prints lstart in.
-func live(claudeDir string, procs []Proc, local *time.Location) (map[string]LiveSession, error) {
+// LiveCtx is Live that stops between session files when ctx ends, with
+// ctx's error. A single read that stalls (a hung mount) is not cut short.
+func LiveCtx(ctx context.Context, claudeDir string, procs []Proc) (map[string]LiveSession, error) {
+	return live(ctx, claudeDir, procs, time.Local)
+}
+
+// live is LiveCtx with the zone ps prints lstart in.
+func live(ctx context.Context, claudeDir string, procs []Proc, local *time.Location) (map[string]LiveSession, error) {
 	byPID := make(map[int]Proc, len(procs))
 	out := map[string]LiveSession{}
 	for _, p := range procs {
@@ -139,6 +185,9 @@ func live(claudeDir string, procs []Proc, local *time.Location) (map[string]Live
 		return nil, fmt.Errorf("session files: %w", err)
 	}
 	for _, f := range files {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		s, err := readSessionFile(f)
 		if err != nil {
 			continue // unreadable, gone since the glob, or not JSON: skipped

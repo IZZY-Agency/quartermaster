@@ -97,6 +97,10 @@ var rules = map[string]rule{
 	"lsp-note":        {run: lspNote},
 	"write-note":      {run: writeNote},
 	"context-limit":   {stateful: true, run: contextLimit},
+	// Turn hooks (turn.go) keep their own files, outside the session state
+	// and its lock: qm watch reads them.
+	"turn-start": {run: turnStart},
+	"turn-stop":  {run: turnStop},
 	// Coordinator rules (coordinator.go); reviewer-model is in both plugins.
 	"reviewer-model":   {usesJev: true, run: reviewerModel},
 	"ask-gate":         {coordinator: true, usesJev: true, needsKey: true, run: askGate},
@@ -398,7 +402,7 @@ func contextLimit(c *call) (result, error) {
 		name = c.in.SessionID
 	}
 	c.st.LastNoteCtx = used
-	return result{note: fmt.Sprintf("Context is at %d tokens. Finish the current step, write the handoff note to %s, and report to the coordinator.",
+	return result{note: fmt.Sprintf("Context is at %d tokens. Finish the current step, write the handoff note to %s, then send the coordinator a message with SendMessage.",
 		used, filepath.Join(dir, name+".md"))}, nil
 }
 

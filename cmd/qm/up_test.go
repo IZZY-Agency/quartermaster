@@ -125,7 +125,7 @@ func newUpMachine(t *testing.T) *upMachine {
 	swap(t, &upPick, func(string) (launch.Launcher, error) {
 		return launch.Agterm{Bin: "agtermctl", Run: m.term.run}, nil
 	})
-	swap(t, &upProcs, func() ([]claudecode.Proc, error) { return nil, nil })
+	swapProcs(t, func() ([]claudecode.Proc, error) { return nil, nil })
 	swap(t, &upRun, func(context.Context, string, string, ...string) ([]byte, error) {
 		return nil, errors.New("not here")
 	})
@@ -138,6 +138,14 @@ func newUpMachine(t *testing.T) *upMachine {
 	})
 	swap(t, &upTmuxWindow, func(string) (string, error) { return "", errors.New("no tmux") })
 	return m
+}
+
+// swapProcs fakes the process list for every reader of it: upProcs and a
+// detection's upProcsCtx.
+func swapProcs(t *testing.T, f func() ([]claudecode.Proc, error)) {
+	t.Helper()
+	swap(t, &upProcs, f)
+	swap(t, &upProcsCtx, func(context.Context) ([]claudecode.Proc, error) { return f() })
 }
 
 func swap[T any](t *testing.T, v *T, to T) {
@@ -351,7 +359,7 @@ func TestUpNoLauncherPrintsScripts(t *testing.T) {
 func TestUpPsFailureStopsBeforeStart(t *testing.T) {
 	m := newUpMachine(t)
 	m.project(t)
-	swap(t, &upProcs, func() ([]claudecode.Proc, error) { return nil, errors.New("ps: not permitted") })
+	swapProcs(t, func() ([]claudecode.Proc, error) { return nil, errors.New("ps: not permitted") })
 	var out, errb bytes.Buffer
 	if code := run([]string{"up", "--yes"}, &out, &errb); code != 1 || !strings.Contains(errb.String(), "nothing started") {
 		t.Errorf("exit %d, stderr %q", code, errb.String())
@@ -509,7 +517,7 @@ func TestUpRepinsAgtermRefUnderTmux(t *testing.T) {
 	if err := up.Save(p); err != nil {
 		t.Fatal(err)
 	}
-	swap(t, &upProcs, func() ([]claudecode.Proc, error) {
+	swapProcs(t, func() ([]claudecode.Proc, error) {
 		return []claudecode.Proc{{PID: 501, Cmd: "claude -n proj-coord --resume " + upCoordID}}, nil
 	})
 	swap(t, &upPick, func(string) (launch.Launcher, error) {

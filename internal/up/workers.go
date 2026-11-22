@@ -19,10 +19,13 @@ import (
 // project has no worker of that name. The caller saves p.
 func MarkDone(p *Project, cands []Candidate, name string, now time.Time) (string, error) {
 	var marked *Candidate
-	// Gather orders workers oldest start first: the last match is newest.
+	// Gather lists the recorded workers, then the hand-started ones, each
+	// oldest first: the newest is the latest start across both, a tie going
+	// to the later listed.
 	for i := range cands {
-		if cands[i].Role == RoleWorker && cands[i].Name == name {
-			marked = &cands[i]
+		c := &cands[i]
+		if c.Role == RoleWorker && c.Name == name && (marked == nil || !c.Started.Before(marked.Started)) {
+			marked = c
 		}
 	}
 	if marked == nil {

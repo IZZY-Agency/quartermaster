@@ -201,6 +201,14 @@ func TestDetectStatusLineAndLSPAndNotify(t *testing.T) {
 	if s := byName(t, got, "statusline"); !s.On {
 		t.Errorf("statusline = %+v", s)
 	}
+	gone := filepath.Join(home, "gone", "qm")
+	if err := os.WriteFile(filepath.Join(claude, "settings.json"), []byte(`{"statusLine": {"command": "`+gone+` statusline -- 'my-line'"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	again := Detect(context.Background(), cfg, envOf(map[string]string{"CLAUDE_CONFIG_DIR": claude}), lookIn("tg"))
+	if s := byName(t, again, "statusline"); s.On || !strings.Contains(s.Why, gone+", which is gone") {
+		t.Errorf("statusline with a missing qm = %+v, want off and the path named", s)
+	}
 	if s := byName(t, got, "lsp"); !s.On || s.Why != "LSP plugins installed: gopls-lsp, pyright-lsp" {
 		t.Errorf("lsp = %+v", s)
 	}
@@ -219,6 +227,8 @@ func TestWrapped(t *testing.T) {
 		"qm statuslinex":                    false,
 		"my-line":                           false,
 		"echo qm statusline":                false,
+		`'/a/it'\''s/qm' statusline -- 'x'`: true, // an apostrophe in the path
+		"qm statusline -- 'a\nb'":           true,
 	} {
 		if got := Wrapped(cmd); got != want {
 			t.Errorf("Wrapped(%q) = %v, want %v", cmd, got, want)

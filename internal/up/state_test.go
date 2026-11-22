@@ -1,6 +1,7 @@
 package up
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -282,5 +283,21 @@ func TestProjectWithoutAdoptionKeys(t *testing.T) {
 	}
 	if strings.Contains(string(b), "adopted") {
 		t.Errorf("a project that adopted nothing writes an adopted key:\n%s", b)
+	}
+}
+
+// AllCtx stops between project files once its context ends.
+func TestAllCtxStopsWhenCancelled(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if err := Save(Project{ID: "p-1", Root: "/r"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := AllCtx(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err %v", err)
+	}
+	if all, err := AllCtx(context.Background()); err != nil || len(all) != 1 {
+		t.Fatalf("all %v err %v", all, err)
 	}
 }

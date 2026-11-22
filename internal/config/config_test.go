@@ -1,10 +1,12 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func isolate(t *testing.T) string {
@@ -189,5 +191,49 @@ func TestUpClaudeArgsDefaultEmptyAndLoad(t *testing.T) {
 	}
 	if want := []string{"--permission-mode", "acceptEdits"}; !reflect.DeepEqual(c.Up.ClaudeArgs, want) {
 		t.Errorf("up.claude_args = %#v, want %#v", c.Up.ClaudeArgs, want)
+	}
+}
+
+func TestSilentThreshold(t *testing.T) {
+	c := Defaults()
+	if d, err := c.SilentThreshold(); err != nil || d != 10*time.Minute {
+		t.Fatalf("unset: %v %v", d, err)
+	}
+	for _, tc := range []struct {
+		json string
+		want time.Duration
+		bad  bool
+	}{
+		{`{"watch":{"silent_minutes":3}}`, 3 * time.Minute, false},
+		{`{"watch":{"silent_minutes":0}}`, 0, true},
+		{`{"watch":{"silent_minutes":-1}}`, 0, true},
+		{`{"watch":{"silent_minutes":9223372036854775807}}`, 0, true},
+		{`{"watch":{}}`, 10 * time.Minute, false},
+	} {
+		var c Config
+		if err := json.Unmarshal([]byte(tc.json), &c); err != nil {
+			t.Fatalf("%s: %v", tc.json, err)
+		}
+		d, err := c.SilentThreshold()
+		if (err != nil) != tc.bad || (!tc.bad && d != tc.want) {
+			t.Fatalf("%s: %v %v", tc.json, d, err)
+		}
+	}
+}
+
+func TestSilentMinutesWrongTypeFailsLikeOtherKeys(t *testing.T) {
+	// A wrongly typed key fails the whole file, as read_budget does.
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	for _, body := range []string{`{"read_budget":"8"}`, `{"watch":{"silent_minutes":"7"}}`} {
+		if err := os.MkdirAll(filepath.Join(dir, "quartermaster"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "quartermaster", "config.json"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(); err == nil {
+			t.Fatalf("%s: no error", body)
+		}
 	}
 }

@@ -1,6 +1,8 @@
 package claudecode
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -22,7 +24,7 @@ var cet = time.FixedZone("CET", 3600)
 func TestLiveMatchesProcStart(t *testing.T) {
 	dir, root := claudeDir(t)
 	procs := []Proc{{PID: 101, Start: "Fri Nov 20 09:00:01 2026", Cmd: "claude --dangerously-skip-permissions"}}
-	got, err := live(dir, procs, cet)
+	got, err := live(context.Background(), dir, procs, cet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +45,7 @@ func TestLiveRejectsReusedPID(t *testing.T) {
 		"Sat Nov 21 09:00:00 2026", // a day later, after a reboot
 	} {
 		procs := []Proc{{PID: 101, Start: start, Cmd: "claude"}}
-		got, err := live(dir, procs, cet)
+		got, err := live(context.Background(), dir, procs, cet)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -91,7 +93,7 @@ func TestLiveRejectsNonClaudePID(t *testing.T) {
 		{PID: 101, Start: "Fri Nov 20 09:00:00 2026", Cmd: "/bin/zsh"},
 		{PID: 202, Start: "Fri Nov 20 09:00:00 2026", Cmd: "/bin/sh -c claude --resume " + id202},
 	}
-	got, err := live(dir, procs, cet)
+	got, err := live(context.Background(), dir, procs, cet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +199,7 @@ func TestLiveSkipsUnreadableFile(t *testing.T) {
 		{PID: 101, Start: "Fri Nov 20 09:00:00 2026", Cmd: "claude"},
 		{PID: 303, Start: "Fri Nov 20 09:00:00 2026", Cmd: "claude"},
 	}
-	got, err := live(dir, procs, cet)
+	got, err := live(context.Background(), dir, procs, cet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,5 +274,55 @@ func TestIsClaudePathWithSpaces(t *testing.T) {
 	}
 	if _, ok := IsClaude("/bin/sh -c /Applications/My Tools/claude --model m"); ok {
 		t.Error("IsClaude(a shell running claude) = true, want false")
+	}
+}
+
+// ProcsCtx stops once its context ends, and lists the processes otherwise.
+func TestProcsCtxStopsWhenCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := ProcsCtx(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err %v, want context.Canceled", err)
+	}
+	procs, err := ProcsCtx(context.Background())
+	if err != nil || len(procs) == 0 {
+		t.Fatalf("procs %d, err %v", len(procs), err)
+	}
+}
+
+// LiveCtx stops between session files once its context ends.
+func TestLiveCtxStopsWhenCancelled(t *testing.T) {
+	dir := filepath.Join("testdata", "cancel") // one session file, pid 7
+	procs := []Proc{{PID: 7, Cmd: "claude"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := LiveCtx(ctx, dir, procs); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err %v", err)
+	}
+	if got, err := LiveCtx(context.Background(), dir, procs); err != nil || got["00000000-0000-4000-8000-000000000007"].PID != 7 {
+		t.Fatalf("got %v err %v", got, err)
+	}
+}
+
+// parseForeground reads ps's tty, pgid and tpgid: a process is in its
+// terminal's foreground when its group is the terminal's foreground group.
+func TestParseForeground(t *testing.T) {
+	for _, c := range []struct {
+		out  string
+		tty  string
+		fg   bool
+		fail bool
+	}{
+		{"ttys012  4242  4242\n", "ttys012", true, false},
+		{"ttys012  4242  5151\n", "ttys012", false, false},
+		{"??      4242     0\n", "", false, false},
+		{"pts/3 77 77", "pts/3", true, false},
+		{"", "", false, true},
+		{"ttys012 x 1", "", false, true},
+	} {
+		tty, fg, err := parseForeground([]byte(c.out))
+		if (err != nil) != c.fail || tty != c.tty || fg != c.fg {
+			t.Errorf("parseForeground(%q) = %q, %v, %v", c.out, tty, fg, err)
+		}
 	}
 }

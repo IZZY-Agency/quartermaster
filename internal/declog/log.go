@@ -27,6 +27,10 @@ func Path() (string, error) {
 
 // Append writes r as one line. The line goes out in a single write to a file
 // opened with O_APPEND, so lines from concurrent writers do not interleave.
+// When the file does not end with a newline (a write cut short by a full
+// disk or a crash), the line starts with one, so the cut line does not
+// swallow it; two writers that both see the cut leave a blank line, which
+// Read skips.
 func Append(r route.Record) error {
 	path, err := Path()
 	if err != nil {
@@ -42,11 +46,20 @@ func Append(r route.Record) error {
 	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("decision log: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0o600)
 	if err != nil {
 		return fmt.Errorf("decision log: %w", err)
 	}
-	if _, err := f.Write(append(b, '\n')); err != nil {
+	cut, err := endsMidLine(f)
+	if err != nil {
+		_ = f.Close()
+		return fmt.Errorf("decision log: %w", err)
+	}
+	b = append(b, '\n')
+	if cut {
+		b = append([]byte{'\n'}, b...)
+	}
+	if _, err := f.Write(b); err != nil {
 		_ = f.Close()
 		return fmt.Errorf("decision log: %w", err)
 	}
@@ -54,6 +67,20 @@ func Append(r route.Record) error {
 		return fmt.Errorf("decision log: %w", err)
 	}
 	return nil
+}
+
+// endsMidLine reports whether f is not empty and its last byte is not a
+// newline.
+func endsMidLine(f *os.File) (bool, error) {
+	fi, err := f.Stat()
+	if err != nil || fi.Size() == 0 {
+		return false, err
+	}
+	last := make([]byte, 1)
+	if _, err := f.ReadAt(last, fi.Size()-1); err != nil {
+		return false, err
+	}
+	return last[0] != '\n', nil
 }
 
 // AppendDecision logs a routing decision: rec carries the fields of the

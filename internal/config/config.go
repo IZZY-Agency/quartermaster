@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
 )
@@ -52,6 +54,12 @@ type Config struct {
 	Up struct {
 		ClaudeArgs []string `json:"claude_args"`
 	} `json:"up"`
+	// Watch configures qm watch. SilentMinutes is how long a worker's
+	// transcript goes unwritten before it counts as silent; nil (left out)
+	// means the default, 10.
+	Watch struct {
+		SilentMinutes *int64 `json:"silent_minutes,omitempty"`
+	} `json:"watch"`
 }
 
 // Defaults is the config used when there is no file; a file overrides only
@@ -194,6 +202,19 @@ func (c Config) Key() string {
 		return k
 	}
 	return c.TypeSafeKey
+}
+
+// SilentThreshold is qm watch's silence threshold: watch.silent_minutes,
+// 10 minutes when unset; an error for a value below 1.
+func (c Config) SilentThreshold() (time.Duration, error) {
+	m := c.Watch.SilentMinutes
+	switch {
+	case m == nil:
+		return 10 * time.Minute, nil
+	case *m < 1 || *m > int64(math.MaxInt64/int64(time.Minute)):
+		return 0, fmt.Errorf("watch.silent_minutes is %d; it must be a whole number from 1 to %d", *m, int64(math.MaxInt64/int64(time.Minute)))
+	}
+	return time.Duration(*m) * time.Minute, nil
 }
 
 // Rule is a rule's switch: on, note or off. A rule not in the file is on.

@@ -35,7 +35,7 @@ func TestHelpFirst(t *testing.T) {
 	os.Stdin = pr
 	t.Cleanup(func() { os.Stdin = oldStdin; _ = pr.Close(); _ = pw.Close() })
 
-	for _, cmd := range []string{"statusline", "hook", "route", "spawn", "version", "up"} {
+	for _, cmd := range []string{"statusline", "hook", "route", "spawn", "version", "up", "watch"} {
 		for _, flag := range []string{"-h", "--help"} {
 			var out, errOut bytes.Buffer
 			done := make(chan int, 1)

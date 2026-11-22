@@ -347,3 +347,38 @@ func TestStartFailureMarksFailed(t *testing.T) {
 		t.Errorf("--status --wait after a failed start: exit %d, stderr %q", code, errOut)
 	}
 }
+
+func TestSpawnReviewEmptyDiffNoteOnDetachedHead(t *testing.T) {
+	spawnHermetic(t, oneP1)
+	repo := routeRepo(t)
+	routeGit(t, repo, "checkout", "-q", "--detach")
+	prompt := routeFile(t, t.TempDir(), "prompt.md", "Check that the notes file reads well.\n")
+	code, _, errOut := spawnRun(t, "--prompt", prompt, "--base", "HEAD", "--repo", repo, "--wait")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, errOut)
+	}
+	if !strings.Contains(errOut, "detached HEAD) has no diff against its base") || !strings.Contains(errOut, "round is 1") || strings.Contains(errOut, "counted for that branch") {
+		t.Errorf("stderr %q: want the detached-HEAD wording (no branch to count for; round 1)", errOut)
+	}
+}
+
+func TestSpawnReviewNotesAnEmptyDiff(t *testing.T) {
+	spawnHermetic(t, oneP1)
+	repo := routeRepo(t)
+	prompt := routeFile(t, t.TempDir(), "prompt.md", "Check that the notes file reads well.\n")
+
+	code, _, errOut := spawnRun(t, "--prompt", prompt, "--base", "HEAD", "--repo", repo, "--wait")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, errOut)
+	}
+	if want := "note: branch feature has no diff against its base"; !strings.Contains(errOut, want) || !strings.Contains(errOut, "pass --repo") {
+		t.Errorf("stderr %q lacks %q and the --repo hint", errOut, want)
+	}
+	code, _, errOut = spawnRun(t, "--prompt", prompt, "--base", "main", "--repo", repo, "--wait")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, errOut)
+	}
+	if strings.Contains(errOut, "no diff against") {
+		t.Errorf("a review with a diff got the note: %q", errOut)
+	}
+}

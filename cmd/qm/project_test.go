@@ -25,7 +25,7 @@ func spawnFrom(t *testing.T, id string) {
 	if id != "" {
 		procs = append(procs, claudecode.Proc{PID: 51, PPID: 1, Cmd: "claude --resume " + id})
 	}
-	swap(t, &upProcs, func() ([]claudecode.Proc, error) { return procs, nil })
+	swapProcs(t, func() ([]claudecode.Proc, error) { return procs, nil })
 	swap(t, &upSelfPID, func([]claudecode.Proc) int { return 52 })
 }
 

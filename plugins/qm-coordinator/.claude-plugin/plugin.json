@@ -1,6 +1,6 @@
 {
   "name": "qm-coordinator",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "quartermaster rules for the coordinator session: workers and reviews only through qm, Claude reviewers routed to the right model and effort, questions the coordinator can decide itself sent back, and new lasting rules from the user flagged for saving.",
   "author": {
     "name": "IZZY Agency"

@@ -21,6 +21,7 @@ import (
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
 	"github.com/IZZY-Agency/quartermaster/internal/providers"
 	"github.com/IZZY-Agency/quartermaster/internal/setup"
+	"github.com/IZZY-Agency/quartermaster/internal/watch"
 )
 
 func init() {
@@ -41,6 +42,18 @@ type statusReport struct {
 	Codex             limits.CodexState  `json:"codex"`
 	CodexError        string             `json:"codex_error,omitempty"`
 	Hints             []string           `json:"hints"`
+	// Workers are the unfinished workers of the working folder's project;
+	// nil outside a project or without workers.
+	Workers *workersReport `json:"workers,omitempty"`
+}
+
+// workersReport is the Workers section: the project's workers and their
+// states, or why they could not be read.
+type workersReport struct {
+	Project string      `json:"project"`
+	Rows    []watch.Row `json:"rows,omitempty"`
+	Note    string      `json:"note,omitempty"`
+	Error   string      `json:"error,omitempty"`
 }
 
 // claudeLimitsReport is the Claude limit file written by qm statusline.
@@ -98,6 +111,7 @@ func buildStatus(ctx context.Context, cfg config.Config) statusReport {
 	for n := range cfg.Rules {
 		r.Rules[n] = cfg.Rule(n)
 	}
+	r.Workers = statusWorkers(cfg)
 	if dir, err := paths.ClaudeDir(); err == nil {
 		r.AutoCompactWindow = autoCompactWindow(filepath.Join(dir, "settings.json"))
 	}
@@ -214,6 +228,52 @@ func writeStatus(w io.Writer, r statusReport) {
 			p("  %s\n", h)
 		}
 	}
+
+	switch wr := r.Workers; {
+	case wr == nil:
+	case wr.Error != "":
+		p("Workers: %s\n", wr.Error)
+	default:
+		p("Workers (%s):\n", wr.Project)
+		if wr.Note != "" {
+			p("  note: worker states unknown: %s\n", wr.Note)
+		}
+		home, _ := os.UserHomeDir()
+		p("%s", watch.Table(wr.Rows, nil, home))
+	}
+}
+
+// statusWorkersBound bounds the Workers section: the process list and the
+// transcripts it reads. Tests shorten it.
+var statusWorkersBound = 5 * time.Second
+
+// statusWorkers builds the Workers section; nil outside a project or
+// without workers. A failure, the bound included, is the section's one
+// line, never qm status's.
+func statusWorkers(cfg config.Config) *workersReport {
+	p, ok, err := projectHere()
+	if err != nil {
+		return &workersReport{Error: err.Error()}
+	}
+	if !ok {
+		return nil
+	}
+	silent, err := cfg.SilentThreshold()
+	if err != nil {
+		return &workersReport{Project: p.ID, Error: err.Error()}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), statusWorkersBound)
+	defer cancel()
+	s, err := workersSnapshot(ctx, p.ID, silent)
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return &workersReport{Project: p.ID, Error: fmt.Sprintf("not read within %v", statusWorkersBound)}
+	case err != nil:
+		return &workersReport{Project: p.ID, Error: err.Error()}
+	case len(s.Rows) == 0:
+		return nil
+	}
+	return &workersReport{Project: p.ID, Rows: s.Rows, Note: s.Note}
 }
 
 // ago is an age at minute resolution: "under a minute ago", "5m ago",

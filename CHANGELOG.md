@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.2.0
+
+- **`qm watch` and worker states.** `qm watch` waits in the background until a
+  worker stops, goes silent or goes away, then says which and exits, so a
+  coordinator that runs it is woken instead of waiting on a worker that will
+  never report. `qm status` lists the project's workers with their state,
+  context size and model. Both read new turn hooks in the `qm-worker` plugin;
+  every stop, silence and disappearance is reported once. With a notifier
+  configured, each event is also sent through it (the worker's name and state
+  only).
+- **Adopting workers later.** `qm up --adopt` on a project that already has
+  state adds running sessions started by hand as workers and restores nothing.
+  In a terminal it asks which; with `--yes` or without a terminal it takes only
+  the ones a worker Record names. A plain `qm up` prints a one-line note when
+  such sessions exist.
+- **Stricter adoption and restore.** Two projects cannot adopt the same
+  session, workspace or tab; a worker is never given a tab another session
+  owns; a restored worker's permission is capped at the running coordinator's
+  and never raised; detection that runs out of time is an error, not an empty
+  list. `qm up` and `qm down` look at a terminal again right before they close
+  it and leave it open when it changed.
+- **`qm init` repairs an earlier install.** It repoints a status line left by
+  another `qm`, and `qm status` says when the status line runs a `qm` that is
+  gone.
+- The tmux launcher is labelled experimental: it is covered by the automated
+  tests, and agterm is the launcher qm is used with day to day.
+- `qm spawn review` prints a note when the branch it runs on has no diff
+  against its base, the sign of a review started in the wrong folder.
+
 ## 0.1.1
 
 - **`qm init` names the right plugin marketplace.** Run inside a quartermaster

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -123,5 +124,56 @@ func TestClaudePathWithSpaces(t *testing.T) {
 	ps = psOf(map[int]proc{4242: {"/bin/sh -c " + bin + " --dangerously-skip-permissions", 1}})
 	if got, why := ParentPermission(envMap(map[string]string{"CLAUDE_PID": "4242"}), ps); got != nil || why != NoCoordinator {
 		t.Errorf("flags = %q (%s), want nil", got, why)
+	}
+}
+
+// LowerPermission orders the modes partially (plan and dontAsk below
+// default, then acceptEdits, auto, bypass); a pair with no mode that allows
+// no more than either is refused, in both orders.
+func TestLowerPermission(t *testing.T) {
+	mode := func(m string) []string { return []string{"--permission-mode", m} }
+	bypass := []string{"--dangerously-skip-permissions"}
+	cases := []struct {
+		name    string
+		a, b    []string
+		want    []string
+		refused bool
+	}{
+		{"dontAsk under acceptEdits", mode("dontAsk"), mode("acceptEdits"), mode("dontAsk"), false},
+		{"dontAsk under default", mode("dontAsk"), nil, mode("dontAsk"), false},
+		{"dontAsk under auto", mode("dontAsk"), mode("auto"), mode("dontAsk"), false},
+		{"dontAsk under bypass", mode("dontAsk"), bypass, mode("dontAsk"), false},
+		{"plan under acceptEdits", mode("plan"), mode("acceptEdits"), mode("plan"), false},
+		{"acceptEdits under auto", mode("acceptEdits"), mode("auto"), mode("acceptEdits"), false},
+		{"auto under bypass", mode("auto"), []string{"--permission-mode=bypassPermissions"}, mode("auto"), false},
+		{"manual is default", mode("manual"), mode("acceptEdits"), mode("manual"), false},
+		{"default flag and none", mode("default"), nil, mode("default"), false},
+		{"same unknown", mode("future"), mode("future"), mode("future"), false},
+		{"unknown under bypass", mode("future"), bypass, mode("future"), false},
+		{"plan and dontAsk", mode("plan"), mode("dontAsk"), nil, true},
+		{"unknown and acceptEdits", mode("future"), mode("acceptEdits"), nil, true},
+		{"unknown and none", mode("future"), nil, nil, true},
+		{"two unknowns", mode("future"), mode("other"), nil, true},
+	}
+	for _, c := range cases {
+		for _, order := range [][2][]string{{c.a, c.b}, {c.b, c.a}} {
+			got, err := LowerPermission(order[0], order[1])
+			if c.refused {
+				if err == nil || !strings.Contains(err.Error(), "no permission mode") {
+					t.Errorf("%s: LowerPermission(%q, %q) = %q, %v, want a refusal", c.name, order[0], order[1], got, err)
+				}
+				continue
+			}
+			want := c.want
+			if c.name == "default flag and none" {
+				// Both stand for default: the first argument's is kept.
+				if !slices.Equal(order[0], c.a) {
+					want = order[0]
+				}
+			}
+			if err != nil || !slices.Equal(got, want) {
+				t.Errorf("%s: LowerPermission(%q, %q) = %q, %v, want %q", c.name, order[0], order[1], got, err, want)
+			}
+		}
 	}
 }

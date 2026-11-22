@@ -90,6 +90,8 @@ func TestHooksJSONCommands(t *testing.T) {
 			"PreToolUse Grep|Bash lsp-note",
 			"PreToolUse Read|Grep|Bash|Write|Edit read-budget",
 			"PreToolUse Write write-note",
+			"Stop  turn-stop",
+			"UserPromptSubmit  turn-start",
 		},
 		"qm-coordinator": {
 			"PostToolUse * feedback-deliver",

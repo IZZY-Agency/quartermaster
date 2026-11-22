@@ -1,7 +1,6 @@
 package spawn
 
 import (
-	"slices"
 	"strings"
 	"testing"
 
@@ -30,36 +29,6 @@ func TestResumeScriptMatchesLaunch(t *testing.T) {
 	}
 	if !strings.Contains(resume, " QM_PROJECT_ID=try-00000000 QM_WORKSPACE=try ") {
 		t.Errorf("resume script lacks the project tie:\n%s", resume)
-	}
-}
-
-func TestResumePermissionCapped(t *testing.T) {
-	bypass := []string{"--dangerously-skip-permissions"}
-	accept := []string{"--permission-mode", "acceptEdits"}
-	plan := []string{"--permission-mode", "plan"}
-	cases := []struct {
-		name                string
-		logged, coordinator []string
-		want                []string
-	}{
-		{"bypass under bypass", bypass, []string{"--model", "opus", "--dangerously-skip-permissions"}, bypass},
-		{"bypass under bypass mode", bypass, []string{"--permission-mode=bypassPermissions"}, bypass},
-		{"bypass under a mode", bypass, accept, accept},
-		{"bypass under none", bypass, []string{"--model", "opus"}, nil},
-		{"mode under bypass", accept, bypass, accept},
-		{"same mode", accept, []string{"--model", "opus", "--permission-mode", "acceptEdits"}, accept},
-		{"other mode", accept, plan, plan},
-		{"mode under none", accept, nil, nil},
-		{"none under bypass", nil, bypass, nil},
-		{"none under a mode", nil, accept, nil},
-		{"none under none", nil, nil, nil},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := CapPermission(c.logged, c.coordinator); !slices.Equal(got, c.want) {
-				t.Errorf("CapPermission(%q, %q) = %q, want %q", c.logged, c.coordinator, got, c.want)
-			}
-		})
 	}
 }
 
