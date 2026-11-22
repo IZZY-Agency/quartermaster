@@ -320,7 +320,10 @@ enabled, and stores a TypeSafe key you type in.
 }
 ```
 
-(`example[\s-]?corp` and `ClientA` are placeholders, and so is the notifier.) A
+(`example[\s-]?corp` and `ClientA` are placeholders, and so is the notifier:
+the `tg` command in it comes from
+[claude-tg](https://github.com/IZZY-Agency/claude-tg), which sends Claude Code
+messages to your phone over Telegram; any command works.) A
 bypass flag in `up.claude_args` would start every coordinator, and so every
 worker, without permission prompts.
 
@@ -508,6 +511,13 @@ its flags.
 4. To delete the decision log and every other record, remove
    `~/.local/state/quartermaster/` (and `~/.config/quartermaster/` if `qm init
    --undo` kept an edited config).
+
+## Thanks
+
+Special thanks to [agterm](https://github.com/umputun/agterm), the terminal
+quartermaster was built in and works best with: its workspaces, session
+sidebar and `agtermctl` are what `qm spawn worker`, `qm up` and `qm down`
+drive.
 
 ## Licence
 
