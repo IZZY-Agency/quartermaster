@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1
+
+- **`qm init` names the right plugin marketplace.** Run inside a quartermaster
+  checkout, an installed `qm` printed the checkout's path in
+  `/plugin marketplace add`. It now prints `IZZY-Agency/quartermaster` unless
+  `qm` itself was built and run from that checkout's `bin/`.
+- The README links claude-tg, thanks agterm, and has the badges and the
+  "How this repository is maintained" section.
+
 ## 0.1.0
 
 First release.

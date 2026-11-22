@@ -465,6 +465,38 @@ func TestInitMarketplaceFlag(t *testing.T) {
 	}
 }
 
+// An installed qm run inside a checkout names the public repository; a qm
+// built in the checkout (bin/qm) names the checkout.
+func TestInitMarketplaceIgnoresWorkingFolder(t *testing.T) {
+	settings := env(t)
+	co, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{".claude-plugin", "bin"} {
+		if err := os.MkdirAll(filepath.Join(co, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, filepath.Join(co, ".claude-plugin", "marketplace.json"), `{"name":"quartermaster"}`)
+	writeFile(t, filepath.Join(co, "bin", "qm"), "")
+	t.Chdir(co)
+	run := func() string {
+		var out bytes.Buffer
+		if err := Init(context.Background(), Streams{In: strings.NewReader(""), Out: &out}, Options{Yes: true, SettingsPath: settings}); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	if got := run(); !strings.Contains(got, "/plugin marketplace add "+publicMarketplace+"\n") {
+		t.Errorf("installed qm in a checkout does not name the public repository:\n%s", got)
+	}
+	executable = func() (string, error) { return filepath.Join(co, "bin", "qm"), nil }
+	if got := run(); !strings.Contains(got, "/plugin marketplace add "+co+"\n") {
+		t.Errorf("qm built in the checkout does not name it:\n%s", got)
+	}
+}
+
 func TestUndoUsesRecordedSettingsPath(t *testing.T) {
 	settings := env(t)
 	runInit(t, settings, "", true) // creates settings with a bare status line

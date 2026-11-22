@@ -78,7 +78,6 @@ const (
 
 // Tests replace these.
 var (
-	getwd      = os.Getwd
 	executable = invokedExecutable
 )
 
@@ -352,9 +351,10 @@ func WriteStatuses(w io.Writer, list []providers.Status) {
 }
 
 // marketplace is what "/plugin marketplace add" names: given, as an absolute
-// folder when it is one, else the folder of a local quartermaster checkout
-// (the working folder or one above it, or the folder above qm's own binary),
-// else the public GitHub form.
+// folder when it is one, else the checkout qm's own binary was built in (the
+// folder above its bin/), else the public GitHub form. The working folder is
+// not looked at: an installed qm run inside a checkout names the public
+// repository.
 func marketplace(given string) string {
 	if given != "" {
 		if fi, err := os.Stat(given); err == nil && fi.IsDir() {
@@ -364,31 +364,24 @@ func marketplace(given string) string {
 		}
 		return given
 	}
-	var dirs []string
-	if wd, err := getwd(); err == nil {
-		for d := wd; ; d = filepath.Dir(d) {
-			dirs = append(dirs, d)
-			if filepath.Dir(d) == d {
-				break
-			}
-		}
+	exe, err := executable()
+	if err != nil {
+		return publicMarketplace
 	}
-	if exe, err := executable(); err == nil {
-		if real, err := filepath.EvalSymlinks(exe); err == nil {
-			dirs = append(dirs, filepath.Dir(filepath.Dir(real)))
-		}
+	real, err := filepath.EvalSymlinks(exe)
+	if err != nil {
+		return publicMarketplace
 	}
-	for _, d := range dirs {
-		b, err := os.ReadFile(filepath.Join(d, ".claude-plugin", "marketplace.json"))
-		if err != nil {
-			continue
-		}
-		var m struct {
-			Name string `json:"name"`
-		}
-		if json.Unmarshal(b, &m) == nil && m.Name == "quartermaster" {
-			return d
-		}
+	d := filepath.Dir(filepath.Dir(real))
+	b, err := os.ReadFile(filepath.Join(d, ".claude-plugin", "marketplace.json"))
+	if err != nil {
+		return publicMarketplace
+	}
+	var m struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(b, &m) == nil && m.Name == "quartermaster" {
+		return d
 	}
 	return publicMarketplace
 }

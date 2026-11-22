@@ -86,9 +86,9 @@ optional (see [Optional providers](#optional-providers)).
    ```
 
 2. Inside Claude Code, add this repository as a plugin marketplace and install
-   the coordinator plugin (`qm init` prints these two lines; run from a source
-   checkout, it prints the checkout's path in the first line instead, which
-   works the same):
+   the coordinator plugin (`qm init` prints these two lines; a `qm` you built
+   yourself and run from the checkout's `bin/` prints the checkout's path in
+   the first line instead, which works the same):
 
    ```
    /plugin marketplace add IZZY-Agency/quartermaster
