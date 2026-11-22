@@ -1,3 +1,10 @@
+<p align="center">
+  <a href="https://github.com/IZZY-Agency/quartermaster/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/IZZY-Agency/quartermaster/ci.yml?branch=main&amp;label=CI" alt="CI"></a>
+  <a href="https://github.com/IZZY-Agency/quartermaster/releases/latest"><img src="https://img.shields.io/github/v/release/IZZY-Agency/quartermaster?label=release&amp;color=f5c518" alt="Latest release"></a>
+  <a href="https://github.com/IZZY-Agency/homebrew-tap"><img src="https://img.shields.io/badge/brew-izzy--agency%2Ftap%2Fquartermaster-f5c518" alt="Homebrew formula"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/IZZY-Agency/quartermaster?color=f5c518" alt="MIT licence"></a>
+</p>
+
 # quartermaster
 
 Right-size every Claude Code agent before it starts.
@@ -9,6 +16,10 @@ your usage limits last longer without losing quality. It also keeps private text
 on your machine, sends reviews to Codex while your Codex limits last and to
 Claude after, and logs every decision so you can check it against what really
 happened.
+
+[Releases](https://github.com/IZZY-Agency/quartermaster/releases) ·
+[Changelog](CHANGELOG.md) ·
+[Issues](https://github.com/IZZY-Agency/quartermaster/issues)
 
 Examples in this file use placeholders: Example Corp (a client), `<email>`,
 `<repo>` (the path of a repository), `<key>` and `ClientA`. Replace them with
@@ -519,6 +530,15 @@ quartermaster was built in and works best with: its workspaces, session
 sidebar and `agtermctl` are what `qm spawn worker`, `qm up` and `qm down`
 drive.
 
+## How this repository is maintained
+
+quartermaster is developed in a private repository. Each release is published
+here as a single commit tagged with its version, so a release tag always points
+at the tree its build came from. Small updates between releases (this README,
+CI, tooling) arrive as commits without a tag. Bug reports and feature requests
+go in [Issues](https://github.com/IZZY-Agency/quartermaster/issues).
+
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+[MIT](LICENSE). The third-party notices quartermaster ships with are in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
