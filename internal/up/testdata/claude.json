@@ -1,0 +1,7 @@
+{
+  "projects": {
+    "@ROOT@/repo": {"hasTrustDialogAccepted": true},
+    "@ROOT@/worktrees": {"hasTrustDialogAccepted": true},
+    "@ROOT@/elsewhere": {"hasTrustDialogAccepted": false}
+  }
+}

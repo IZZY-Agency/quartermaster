@@ -1,0 +1,13 @@
+# agent worktrees and local agent state
+.claude/
+
+# local-only material that must never be committed: the original design with
+# per-project evidence, the measurement scripts and their data
+.private/
+
+# build output
+/bin/
+/dist/
+
+# Finder metadata
+.DS_Store

@@ -1,0 +1,9 @@
+{
+  "name": "qm-worker",
+  "version": "0.1.0",
+  "description": "quartermaster rules for worker sessions: exploration through a Haiku explorer, LSP and Edit notes, the launch gate and the context-limit handoff note. Loaded into workers by qm spawn worker.",
+  "author": {
+    "name": "IZZY Agency"
+  },
+  "license": "MIT"
+}

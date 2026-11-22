@@ -1,0 +1,14 @@
+{
+  "name": "quartermaster",
+  "owner": {
+    "name": "IZZY Agency"
+  },
+  "description": "quartermaster: picks the model and effort for each Claude Code worker and reviewer before it is spawned.",
+  "plugins": [
+    {
+      "name": "qm-coordinator",
+      "source": "./plugins/qm-coordinator",
+      "description": "Routes Claude Code workers and reviewers to the right model and effort through qm, and keeps the coordinator from asking what it can decide itself. Needs the qm command."
+    }
+  ]
+}

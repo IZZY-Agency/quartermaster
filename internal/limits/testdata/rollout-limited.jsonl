@@ -1,0 +1,5 @@
+{"timestamp":"2026-11-19T10:00:00.000Z","type":"session_meta","payload":{"id":"s1"}}
+{"timestamp":"2026-11-19T10:00:01.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":40.0,"window_minutes":10080,"resets_at":RESET},"secondary":null,"credits":null}}}
+{"timestamp":"2026-11-19T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-11-19T10:00:03.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":100.0,"window_minutes":10080,"resets_at":RESET},"secondary":null,"credits":{"has_credits":true,"unlimited":false,"balance":"500"}}}}
+{"timestamp":"2026-11-19T10:00:04.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":null,"secondary":null,"credits":null}}}

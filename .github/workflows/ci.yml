@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # CI runs on the public repository only; in the private working repository
+    # the job is skipped and `make check` run locally is the gate.
+    if: github.repository == 'IZZY-Agency/quartermaster'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        if: hashFiles('go.mod') != ''
+        with:
+          go-version-file: go.mod
+
+      - uses: golangci/golangci-lint-action@v9
+        if: hashFiles('go.mod') != ''
+        with:
+          version: v2.15.0
+          install-only: true
+
+      # make check runs the private-material guard over the tree and over the
+      # history of this branch, main, origin/main and the tags (the full scan
+      # of every ref is make private-all); CI has no deny-list, so it says so
+      # explicitly.
+      - run: make check PRIVATE_FLAGS=--no-denylist
+      - run: make build

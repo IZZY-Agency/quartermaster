@@ -1,0 +1,1 @@
+{"ok":true,"result":{"tree":{"workspaces":[{"id":"w1","name":"alpha","sessions":[{"id":"s1","name":"coordinator","cwd":"/work/repo","foreground":["claude","--resume","00000000-0000-4000-8000-000000000001"]},{"id":"s2","name":"task-1","foregroundShell":"zsh","cwd":"/work/wt"}]},{"id":"w2","name":"beta","sessions":[{"id":"s3","name":"other"}]}]}}}

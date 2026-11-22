@@ -1,0 +1,31 @@
+{
+  "role": {
+    "choice": "implement",
+    "probabilities": {
+      "implement": 0.9,
+      "review": 0.05,
+      "research": 0.05
+    }
+  },
+  "mechanical": {
+    "noul": 0.2
+  },
+  "security": {
+    "noul": 0.05
+  },
+  "live_data": {
+    "noul": 0.05
+  },
+  "root_cause": {
+    "noul": 0.1
+  },
+  "design_open": {
+    "noul": 0.1
+  },
+  "visual": {
+    "noul": 0.05
+  },
+  "data_risk": {
+    "noul": 0.05
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "session_id": "test-session",
+  "transcript_path": "/tmp/qm-test/transcript.jsonl",
+  "cwd": "/work/example",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {"command": "ls"},
+  "tool_use_id": "toolu_test"
+}

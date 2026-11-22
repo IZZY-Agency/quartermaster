@@ -1,0 +1,9 @@
+{
+  "numStartups": 3,
+  "projects": {
+    "@ROOT@/trusted": {"hasTrustDialogAccepted": true, "allowedTools": []},
+    "@ROOT@/trusted/sub/declined": {"hasTrustDialogAccepted": false},
+    "@ROOT@/other": {"hasTrustDialogAccepted": false},
+    "@ROOT@/slash/": {"hasTrustDialogAccepted": true}
+  }
+}

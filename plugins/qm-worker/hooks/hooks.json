@@ -1,0 +1,84 @@
+{
+  "description": "quartermaster worker rules. Each hook runs qm hook <name> and exits quietly when qm is not on PATH.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Grep|Bash|Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook read-budget",
+            "timeout": 25
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook raw-launch-gate",
+            "timeout": 25
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook explorer-model",
+            "timeout": 25
+          },
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook reviewer-model",
+            "timeout": 25
+          }
+        ]
+      },
+      {
+        "matcher": "Grep|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook lsp-note",
+            "timeout": 25
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook write-note",
+            "timeout": 25
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook context-limit",
+            "timeout": 25
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook reviewer-model",
+            "timeout": 25
+          }
+        ]
+      }
+    ]
+  }
+}

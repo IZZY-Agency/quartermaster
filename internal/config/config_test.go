@@ -1,0 +1,193 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+)
+
+func isolate(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	t.Setenv("TYPESAFE_API_KEY", "")
+	return dir
+}
+
+func TestConfigDefaults(t *testing.T) {
+	isolate(t)
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ReadBudget != 8 || c.WorkerWindow["sonnet"] != 250000 || c.WorkerWindow["opus"] != 400000 || c.WorkerWindow["fable"] != 400000 {
+		t.Errorf("budget %d window %v", c.ReadBudget, c.WorkerWindow)
+	}
+	if c.Launcher != "auto" || c.Privacy.LocalModel != "auto" {
+		t.Errorf("launcher %q local model %q", c.Launcher, c.Privacy.LocalModel)
+	}
+	if len(c.Worker.Plugins) != 0 || len(c.Privacy.Clients) != 0 || len(c.Notify) != 0 {
+		t.Errorf("want empty lists: %+v", c)
+	}
+	if c.Rule("any-rule") != "on" {
+		t.Errorf("rule default %q, want on", c.Rule("any-rule"))
+	}
+}
+
+func TestConfigXDG(t *testing.T) {
+	dir := isolate(t)
+	want := filepath.Join(dir, "quartermaster", "config.json")
+	if got, err := Path(); err != nil || got != want {
+		t.Fatalf("Path() = %q, %v; want %q", got, err, want)
+	}
+	c, _ := Load()
+	if err := Save(c); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("saved file not under XDG_CONFIG_HOME: %v", err)
+	}
+}
+
+func TestConfigSaveMode(t *testing.T) {
+	dir := isolate(t)
+	c, _ := Load()
+	if err := Save(c); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(filepath.Join(dir, "quartermaster", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("file mode %v, want 0600", fi.Mode().Perm())
+	}
+	di, err := os.Stat(filepath.Join(dir, "quartermaster"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if di.Mode().Perm() != 0o700 {
+		t.Errorf("folder mode %v, want 0700", di.Mode().Perm())
+	}
+}
+
+func TestConfigRoundTrip(t *testing.T) {
+	isolate(t)
+	c, _ := Load()
+	c.Privacy.Clients = []Pseudonym{{Pattern: "Acme", Replace: "client-a"}}
+	c.Worker.Plugins = []string{"example-plugin"}
+	c.Rules = map[string]string{"read-budget": "note"}
+	c.WorkerWindow["sonnet"] = 200000
+	c.TypeSafeKey = "file-key"
+	if err := Save(c); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Privacy.Clients) != 1 || got.Privacy.Clients[0].Replace != "client-a" || got.Worker.Plugins[0] != "example-plugin" {
+		t.Errorf("lists lost: %+v", got)
+	}
+	if got.Rule("read-budget") != "note" || got.Rule("other") != "on" {
+		t.Errorf("rules %v", got.Rules)
+	}
+	if got.WorkerWindow["sonnet"] != 200000 || got.WorkerWindow["opus"] != 400000 {
+		t.Errorf("window %v", got.WorkerWindow)
+	}
+	if got.ReadBudget != 8 || got.Launcher != "auto" {
+		t.Errorf("defaults lost: %+v", got)
+	}
+}
+
+func TestConfigBadFile(t *testing.T) {
+	dir := isolate(t)
+	p := filepath.Join(dir, "quartermaster", "config.json")
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load()
+	if err == nil {
+		t.Fatal("want an error for a broken config file")
+	}
+	if !reflect.DeepEqual(c, Defaults()) {
+		t.Errorf("broken file: got %+v, want the defaults", c)
+	}
+}
+
+func TestConfigNullKeepsDefaults(t *testing.T) {
+	dir := isolate(t)
+	p := filepath.Join(dir, "quartermaster", "config.json")
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"privacy":{"clients":null},"worker":{"plugins":null},"rules":null,"project_plugins":null,"project_mcp":null,"worker_window":null,"notify":null,"up":{"claude_args":null}}`
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(c, Defaults()) {
+		t.Errorf("nulls: got %+v, want the defaults", c)
+	}
+}
+
+func TestKeyEnvFirst(t *testing.T) {
+	isolate(t)
+	c := Config{TypeSafeKey: "from-file"}
+	if c.Key() != "from-file" {
+		t.Errorf("file key: got %q", c.Key())
+	}
+	t.Setenv("TYPESAFE_API_KEY", "from-env")
+	if c.Key() != "from-env" {
+		t.Errorf("env key: got %q", c.Key())
+	}
+}
+
+func TestReportWorkerMarkersDefaultEmptyAndLoad(t *testing.T) {
+	if m := Defaults().Report.WorkerMarkers; m == nil || len(m) != 0 {
+		t.Errorf("default markers = %#v, want an empty list", m)
+	}
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	p, err := Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(`{"report":{"worker_markers":["^X"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load()
+	if err != nil || len(c.Report.WorkerMarkers) != 1 {
+		t.Errorf("markers = %v, err %v", c.Report.WorkerMarkers, err)
+	}
+}
+
+func TestUpClaudeArgsDefaultEmptyAndLoad(t *testing.T) {
+	if a := Defaults().Up.ClaudeArgs; a == nil || len(a) != 0 {
+		t.Errorf("default up.claude_args = %#v, want an empty list", a)
+	}
+	dir := isolate(t)
+	p := filepath.Join(dir, "quartermaster", "config.json")
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(`{"up":{"claude_args":["--permission-mode","acceptEdits"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"--permission-mode", "acceptEdits"}; !reflect.DeepEqual(c.Up.ClaudeArgs, want) {
+		t.Errorf("up.claude_args = %#v, want %#v", c.Up.ClaudeArgs, want)
+	}
+}

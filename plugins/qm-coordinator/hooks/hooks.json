@@ -1,0 +1,86 @@
+{
+  "description": "quartermaster coordinator rules. Each hook runs qm hook <name> and exits quietly when qm is not on PATH.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook raw-launch-gate",
+            "timeout": 25
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook reviewer-model",
+            "timeout": 25
+          }
+        ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook ask-gate",
+            "timeout": 25
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook ask-gate",
+            "timeout": 25
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook feedback",
+            "timeout": 25
+          },
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook feedback-deliver",
+            "timeout": 25
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook feedback-deliver",
+            "timeout": 25
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v qm >/dev/null 2>&1 || exit 0; exec qm hook reviewer-model",
+            "timeout": 25
+          }
+        ]
+      }
+    ]
+  }
+}
