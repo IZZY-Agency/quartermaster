@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
@@ -29,8 +30,10 @@ func Path() (string, error) {
 // opened with O_APPEND, so lines from concurrent writers do not interleave.
 // When the file does not end with a newline (a write cut short by a full
 // disk or a crash), the line starts with one, so the cut line does not
-// swallow it; two writers that both see the cut leave a blank line, which
-// Read skips.
+// swallow it. The look at the file's end and the write happen under an
+// exclusive lock on the file: without it a writer can see another's record
+// half written (the file's size grows before the record is complete) and
+// take it for a cut line.
 func Append(r route.Record) error {
 	path, err := Path()
 	if err != nil {
@@ -49,6 +52,11 @@ func Append(r route.Record) error {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0o600)
 	if err != nil {
 		return fmt.Errorf("decision log: %w", err)
+	}
+	// Closing the file releases the lock.
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("decision log: lock: %w", err)
 	}
 	cut, err := endsMidLine(f)
 	if err != nil {
