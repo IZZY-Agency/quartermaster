@@ -33,6 +33,9 @@ type statusReport struct {
 	Providers    []providers.Status `json:"providers"`
 	Rules        map[string]string  `json:"rules"`
 	WorkerWindow map[string]int     `json:"worker_window"`
+	// Handoff says at which share of its window a worker is told to hand
+	// off, and why when the config's value is not usable.
+	Handoff string `json:"handoff"`
 	// AutoCompactWindow is autoCompactWindow in the user's Claude Code
 	// settings (nil: not set); AutoCompactEnv is
 	// CLAUDE_CODE_AUTO_COMPACT_WINDOW, which overrides it, when set.
@@ -100,6 +103,7 @@ func buildStatus(ctx context.Context, cfg config.Config) statusReport {
 		Providers:    providers.DetectWithCodex(ctx, cfg, os.Getenv, exec.LookPath, codex, codexErr),
 		Rules:        map[string]string{},
 		WorkerWindow: cfg.WorkerWindow,
+		Handoff:      handoffLine(cfg),
 		Codex:        codex,
 	}
 	if codexErr != nil {
@@ -176,6 +180,7 @@ func writeStatus(w io.Writer, r statusReport) {
 		ws = append(ws, fmt.Sprintf("%s %d", m, r.WorkerWindow[m]))
 	}
 	p("  workers: %s\n", strings.Join(ws, ", "))
+	p("  workers hand off at: %s\n", r.Handoff)
 	if r.AutoCompactWindow != nil {
 		p("  your sessions: autoCompactWindow %d\n", *r.AutoCompactWindow)
 	} else {
@@ -302,4 +307,15 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// handoffLine is the status line of worker.handoff_percent: the share in
+// effect, and the config's error when its value is out of range.
+func handoffLine(cfg config.Config) string {
+	share, err := cfg.HandoffShare()
+	line := fmt.Sprintf("%.0f%% of the window", share*100)
+	if err != nil {
+		line += " (" + err.Error() + ")"
+	}
+	return line
 }

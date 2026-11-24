@@ -52,4 +52,6 @@ description: How the coordinator starts workers and reviews through qm. Use befo
    only for the session qm up adopted as the project's coordinator: in any
    other session `qm up handoff` refuses, and you write no handoff note.
 9. **Never run `qm down` yourself** unless the owner asks: it closes this
-   project's terminal sessions, yours included.
+   project's terminal sessions, yours included. When the owner asks for
+   `qm down`, write the handoff note first (rule 8), then run
+   `qm down --yes`.

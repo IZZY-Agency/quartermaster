@@ -466,11 +466,11 @@ func TestContextLimit(t *testing.T) {
 	post := func(tr string) []byte {
 		return fireEvent(t, cfg, "context-limit", "PostToolUse", "Bash", bash("ls"), tr)
 	}
-	want(t, post(usageTranscript(t, 100, 1000, 170000)), "pass") // 171,100 is under 70% of 250,000
-	out := post(usageTranscript(t, 100, 4900, 170000))           // 175,000
+	want(t, post(usageTranscript(t, 100, 1000, 211000)), "pass") // 212,100 is under 85% of 250,000
+	out := post(usageTranscript(t, 100, 2400, 210000))           // 212,500
 	want(t, out, "note")
 	state := os.Getenv("XDG_STATE_HOME")
-	wantNote := "Context is at 175000 tokens. Finish the current step, write the handoff note to " +
+	wantNote := "Context is at 212500 tokens. Finish the current step, write the handoff note to " +
 		filepath.Join(state, "quartermaster", "handoff", "task-a.md") + ", then send the coordinator a message with SendMessage."
 	if c := decode(t, out).HookSpecificOutput["additionalContext"]; c != wantNote {
 		t.Errorf("note %q\nwant %q", c, wantNote)
@@ -478,8 +478,32 @@ func TestContextLimit(t *testing.T) {
 	if fi, err := os.Stat(filepath.Join(state, "quartermaster", "handoff")); err != nil || !fi.IsDir() {
 		t.Errorf("handoff folder: %v", err)
 	}
-	want(t, post(usageTranscript(t, 0, 0, 224999)), "pass") // under 50,000 above the last note
-	want(t, post(usageTranscript(t, 0, 0, 225000)), "note")
+	want(t, post(usageTranscript(t, 0, 0, 262499)), "pass") // under 50,000 above the last note
+	want(t, post(usageTranscript(t, 0, 0, 262500)), "note")
+}
+
+// worker.handoff_percent moves the point of the first note; a value out of
+// range leaves the default, 85.
+func TestContextLimitHandoffPercent(t *testing.T) {
+	for _, tc := range []struct {
+		percent    int
+		pass, note int
+	}{
+		{70, 174999, 175000},
+		{95, 237499, 237500},
+		{0, 212499, 212500},
+		{100, 212499, 212500},
+	} {
+		cfg := setup(t)
+		t.Setenv("QM_AUTOCOMPACT", "250000")
+		t.Setenv("QM_SESSION_NAME", "task-a")
+		cfg.Worker.HandoffPercent = &tc.percent
+		post := func(used int) []byte {
+			return fireEvent(t, cfg, "context-limit", "PostToolUse", "Bash", bash("ls"), usageTranscript(t, 0, 0, used))
+		}
+		want(t, post(tc.pass), "pass")
+		want(t, post(tc.note), "note")
+	}
 }
 
 func TestContextLimitProjectFolder(t *testing.T) {
@@ -489,7 +513,7 @@ func TestContextLimitProjectFolder(t *testing.T) {
 	t.Setenv("QM_AUTOCOMPACT", "250000")
 	t.Setenv("QM_SESSION_NAME", "task-a")
 	t.Setenv("QM_PROJECT_ID", "proj-12345678")
-	out := fireEvent(t, cfg, "context-limit", "PostToolUse", "Bash", bash("ls"), usageTranscript(t, 100, 4900, 170000))
+	out := fireEvent(t, cfg, "context-limit", "PostToolUse", "Bash", bash("ls"), usageTranscript(t, 100, 4900, 210000))
 	dir := filepath.Join(os.Getenv("XDG_STATE_HOME"), "quartermaster", "handoff", "proj-12345678")
 	if c, _ := decode(t, out).HookSpecificOutput["additionalContext"].(string); !strings.Contains(c, filepath.Join(dir, "task-a.md")) {
 		t.Errorf("note %q, want the path under %s", c, dir)
@@ -507,7 +531,7 @@ func TestContextLimitNeedsWindow(t *testing.T) {
 func TestContextLimitReadsTail(t *testing.T) {
 	cfg := setup(t)
 	t.Setenv("QM_AUTOCOMPACT", "250000")
-	p := usageTranscript(t, 0, 0, 200000)
+	p := usageTranscript(t, 0, 0, 220000)
 	f, err := os.OpenFile(p, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)

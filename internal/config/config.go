@@ -90,8 +90,12 @@ type Config struct {
 		Clients    []Pseudonym `json:"clients"`
 		LocalModel string      `json:"local_model"`
 	} `json:"privacy"`
+	// Worker configures workers. HandoffPercent is the share of its compact
+	// window at which a worker is told to hand off; nil (left out) means the
+	// default, 85.
 	Worker struct {
-		Plugins []string `json:"plugins"`
+		Plugins        []string `json:"plugins"`
+		HandoffPercent *int     `json:"handoff_percent,omitempty"`
 	} `json:"worker"`
 	// Rules maps a rule name to on|note|off; a rule not listed is on.
 	Rules          map[string]string   `json:"rules"`
@@ -110,9 +114,11 @@ type Config struct {
 	Notify []string `json:"notify"`
 	// Up configures qm up. ClaudeArgs are a new project's coordinator claude
 	// arguments when qm up is given none after "--" (its permission flag,
-	// say).
+	// say). CoordinatorTab is where qm up starts a coordinator: "new" (a new
+	// tab, the default) or "here" (the tab qm up runs in); see CoordinatorTab.
 	Up struct {
-		ClaudeArgs []string `json:"claude_args"`
+		ClaudeArgs     []string `json:"claude_args"`
+		CoordinatorTab string   `json:"coordinator_tab"`
 	} `json:"up"`
 	// Watch configures qm watch. SilentMinutes is how long a worker's
 	// transcript goes unwritten before it counts as silent; nil (left out)
@@ -276,6 +282,24 @@ func (c Config) Key() string {
 	return c.TypeSafeKey
 }
 
+// DefaultHandoffPercent is worker.handoff_percent when it is unset.
+const DefaultHandoffPercent = 85
+
+// HandoffShare is the share of a worker's compact window at which the
+// context-limit rule tells it to hand off: worker.handoff_percent as a
+// fraction, 0.85 when unset. A value outside 1 to 99 is an error, returned
+// with the default share, so the rule goes on with it.
+func (c Config) HandoffShare() (float64, error) {
+	p := c.Worker.HandoffPercent
+	switch {
+	case p == nil:
+		return DefaultHandoffPercent / 100.0, nil
+	case *p < 1 || *p > 99:
+		return DefaultHandoffPercent / 100.0, fmt.Errorf("worker.handoff_percent is %d; it must be a whole number from 1 to 99", *p)
+	}
+	return float64(*p) / 100, nil
+}
+
 // SilentThreshold is qm watch's silence threshold: watch.silent_minutes,
 // 10 minutes when unset; an error for a value below 1.
 func (c Config) SilentThreshold() (time.Duration, error) {
@@ -287,6 +311,18 @@ func (c Config) SilentThreshold() (time.Duration, error) {
 		return 0, fmt.Errorf("watch.silent_minutes is %d; it must be a whole number from 1 to %d", *m, int64(math.MaxInt64/int64(time.Minute)))
 	}
 	return time.Duration(*m) * time.Minute, nil
+}
+
+// CoordinatorTab is up.coordinator_tab: "here" or "new"; unset or empty is
+// "new". Any other value is an error.
+func (c Config) CoordinatorTab() (string, error) {
+	switch c.Up.CoordinatorTab {
+	case "", "new":
+		return "new", nil
+	case "here":
+		return "here", nil
+	}
+	return "", fmt.Errorf("up.coordinator_tab is %q; it must be %q or %q", c.Up.CoordinatorTab, "new", "here")
 }
 
 // Rule is a rule's switch: on, note or off. A rule not in the file is on.

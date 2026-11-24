@@ -125,8 +125,8 @@ func Summary(in SummaryInput) string {
 		b.WriteString("none\n")
 	} else {
 		slices.SortStableFunc(steps, func(a, c Step) int { return strings.Compare(a.Name, c.Name) })
-		b.WriteString("qm up wrote this before it started the workers: the states are its plan,\n")
-		b.WriteString("and a worker whose launch then failed is still listed as planned. A worker\n")
+		b.WriteString("The states are qm up's plan for this run, not what happened: a worker\n")
+		b.WriteString("whose launch failed is still listed as planned. A worker\n")
 		b.WriteString("that does not answer may not have started: check the workspace's sessions.\n\n")
 		b.WriteString("| name | state | branch | pull request | last activity | context | qm up plan |\n")
 		b.WriteString("|---|---|---|---|---|---|---|\n")

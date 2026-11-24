@@ -91,7 +91,8 @@ func (a Agterm) Pin(ctx context.Context, id string) error {
 // with its id, name and sessions. A session whose foregroundShell is set is
 // an idle shell (Idle); a pane running claude or anything else has no such
 // key. A session's foreground (the argv of its pane's foreground process)
-// and cwd are read into Foreground and Cwd.
+// and cwd are read into Foreground and Cwd; a tab split into several panes
+// is Split.
 func (a Agterm) Workspaces(ctx context.Context) ([]Workspace, error) {
 	raw, err := a.call(ctx, "tree", "tree", "--json")
 	if err != nil {
@@ -108,6 +109,7 @@ func (a Agterm) Workspaces(ctx context.Context) ([]Workspace, error) {
 					ForegroundShell string   `json:"foregroundShell"`
 					Foreground      []string `json:"foreground"`
 					Cwd             string   `json:"cwd"`
+					Split           bool     `json:"split"`
 				} `json:"sessions"`
 			} `json:"workspaces"`
 		} `json:"tree"`
@@ -119,7 +121,7 @@ func (a Agterm) Workspaces(ctx context.Context) ([]Workspace, error) {
 	for _, w := range res.Tree.Workspaces {
 		ws := Workspace{ID: w.ID, Name: w.Name}
 		for _, s := range w.Sessions {
-			ws.Sessions = append(ws.Sessions, SessionRef{Launcher: "agterm", ID: s.ID, Name: s.Name, Idle: s.ForegroundShell != "", Foreground: strings.Join(s.Foreground, " "), Cwd: s.Cwd})
+			ws.Sessions = append(ws.Sessions, SessionRef{Launcher: "agterm", ID: s.ID, Name: s.Name, Idle: s.ForegroundShell != "", Foreground: strings.Join(s.Foreground, " "), Cwd: s.Cwd, Split: s.Split})
 		}
 		out = append(out, ws)
 	}
@@ -148,6 +150,24 @@ func (a Agterm) Move(ctx context.Context, sessionID, workspaceID string) error {
 		return fmt.Errorf("agterm: %w", err)
 	}
 	return nil
+}
+
+// WorkspaceNew runs: agtermctl workspace new --json -- NAME (a name that
+// starts with a dash is not read as a flag), and returns the new
+// workspace's id from the response, {"ok":true,"result":{"id":...}}
+// (verified live).
+func (a Agterm) WorkspaceNew(ctx context.Context, name string) (string, error) {
+	raw, err := a.call(ctx, "workspace new", "workspace", "new", "--json", "--", name)
+	if err != nil {
+		return "", fmt.Errorf("agterm: %w", err)
+	}
+	var res struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil || res.ID == "" {
+		return "", fmt.Errorf("agterm: %s workspace new returned no workspace id", a.Bin)
+	}
+	return res.ID, nil
 }
 
 var _ Reuser = Agterm{}

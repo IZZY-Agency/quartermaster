@@ -66,6 +66,12 @@ type Deps struct {
 	// them while the coordinator runs, at the saved ClaudeArgs when it does
 	// not (nil: the saved ones always).
 	CoordinatorArgs func(sessionID string) (args []string, live bool, err error)
+	// Here, when set, starts the coordinator in the tab qm up runs in (qm
+	// up --here): a coordinator that starts is prepared last, its script
+	// written and its state saved, but not launched; the caller runs its
+	// script in place of qm (Outcome.Here). Here returns the tab's terminal
+	// session (HereTerm.Resolve), "" ID when none is recorded, and a note.
+	Here func(ctx context.Context, p *Project, own []string, first bool) (launch.SessionRef, string)
 }
 
 // coordinatorCap is the claude arguments a worker's permission flags are
@@ -148,6 +154,9 @@ type Outcome struct {
 	NewSessionID string
 	Script       string
 	Err          error
+	// Here says the coordinator is to start in the tab qm up runs in: its
+	// script is ready, and the caller runs it in place of qm when Err is nil.
+	Here bool
 	// waitFor is the session id typed into a reused tab, which Apply waits
 	// to see running once every step has started.
 	waitFor string
@@ -165,14 +174,19 @@ type Outcome struct {
 // no terminal session is recorded and no kind "up" Record logged, but a
 // fresh session's new id is (the new coordinator in the state, a fresh
 // worker's Record), so a printed line once run is a session the next qm up
-// knows, and the duplicate guard covers it.
+// knows, and the duplicate guard covers it. With d.Here, a coordinator that
+// starts comes last: its script is written, the tab qm up runs in recorded
+// (d.Here), the state saved and its Record logged, launcher or not, but it is
+// not launched (Outcome.Here): the caller runs its script in place of qm once
+// Apply is done. Its earlier terminal session is neither reused nor closed.
 func Apply(ctx context.Context, p *Project, steps []Step, d Deps) []Outcome {
 	if p.Sessions == nil {
 		p.Sessions = map[string]launch.SessionRef{}
 	}
 	order := slices.Clone(steps)
+	here := d.Here != nil
 	slices.SortStableFunc(order, func(a, b Step) int {
-		return cmp.Compare(rank(a.Role), rank(b.Role))
+		return cmp.Compare(applyRank(a, here), applyRank(b, here))
 	})
 	starting := d.Launcher != nil
 	var warnings map[string][]string
@@ -185,10 +199,25 @@ func Apply(ctx context.Context, p *Project, steps []Step, d Deps) []Outcome {
 		pruneStale(p, order, sp, launcherKind(d.Launcher))
 	}
 	outs := make([]Outcome, 0, len(order))
-	// The coordinator's step comes first (rank): the workers' permission cap
-	// reads the sessions it stands for.
+	// The coordinator's step comes first (applyRank): the workers' permission
+	// cap reads the sessions it stands for. A coordinator started here comes
+	// last, so the cap reads the sessions its step stands for already: none
+	// runs yet, so the cap is the saved arguments its script starts with.
 	coordIDs := coordinatorIDs(p, nil)
 	for _, s := range order {
+		if here && s.Role == RoleCoordinator {
+			coordIDs = coordinatorIDs(p, &Outcome{Step: s})
+		}
+	}
+	waited := false
+	for _, s := range order {
+		if here && s.Role == RoleCoordinator && (s.Action == Resume || s.Action == Fresh) && !waited {
+			// Reused tabs are waited for before the coordinator's step, so
+			// its last check for a hand-resumed copy comes right before qm
+			// is replaced by it.
+			waitStarted(ctx, d, outs)
+			waited = true
+		}
 		o := Outcome{Step: s}
 		switch s.Action {
 		case Leave:
@@ -201,7 +230,7 @@ func Apply(ctx context.Context, p *Project, steps []Step, d Deps) []Outcome {
 				o.Ref.Warning = strings.Join(append(w, nonEmpty(o.Ref.Warning)...), "; ")
 			}
 		}
-		if starting && o.Err == nil {
+		if (starting || o.Here) && o.Err == nil {
 			id := o.Step.SessionID
 			if o.NewSessionID != "" {
 				id = o.NewSessionID
@@ -213,7 +242,9 @@ func Apply(ctx context.Context, p *Project, steps []Step, d Deps) []Outcome {
 		}
 		outs = append(outs, o)
 	}
-	waitStarted(ctx, d, outs)
+	if !waited {
+		waitStarted(ctx, d, outs)
+	}
 	return outs
 }
 
@@ -222,6 +253,16 @@ func rank(r Role) int {
 		return 0
 	}
 	return 1
+}
+
+// applyRank orders Apply's steps: the coordinator first (rank), but last
+// when it starts in the tab qm up runs in (here): qm is replaced by it once
+// every other step is done.
+func applyRank(s Step, here bool) int {
+	if here && s.Role == RoleCoordinator && (s.Action == Resume || s.Action == Fresh) {
+		return 2
+	}
+	return rank(s.Role)
 }
 
 func nonEmpty(s string) []string {
@@ -285,6 +326,11 @@ func PlanStale(ctx context.Context, p *Project, steps []Step, d Deps) *StalePlan
 			}
 		}
 		return sp
+	}
+	if d.Here != nil {
+		// A coordinator started here runs in qm up's own tab: its recorded
+		// terminal session is neither reused nor closed.
+		steps = slices.DeleteFunc(slices.Clone(steps), func(s Step) bool { return s.Role == RoleCoordinator })
 	}
 	sp.Listed, sp.Shown = true, map[string]launch.SessionRef{}
 	for _, l := range listed {
@@ -452,7 +498,20 @@ func repin(ctx context.Context, p *Project, s Step, d Deps) launch.SessionRef {
 // running while qm up asked (resumed by hand) is left, and o.Step becomes a
 // leave with a warning; a failed read starts nothing.
 func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *StalePlan, coordIDs []string, o *Outcome) {
-	if d.Launcher != nil && d.Live != nil {
+	here := d.Here != nil && s.Role == RoleCoordinator
+	// A coordinator started here holds the adoption lock from its last check
+	// for a copy resumed by hand, through the read of what other projects
+	// hold, to the save, as a first run and an adoption hold it.
+	var lockErr error
+	if here {
+		unlock, err := AdoptLock()
+		if err != nil {
+			lockErr = err
+		} else {
+			defer unlock()
+		}
+	}
+	if (d.Launcher != nil || here) && d.Live != nil {
 		live, err := d.Live()
 		if err != nil {
 			o.Err = fmt.Errorf("the running sessions were not read again, so %s was not started (it may have been resumed by hand meanwhile): %w", s.Name, err)
@@ -563,7 +622,34 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 		return
 	}
 	done := "script " + o.Script + " written"
-	if d.Launcher != nil {
+	switch {
+	case here:
+		// Started by the caller in place of qm: the tab qm up runs in is
+		// recorded, or none, never the session's earlier tab (left open).
+		own := slices.Concat([]string{p.Coordinator.ID, s.SessionID, s.Instead, sid}, p.PastCoordinators)
+		var ref launch.SessionRef
+		if lockErr != nil {
+			o.warn = "this tab not recorded (" + lockErr.Error() + "): " + noRef
+		} else {
+			ref, o.warn = d.Here(ctx, p, own, false)
+		}
+		o.Here, o.Ref = true, ref
+		if ref.ID != "" {
+			p.Sessions[sid] = stored(ref)
+			delete(p.Dropped, sid)
+			done = fmt.Sprintf("to start in this tab (%s %s)", ref.Launcher, ref.ID)
+		} else {
+			if _, ok := p.Sessions[sid]; ok {
+				p.drop(sid)
+			}
+			done = "to start in this tab"
+		}
+		if _, ok := p.Sessions[s.Instead]; ok && s.Instead != "" && s.Instead != sid {
+			// The never-run session this one stands in for: its tab is
+			// not the coordinator's.
+			p.drop(s.Instead)
+		}
+	case d.Launcher != nil:
 		var reused bool
 		if o.Ref, reused, err = launchStep(ctx, p, s, d, sp, o.Script); err != nil {
 			o.Err = err
@@ -582,7 +668,7 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 		done = fmt.Sprintf("started (%s %s)", o.Ref.Launcher, o.Ref.ID)
 	}
 	if sid == s.SessionID {
-		if d.Launcher == nil {
+		if d.Launcher == nil && !here {
 			return // a resume without a launcher changes nothing qm records
 		}
 	} else if _, ok := p.Sessions[s.SessionID]; ok {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,10 +41,9 @@ const (
 	// writeNoteMinBytes: a Write over an existing file larger than this gets
 	// the write-note.
 	writeNoteMinBytes = 2000
-	// contextNoteShare of QM_AUTOCOMPACT is where context-limit starts
-	// noting, and contextNoteStep the growth between two notes.
-	contextNoteShare = 0.7
-	contextNoteStep  = 50000
+	// contextNoteStep is the growth of the context between two
+	// context-limit notes.
+	contextNoteStep = 50000
 )
 
 // hookTimeout bounds one hook call; past it the action passes and an error is
@@ -369,9 +369,10 @@ func writeNote(c *call) (result, error) {
 	return result{note: writeNoteText}, nil
 }
 
-// contextLimit tells the worker to hand off once its context passes
-// contextNoteShare of its compact window (QM_AUTOCOMPACT), and again every
-// contextNoteStep tokens after that.
+// contextLimit tells the worker to hand off once its context passes the
+// config's handoff share (worker.handoff_percent, 85% by default; the
+// default too when the value is out of range) of its compact window
+// (QM_AUTOCOMPACT), and again every contextNoteStep tokens after that.
 func contextLimit(c *call) (result, error) {
 	window, err := strconv.Atoi(os.Getenv("QM_AUTOCOMPACT"))
 	if err != nil || window <= 0 || c.in.AgentID != "" || c.in.TranscriptPath == "" {
@@ -382,7 +383,10 @@ func contextLimit(c *call) (result, error) {
 	if err != nil || used == 0 {
 		return result{}, err
 	}
-	if float64(used) < contextNoteShare*float64(window) {
+	share, _ := c.cfg.HandoffShare()
+	// Whole tokens, rounded up: 85% of 250,000 is 212,500, not a float a
+	// hair under it.
+	if used < int(math.Ceil(share*float64(window)-1e-6)) {
 		return result{}, nil
 	}
 	// A context below the last note means a compaction since: note again.

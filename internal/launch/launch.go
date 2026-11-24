@@ -58,6 +58,8 @@ type SessionRef struct {
 	Cwd        string `json:"-"`
 	// Panes is the number of panes of a listed tmux window (0 otherwise).
 	Panes int `json:"-"`
+	// Split says a listed agterm tab is split into several panes.
+	Split bool `json:"-"`
 }
 
 // shells are the command names of the shells a terminal session falls back

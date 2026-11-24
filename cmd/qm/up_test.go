@@ -36,6 +36,8 @@ type upAgterm struct {
 	// id, with their names; the ids in idle list a foregroundShell.
 	open map[string]string
 	idle map[string]bool
+	// fg are the foreground argv of the sessions, by id.
+	fg map[string][]string
 }
 
 // show lists the sessions ids (named like their id) in the workspace "proj".
@@ -77,14 +79,23 @@ func (f *upAgterm) run(_ context.Context, _ string, args ...string) ([]byte, err
 		result = map[string]string{"id": fmt.Sprintf("s-%d", f.n)}
 	case len(args) >= 2 && args[0] == "session" && args[1] == "type":
 		// typed into a session: answered ok.
+	case len(args) >= 2 && args[0] == "workspace" && args[1] == "new":
+		result = map[string]string{"id": "w-new"}
 	case args[0] == "tree":
 		var sessions []any
 		for id, name := range f.open {
 			sess := map[string]string{"id": id, "name": name}
-			if f.idle[id] {
-				sess["foregroundShell"] = "zsh"
+			entry := map[string]any{}
+			for k, v := range sess {
+				entry[k] = v
 			}
-			sessions = append(sessions, sess)
+			if f.idle[id] {
+				entry["foregroundShell"] = "zsh"
+			}
+			if fg, ok := f.fg[id]; ok {
+				entry["foreground"] = fg
+			}
+			sessions = append(sessions, entry)
 		}
 		result = map[string]any{"tree": map[string]any{"workspaces": []any{map[string]any{"name": "proj", "sessions": sessions}}}}
 	}

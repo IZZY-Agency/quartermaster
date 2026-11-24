@@ -261,7 +261,7 @@ do not block) or `off`; a rule not listed is on.
 | `explorer-model` | worker | runs explorer sub-agents on Haiku |
 | `lsp-note` | worker | notes that the LSP tool is there when a search looks like a symbol lookup |
 | `write-note` | worker | notes that `Edit` is for changes to a large existing file |
-| `context-limit` | worker | at 70% of the compact window, tells the worker to finish the step, write a handoff note and send the coordinator a message |
+| `context-limit` | worker | at 85% of the compact window (`worker.handoff_percent`), tells the worker to finish the step, write a handoff note and send the coordinator a message |
 | `turn-start`, `turn-stop` | worker | record, silently and in their own files, whether the worker's turn is open, for [qm watch](#watching-workers-qm-watch); they act only in workers (`QM_ROLE=worker`) |
 
 The `read-budget` and `raw-launch-gate` rules, after blocking work three times
@@ -357,12 +357,14 @@ worker, without permission prompts.
 | `project_mcp` | `{}` | an MCP config file for a repository's workers: `{"<repo>": "<path to a .mcp.json>"}`; without one, workers get no MCP servers |
 | `rules` | `{}` | a rule's switch, `on`, `note` or `off`; see [The plugins' rules](#the-plugins-rules) |
 | `read_budget` | `8` | exploration reads a worker may do in one phase |
+| `worker.handoff_percent` | `85` | the share of its compact window at which a worker is told to finish its step, write a handoff note and report; a whole number from 1 to 99 (another value is shown by `qm status` and the default is used). Lower means shorter, cheaper sessions and more handoffs |
 | `worker_window` | `{"sonnet": 250000, "opus": 400000, "fable": 400000}` | each worker model's auto-compact window, in tokens |
 | `typesafe_api_key` | unset | the TypeSafe key; the `TYPESAFE_API_KEY` environment variable wins, and `qm init` never stores a key it read from there |
 | `launcher` | `"auto"` | `auto`, `agterm` or `tmux` |
 | `notify` | `[]` | a command that receives a message as its last argument (as `<title>: <text>`) when a rule softens or `qm watch` reports a worker (its name and state, never a path); no shell is used |
 | `report.worker_markers` | `[]` | extra regexes that mark a session as a worker for `qm report --baseline`, next to the built-in ones |
 | `up.claude_args` | `[]` | `claude` arguments for a new project's coordinator when `qm up` gets none after `--` |
+| `up.coordinator_tab` | `"new"` | where `qm up` starts a coordinator: `new` (a new tab) or `here` (the tab `qm up` runs in, as `--here`; without a terminal, a new tab with a note); `--here` and `--new-tab` win over it |
 | `watch.silent_minutes` | `10` | minutes without a write to a worker's transcript after which `qm watch` and `qm status` call it silent; a whole number of at least 1 (`0` or a negative number is an error `qm watch` and the Workers section show; a value of the wrong type, like any key's, fails the whole config) |
 
 `launcher: auto` picks agterm when `AGTERM_SESSION_ID` is set and tmux when
@@ -406,6 +408,7 @@ qm up              # first run: start the coordinator; later runs: restore
 qm up --dry-run    # print the plan, change nothing
 qm up --full       # resume every unfinished session in full
 qm up --adopt      # first run: take over the sessions already running here
+qm up --here       # start the coordinator in this tab, after the workers
 qm up done NAME    # mark a worker finished; it is never restored
 qm down            # record the state and close the project's sessions
 ```
@@ -419,6 +422,28 @@ coordinator spawns with `qm spawn worker` open in the same workspace and are
 tied to the project. The coordinator's plugin tells it to run `qm up done NAME`
 when it accepts a worker's report as finished (in a coordinator started by
 `qm up`).
+
+**The coordinator in this tab.** `qm up --here` starts the coordinator in the
+tab you ran it from, in place of a new one: qm starts the workers first,
+saves the state and prints its summary, then replaces itself with the
+coordinator, so the tab ends up running it with nothing of qm left behind. In
+agterm the tab is moved into the project's workspace and pinned; it must not
+be split. In tmux the window must have that one pane, and is renamed after the
+coordinator. qm records the tab only when it sees qm itself running in it, so
+`qm down` closes it last. A tab another project or another session holds is never taken: the
+coordinator still starts here, with no tab recorded, and a note says why
+(that is also what happens in a terminal that is neither agterm nor tmux).
+`--here` needs a terminal, and only goes with a run that starts a coordinator:
+a first run, or a restore that resumes or restarts it; next to a coordinator
+that is still running, or with `--adopt`, it is refused. Set
+`up.coordinator_tab` to `here` to make it the default; `--new-tab` overrides
+it for one run, and without a terminal (a script, another Claude session) the
+config's `here` falls back to a new tab with a note. `--dry-run` says which
+tab the coordinator would start in.
+
+**Ending a session.** Tell the coordinator to wrap up and run `qm down`: it
+writes its handoff note first, then runs `qm down --yes`, which closes the
+workers' tabs and then its own.
 
 **Later runs.** `qm up` reads its own records, Claude Code's session files and
 transcripts, and git (and `gh`, when installed), shows one row per session and
@@ -446,8 +471,10 @@ why the plan shows the cost before you answer.
 log, saves the state, then closes the workers' terminal sessions and the
 coordinator's last, each only while it is still in the project's workspace or
 tmux session. `--keep-open` records and closes nothing; `--yes` skips the
-question. A session you already closed by hand is not an error, and a tab that
-no longer runs its session and now runs something else is left open. Coordinators
+question. A session you already closed by hand is not an error, a tab that
+no longer runs its session and now runs something else is left open, and so is
+an agterm tab split into several panes (closing it would end what runs beside
+the session). Coordinators
 are told not to run `qm down` themselves unless you ask.
 
 **Adopting running sessions.** When the first `qm up` finds Claude sessions

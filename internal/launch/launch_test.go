@@ -574,6 +574,21 @@ func TestAgtermMoveArgs(t *testing.T) {
 	}
 }
 
+func TestAgtermWorkspaceNew(t *testing.T) {
+	r := &recorder{out: `{"ok":true,"result":{"id":"W-1"}}`}
+	id, err := (Agterm{Bin: "agtermctl", Run: r.run}).WorkspaceNew(context.Background(), "repo")
+	want := []string{"workspace", "new", "--json", "--", "repo"}
+	if err != nil || id != "W-1" || !slices.Equal(r.first(), want) {
+		t.Errorf("id %q err %v, ran %q, want %q", id, err, r.calls, want)
+	}
+	for _, out := range []string{`{"ok":false,"error":"refused"}`, `{"ok":true,"result":{}}`} {
+		r = &recorder{out: out}
+		if _, err := (Agterm{Bin: "agtermctl", Run: r.run}).WorkspaceNew(context.Background(), "repo"); err == nil {
+			t.Errorf("WorkspaceNew succeeded on %s", out)
+		}
+	}
+}
+
 func TestAgtermReuseArgs(t *testing.T) {
 	r := &recorder{out: `{"ok":true,"result":{}}`}
 	ref := SessionRef{Launcher: "agterm", ID: "s-1", Name: "w-one", Idle: true}

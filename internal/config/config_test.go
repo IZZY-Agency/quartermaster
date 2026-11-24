@@ -195,6 +195,73 @@ func TestUpClaudeArgsDefaultEmptyAndLoad(t *testing.T) {
 	}
 }
 
+func TestUpCoordinatorTab(t *testing.T) {
+	if got, err := Defaults().CoordinatorTab(); err != nil || got != "new" {
+		t.Fatalf("default = %q, %v; want new", got, err)
+	}
+	for _, tc := range []struct {
+		json string
+		want string
+		bad  bool
+	}{
+		{`{"up":{"coordinator_tab":"here"}}`, "here", false},
+		{`{"up":{"coordinator_tab":"new"}}`, "new", false},
+		{`{"up":{"coordinator_tab":""}}`, "new", false},
+		{`{"up":{"coordinator_tab":null}}`, "new", false},
+		{`{"up":{"coordinator_tab":"Here"}}`, "", true},
+		{`{"up":{"coordinator_tab":"tab"}}`, "", true},
+	} {
+		dir := isolate(t)
+		p := filepath.Join(dir, "quartermaster", "config.json")
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(tc.json), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load()
+		if err != nil {
+			t.Fatalf("%s: load: %v", tc.json, err)
+		}
+		got, err := c.CoordinatorTab()
+		if (err != nil) != tc.bad || got != tc.want {
+			t.Errorf("%s: CoordinatorTab() = %q, %v; want %q, bad=%v", tc.json, got, err, tc.want, tc.bad)
+		}
+	}
+}
+
+func TestHandoffShare(t *testing.T) {
+	c := Defaults()
+	if v, err := c.HandoffShare(); err != nil || v != 0.85 {
+		t.Fatalf("unset: %v %v", v, err)
+	}
+	for _, tc := range []struct {
+		json string
+		want float64
+		bad  bool
+	}{
+		{`{"worker":{"handoff_percent":70}}`, 0.70, false},
+		{`{"worker":{"handoff_percent":99}}`, 0.99, false},
+		{`{"worker":{"handoff_percent":1}}`, 0.01, false},
+		{`{"worker":{"handoff_percent":0}}`, 0.85, true},
+		{`{"worker":{"handoff_percent":100}}`, 0.85, true},
+		{`{"worker":{"handoff_percent":-5}}`, 0.85, true},
+		{`{"worker":{}}`, 0.85, false},
+	} {
+		var c Config
+		if err := json.Unmarshal([]byte(tc.json), &c); err != nil {
+			t.Fatalf("%s: %v", tc.json, err)
+		}
+		v, err := c.HandoffShare()
+		if (err != nil) != tc.bad || v != tc.want {
+			t.Fatalf("%s: %v %v", tc.json, v, err)
+		}
+		if tc.bad && !strings.Contains(err.Error(), "worker.handoff_percent") {
+			t.Errorf("%s: error %q does not name the key", tc.json, err)
+		}
+	}
+}
+
 func TestSilentThreshold(t *testing.T) {
 	c := Defaults()
 	if d, err := c.SilentThreshold(); err != nil || d != 10*time.Minute {

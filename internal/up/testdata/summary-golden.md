@@ -6,8 +6,8 @@ coordinator's context was 231k tokens (threshold 200k). Its transcript is
 this summary lacks. Workers are addressed by their session names, as before.
 
 ## Workers
-qm up wrote this before it started the workers: the states are its plan,
-and a worker whose launch then failed is still listed as planned. A worker
+The states are qm up's plan for this run, not what happened: a worker
+whose launch failed is still listed as planned. A worker
 that does not answer may not have started: check the workspace's sessions.
 
 | name | state | branch | pull request | last activity | context | qm up plan |

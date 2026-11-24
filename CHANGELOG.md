@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.2
+
+- **The coordinator in the tab `qm up` runs in.** `qm up --here` starts the
+  workers first, then replaces itself with the coordinator in the current
+  tab, and records that tab so `qm down` closes it last. `--new-tab` keeps a
+  new tab for one run, and `up.coordinator_tab` (`new` or `here`) sets the
+  default. Without a terminal, `here` from the config falls back to a new
+  tab with a note. In a terminal that is neither agterm nor tmux the
+  coordinator still starts in place, so `--here` also works with no
+  launcher.
+- **Ending a session from the coordinator.** Tell the coordinator to wrap up
+  and run `qm down`: it writes its handoff note, then runs `qm down --yes`,
+  which closes the workers' tabs and then its own.
+- **Workers hand off later.** A worker is told to finish its step and write
+  a handoff note at 85% of its compact window, up from 70%, which stopped
+  workers that were close to done. `worker.handoff_percent` sets the share,
+  and `qm status` shows it.
+- `qm down` leaves an agterm tab open when it is split into several panes:
+  closing it would end what runs beside the session.
+- A lone `--` among the coordinator's claude arguments is refused: it would
+  end claude's options before the ones `qm up` sets.
+- `qm up --dry-run` says where the coordinator would start.
+
 ## 0.2.1
 
 A hardening release, after an audit of the code.

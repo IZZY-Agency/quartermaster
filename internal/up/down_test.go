@@ -28,6 +28,7 @@ type fakeCloser struct {
 	renamed  map[string]string // id: the name the listing shows instead
 	busy     map[string]bool   // listed as running something (not Idle)
 	other    map[string]bool   // its foreground is not the session's claude
+	split    map[string]bool   // an agterm tab split into several panes
 	notFg    map[string]bool   // a tmux window whose pane's foreground is another job
 	listErr  error
 	listed   []string // launcher/workspace of each listing
@@ -60,6 +61,7 @@ func (f *fakeCloser) Sessions(_ context.Context, launcher, ws string) ([]launch.
 			if f.other[ref.ID] {
 				ref.Foreground = "npm run dev"
 			}
+			ref.Split = f.split[ref.ID]
 			if n, ok := f.renamed[ref.ID]; ok {
 				ref.Name = n
 			}

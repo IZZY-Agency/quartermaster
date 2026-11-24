@@ -29,7 +29,7 @@ import (
 )
 
 const upUsage = `usage:
-  qm up [--yes] [--dry-run] [--full] [--launcher agterm|tmux] [--adopt | --adopt-coordinator ID | --new] [-- CLAUDE ARGS]
+  qm up [--yes] [--dry-run] [--full] [--launcher agterm|tmux] [--here | --new-tab] [--adopt | --adopt-coordinator ID | --new] [-- CLAUDE ARGS]
   qm up done NAME
   qm up handoff
 
@@ -48,6 +48,13 @@ const upUsage = `usage:
              as the coordinator; implies --adopt
   --new      first run: start a new coordinator beside the live sessions and
              adopt nothing
+  --here     start the coordinator in this tab, once the workers are started
+             and the state saved: qm is replaced by it, and qm down closes
+             this tab last. Needs a terminal; only when a coordinator starts
+             (a first run, or a restore that resumes or restarts it). The
+             config's up.coordinator_tab "here" does the same
+  --new-tab  start the coordinator in a new tab (the default), whatever the
+             config says
   --         what follows is the coordinator's claude arguments, replacing the
              saved ones (leave it out to keep them); qm up sets --resume,
              --continue, --session-id, --name and --print itself, so they are
@@ -120,7 +127,22 @@ var (
 		return os.Getppid()
 	}
 	// upSleep waits between the checks that claude started in a reused tab.
-	upSleep      = time.Sleep
+	upSleep = time.Sleep
+	// upHereTerminal says whether standard input and output are both a
+	// terminal, which a coordinator started in this tab needs.
+	upHereTerminal = func() bool {
+		return isTTY(os.Stdin.Fd()) && isTTY(os.Stdout.Fd())
+	}
+	// upExec replaces qm with the coordinator's launch script: no process of
+	// qm is left behind.
+	upExec = func(script string) error {
+		return syscall.Exec("/bin/sh", []string{"/bin/sh", script}, os.Environ())
+	}
+	// upEnv reads qm up's environment (AGTERM_SESSION_ID, TMUX_PANE).
+	upEnv = os.Getenv
+	// upArgv is qm's own command line, which the tab qm up runs in shows
+	// as its foreground.
+	upArgv       = os.Args
 	upTmuxWindow = func(pane string) (string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -166,6 +188,23 @@ type upOptions struct {
 	coordinatorGiven bool
 	claudeArgs       []string
 	argsGiven        bool
+	// hereFlag and newTab are --here and --new-tab. here says the
+	// coordinator starts in this tab (the flags, else the config); hereGiven
+	// says --here asked for it, so a run that cannot is a usage error, not a
+	// fallback. hereNote says why the config's "here" fell back to a new tab.
+	hereFlag, newTab, here, hereGiven bool
+	hereNote                          string
+	// pending is the coordinator to run in place of qm once the run is done
+	// and its locks released (an empty script for none).
+	pending *upPending
+}
+
+// upPending is a coordinator prepared to start in this tab: its launch
+// script, and the project root, session id and terminal session recorded for
+// it, which a failed exec takes back.
+type upPending struct {
+	script, root, sessionID string
+	ref                     launch.SessionRef
 }
 
 // runUp runs qm up and qm up done. Exit 0 when done or nothing to do; 1 on a
@@ -220,6 +259,8 @@ func parseUp(args []string, stderr io.Writer) (upOptions, error) {
 	fs.BoolVar(&o.adopt, "adopt", false, "adopt the running sessions as the project's first run does, without asking; on a project with state, adopt workers only (asks which)")
 	fs.StringVar(&o.adoptCoordinator, "adopt-coordinator", "", "first run: adopt the session with this id (or unique prefix) as the coordinator; implies --adopt")
 	fs.BoolVar(&o.newRun, "new", false, "first run: start a new coordinator and adopt nothing")
+	fs.BoolVar(&o.hereFlag, "here", false, "start the coordinator in this tab, after the workers")
+	fs.BoolVar(&o.newTab, "new-tab", false, "start the coordinator in a new tab (the default)")
 	if err := parseFlags(fs, flags); err != nil {
 		return o, err
 	}
@@ -233,12 +274,34 @@ func parseUp(args []string, stderr io.Writer) (upOptions, error) {
 	if o.newRun && o.adopt {
 		return o, fmt.Errorf("%w: --new starts a new coordinator; it does not go with --adopt or --adopt-coordinator", errUsage)
 	}
+	if o.hereFlag && o.newTab {
+		return o, fmt.Errorf("%w: --here and --new-tab are opposites; give one", errUsage)
+	}
+	if o.hereFlag && o.adopt {
+		return o, fmt.Errorf("%w: --here starts a coordinator in this tab; --adopt and --adopt-coordinator start none", errUsage)
+	}
 	if o.launcher != "" && o.launcher != "agterm" && o.launcher != "tmux" {
 		return o, fmt.Errorf("%w: --launcher %q is not agterm or tmux", errUsage, o.launcher)
 	}
 	return o, up.CheckClaudeArgs(o.claudeArgs)
 }
 
+// setPending leaves the coordinator of out, prepared in project root, to
+// run in place of qm once the run is done.
+func (o upOptions) setPending(root string, out up.Outcome) {
+	if o.pending == nil {
+		return
+	}
+	sid := out.Step.SessionID
+	if out.NewSessionID != "" {
+		sid = out.NewSessionID
+	}
+	*o.pending = upPending{script: out.Script, root: root, sessionID: sid, ref: out.Ref}
+}
+
+// upRunMain runs qm up; when the run leaves a coordinator to start in this
+// tab (o.pending), qm is replaced by its script once the run is done and its
+// locks released, and nothing more is printed.
 func upRunMain(args []string, stdout, stderr io.Writer) error {
 	o, err := parseUp(args, stderr)
 	if err != nil {
@@ -248,6 +311,78 @@ func upRunMain(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if err := upResolveHere(&o, cfg); err != nil {
+		return err
+	}
+	o.pending = new(upPending)
+	err = upRunLocked(o, cfg, stdout, stderr)
+	pd := *o.pending
+	if pd.script == "" {
+		return err
+	}
+	if err := upExec(pd.script); err != nil {
+		msg := fmt.Sprintf("the coordinator was not started in this tab: %v; run: %s", err, launch.Command(pd.script))
+		if ferr := forgetHere(pd); ferr != nil {
+			msg += fmt.Sprintf("; its tab (%s %s) is still recorded (%v): qm down may close it", pd.ref.Launcher, pd.ref.ID, ferr)
+		}
+		return errors.New(msg)
+	}
+	return nil
+}
+
+// forgetHere takes back the terminal session recorded for a coordinator
+// whose exec failed, so qm down never closes a tab that never ran it. It
+// changes the saved state only while it still records that session there.
+func forgetHere(pd upPending) error {
+	if pd.ref.ID == "" {
+		return nil
+	}
+	unlock, err := up.Lock(up.ProjectID(pd.root))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	p, ok, err := up.Load(pd.root)
+	if err != nil || !ok {
+		return err
+	}
+	if ref, ok := p.Sessions[pd.sessionID]; ok && ref.Launcher == pd.ref.Launcher && ref.ID == pd.ref.ID {
+		delete(p.Sessions, pd.sessionID)
+		return up.Save(p)
+	}
+	return nil
+}
+
+// upResolveHere sets o.here from --here, --new-tab and the config's
+// up.coordinator_tab (the flags win). The tab must be a terminal: without
+// one, --here is a usage error and the config's "here" falls back to a new
+// tab with a note.
+func upResolveHere(o *upOptions, cfg config.Config) error {
+	tab, err := cfg.CoordinatorTab()
+	if err != nil {
+		return err
+	}
+	switch {
+	case o.hereFlag:
+		o.here, o.hereGiven = true, true
+	case o.newTab:
+		o.here = false
+	default:
+		o.here = tab == "here" && !o.adopt
+	}
+	if o.here && !upHereTerminal() {
+		if o.hereGiven {
+			return fmt.Errorf("%w: --here needs a terminal on standard input and output, to start the coordinator in", errUsage)
+		}
+		o.here = false
+		o.hereNote = "up.coordinator_tab is here, but standard input or output is not a terminal: the coordinator starts in a new tab"
+	}
+	return nil
+}
+
+// upRunLocked is qm up's run under the project's lock, released when it
+// returns.
+func upRunLocked(o upOptions, cfg config.Config, stdout, stderr io.Writer) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -283,7 +418,8 @@ func upRunMain(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("%w: --adopt-coordinator and --new are for a project's first run; %s has state already", errUsage, root)
 	}
 	if found && o.adopt {
-		// Workers only: nothing is started, so no launcher is picked.
+		// Workers only: nothing is started, so no launcher is picked. --here
+		// with --adopt is refused when parsed.
 		if o.argsGiven || o.full {
 			return fmt.Errorf("%w: on a project with state, --adopt adopts workers only: it does not go with --full or coordinator arguments after --", errUsage)
 		}
@@ -294,6 +430,9 @@ func upRunMain(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("%w: %v", errUsage, pickErr)
 	}
 	d := upDeps(l, exe, cfg)
+	if o.here {
+		d.Here = upHere(l)
+	}
 	if !found {
 		return upFirstRun(root, recs, o, d, stdout, stderr)
 	}
@@ -327,6 +466,85 @@ func upDeps(l launch.Launcher, exe string, cfg config.Config) up.Deps {
 		d.Pin = a.Pin
 	}
 	return d
+}
+
+// upHere is the tab qm up runs in, as a coordinator started in it records
+// it: the launcher picked (l, nil for none) settles agterm or tmux when both
+// are in the environment.
+func upHere(l launch.Launcher) func(context.Context, *up.Project, []string, bool) (launch.SessionRef, string) {
+	a, t := upAgtermCtl, upTmuxCtl
+	prefer := ""
+	switch l.(type) {
+	case launch.Agterm:
+		prefer = "agterm"
+	case launch.Tmux:
+		prefer = "tmux"
+	}
+	ad := upAdoptDeps(up.Deps{}, "")
+	return up.HereTerm{
+		AgtermSession: upEnv("AGTERM_SESSION_ID"), TmuxPane: upEnv("TMUX_PANE"), Prefer: prefer,
+		Argv:       strings.Join(upArgv, " "),
+		Cwd:        upHereCwd(),
+		Workspaces: a.Workspaces, NewWorkspace: a.WorkspaceNew, Move: a.Move, Pin: a.Pin,
+		PaneOf: t.PaneOf, WindowPanes: ad.WindowPanes,
+		// The pane's foreground is qm itself: its tty is qm's and qm's
+		// process group is the tty's foreground group.
+		PaneRuns: func(ctx context.Context, pane string) (bool, error) {
+			return upPaneRuns(ctx, pane, os.Getpid())
+		},
+		RenameWindow: func(ctx context.Context, windowID, name string) error {
+			if _, err := t.Run(ctx, t.Bin, "rename-window", "-t", windowID, "--", name); err != nil {
+				return fmt.Errorf("tmux: %w", err)
+			}
+			return nil
+		},
+		All:     up.All,
+		Records: func() ([]route.Record, error) { return readUpRecords(io.Discard) },
+	}.Resolve
+}
+
+// upHereCwd is qm's working folder ("" when unread).
+func upHereCwd() string {
+	wd, err := upWorkDir()
+	if err != nil {
+		return ""
+	}
+	return wd
+}
+
+// whereLine says where the coordinator starts: in this tab or a new one.
+func whereLine(o upOptions, would bool) string {
+	verb := "will start"
+	if would {
+		verb = "would start"
+	}
+	if o.here {
+		return "the coordinator " + verb + " in this tab, once the rest is done"
+	}
+	return "the coordinator " + verb + " in a new tab"
+}
+
+// restoreWhere is whereLine for a restore: the coordinator's earlier tab
+// when the plan reuses it, its launch line when there is no launcher.
+func restoreWhere(o upOptions, steps []up.Step, sp *up.StalePlan, noLauncher bool) string {
+	verb := "will start"
+	if o.dryRun {
+		verb = "would start"
+	}
+	switch {
+	case o.here:
+		return whereLine(o, o.dryRun)
+	case noLauncher:
+		return "the coordinator " + verb + " from its launch line, run in a terminal of your choice"
+	}
+	if sp != nil {
+		for _, s := range steps {
+			if ref, ok := sp.Reuse[s.SessionID]; ok && s.Role == up.RoleCoordinator {
+				return fmt.Sprintf("the coordinator %s in its earlier tab (%s %s), reused", verb, ref.Launcher, ref.ID)
+			}
+		}
+	}
+	return whereLine(o, o.dryRun)
 }
 
 // upLive reads the running Claude sessions now: Apply reads them again right
@@ -449,15 +667,31 @@ var upLinkedWorktree = func(root string) (string, bool) {
 
 // upStartFirst starts a new project's coordinator, adopting nothing.
 func upStartFirst(root string, o upOptions, d up.Deps, stdout, stderr io.Writer) error {
+	if o.hereNote != "" {
+		_, _ = fmt.Fprintf(stdout, "note: %s\n", o.hereNote)
+	}
 	if o.dryRun {
 		args := o.claudeArgs
 		if !o.argsGiven {
 			args = d.Coordinator
 		}
-		_, err := fmt.Fprintf(stdout, "first run in %s: would start the coordinator in a new workspace, launcher %s, claude arguments %q\ntrust: %s\n(dry run: nothing started)\n", root, launcherNote(d.Launcher), args, trustLine(d.Trusted, root))
+		where, line := "in a new workspace", whereLine(o, true)
+		switch {
+		case o.here:
+			where = "in the project's workspace (under tmux, this tab's tmux session)"
+		case d.Launcher == nil:
+			line = "the coordinator would start from its launch line, run in a terminal of your choice"
+		}
+		_, err := fmt.Fprintf(stdout, "first run in %s: would start the coordinator %s, launcher %s, claude arguments %q\n%s\ntrust: %s\n(dry run: nothing started)\n", root, where, launcherNote(d.Launcher), args, line, trustLine(d.Trusted, root))
 		return err
 	}
 	p, out, err := up.Start(context.Background(), root, o.claudeArgs, d)
+	if err == nil && out.Here {
+		warn(stderr, out)
+		_, _ = fmt.Fprintf(stdout, "project %s: starting coordinator %s in this tab (%s) in workspace %s\n", p.ID, out.Step.Name, hereRef(out.Ref), p.Workspace)
+		o.setPending(p.Root, out)
+		return nil
+	}
 	if errors.Is(err, launch.ErrNoLauncher) {
 		_, _ = fmt.Fprintf(stdout, "no launcher (agterm or tmux) found: run this line in a terminal of your choice, then qm up again:\n%s\n", launch.Command(out.Script))
 		return errQuiet
@@ -469,6 +703,15 @@ func upStartFirst(root string, o upOptions, d up.Deps, stdout, stderr io.Writer)
 	_, _ = fmt.Fprintf(stdout, "project %s: started coordinator %s (%s %s) in workspace %s\n", p.ID, out.Step.Name, out.Ref.Launcher, out.Ref.ID, p.Workspace)
 	attachHint(stdout, d.Launcher, p.Workspace, 1)
 	return nil
+}
+
+// hereRef names the terminal session recorded for a coordinator started in
+// this tab.
+func hereRef(ref launch.SessionRef) string {
+	if ref.ID == "" {
+		return "no terminal session recorded"
+	}
+	return ref.Launcher + " " + ref.ID
 }
 
 // trustLine says whether Claude Code trusts root, for a first-run dry run.
@@ -507,9 +750,29 @@ func upRestore(p *up.Project, recs []route.Record, o upOptions, d up.Deps, pickE
 	if o.argsGiven && !o.dryRun {
 		p.ClaudeArgs = append([]string{}, o.claudeArgs...)
 	}
+
 	steps, now, notes, procs, err := upPlan(p, recs, o.full, "started")
 	if err != nil {
 		return err
+	}
+	coordStarts, why := false, "the plan has no coordinator"
+	for _, s := range steps {
+		switch {
+		case s.Role != up.RoleCoordinator:
+		case s.Action == up.Resume || s.Action == up.Fresh:
+			coordStarts = true
+		case s.Action == up.Skip:
+			why = "it is skipped: " + s.Why
+		default:
+			why = "it runs already and is left as it is"
+		}
+	}
+	if !coordStarts && o.hereGiven {
+		return fmt.Errorf("%w: --here starts the coordinator in this tab, but no coordinator starts: %s", errUsage, why)
+	}
+	if !coordStarts {
+		// The config's "here" is not applied: no coordinator starts.
+		o.here, d.Here = false, nil
 	}
 	_, _ = fmt.Fprintf(stdout, "project %s (%s), workspace %s, launcher %s\n", p.ID, p.Root, p.Workspace, launcherNote(d.Launcher))
 	_, _ = fmt.Fprint(stdout, up.Render(steps, now))
@@ -522,12 +785,29 @@ func upRestore(p *up.Project, recs []route.Record, o upOptions, d up.Deps, pickE
 		d.Stale = up.PlanStale(context.Background(), p, steps, d)
 		_, _ = fmt.Fprint(stdout, up.RenderStale(d.Stale))
 	}
+	if coordStarts {
+		_, _ = fmt.Fprintln(stdout, restoreWhere(o, steps, d.Stale, pickErr != nil))
+		if o.hereNote != "" {
+			_, _ = fmt.Fprintf(stdout, "note: %s\n", o.hereNote)
+		}
+	}
 	if o.dryRun {
 		_, err := fmt.Fprintln(stdout, "dry run: nothing started")
 		return err
 	}
 	starts := up.Starts(steps)
-	if pickErr != nil && starts > 0 {
+	if starts > 0 && !o.argsGiven {
+		// Saved before qm refused a lone --: a coordinator would not start
+		// as qm means, and the workers' cap would read past it.
+		if err := up.CheckClaudeArgs(p.ClaudeArgs); err != nil {
+			return fmt.Errorf("the saved coordinator arguments: %w (replace them with qm up -- ARGS)", err)
+		}
+	}
+	launched := starts
+	if o.here {
+		launched-- // the coordinator starts in this tab
+	}
+	if pickErr != nil && launched > 0 {
 		_, _ = fmt.Fprintln(stdout, "no launcher (agterm or tmux) found: qm up will write the launch scripts and record the new sessions' ids, for you to run")
 	}
 	if starts > 0 && !o.yes {
@@ -556,14 +836,29 @@ func upRestore(p *up.Project, recs []route.Record, o upOptions, d up.Deps, pickE
 	}
 	d.Progress = func(line string) { _, _ = fmt.Fprintln(stdout, line) }
 	outs := up.Apply(context.Background(), p, steps, d)
+	// A coordinator to start in this tab runs once qm returns (o.pending),
+	// whatever happened to the workers; one whose step failed does not.
+	for _, out := range outs {
+		if out.Here && out.Err == nil {
+			o.setPending(p.Root, out)
+		}
+	}
 	if d.Launcher == nil {
-		_, _ = fmt.Fprintln(stdout, "no launcher (agterm or tmux) found: run each line in a terminal of your choice, then qm up again:")
+		printed := false
 		for _, out := range outs {
-			if out.Script != "" {
+			if out.Script != "" && !out.Here {
+				if !printed {
+					_, _ = fmt.Fprintln(stdout, "no launcher (agterm or tmux) found: run each line in a terminal of your choice, then qm up again:")
+					printed = true
+				}
 				_, _ = fmt.Fprintln(stdout, launch.Command(out.Script))
 			}
 		}
 		for _, out := range outs {
+			if out.Here && out.Err == nil {
+				warn(stderr, out)
+				_, _ = fmt.Fprintln(stdout, resultLine(out))
+			}
 			if out.Err != nil {
 				_, _ = fmt.Fprintf(stderr, "qm up: %s: %v\n", out.Step.Name, out.Err)
 			}
@@ -666,6 +961,13 @@ func warn(stderr io.Writer, out up.Outcome) {
 // resultLine says what qm up did with one session.
 func resultLine(out up.Outcome) string {
 	s := out.Step
+	if out.Here {
+		how := "resuming"
+		if s.Action == up.Fresh {
+			how = "starting fresh as " + out.NewSessionID + ":"
+		}
+		return fmt.Sprintf("%s %s in this tab (%s)", how, s.Name, hereRef(out.Ref))
+	}
 	switch s.Action {
 	case up.Leave:
 		return fmt.Sprintf("left %s running", s.Name)
@@ -1055,6 +1357,9 @@ func upAdopt(root string, all []up.Project, det up.Detected, claudeDir string, o
 		}
 		if ch.New {
 			return upStartFirst(root, o, d, stdout, stderr)
+		}
+		if o.hereGiven {
+			return fmt.Errorf("%w: --here starts a coordinator in this tab, but adopting a running one starts none", errUsage)
 		}
 	}
 	ad := upAdoptDeps(d, claudeDir)

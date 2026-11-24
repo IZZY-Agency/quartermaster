@@ -200,8 +200,12 @@ func WillClose(s Step, ref launch.SessionRef, listed map[string]map[string]launc
 // A session that is not running: only an idle shell (Idle). A running one
 // (a leave): an agterm tab only when its foreground is that session
 // (runsSession), a tmux window only when it has one pane, so closing it
-// ends that session alone.
+// ends that session alone. An agterm tab split into several panes is never
+// closed: closing it would end what runs beside the session.
 func closable(s Step, l launch.SessionRef) bool {
+	if l.Launcher == "agterm" && l.Split {
+		return false
+	}
 	if s.Action != Leave {
 		return l.Idle
 	}
