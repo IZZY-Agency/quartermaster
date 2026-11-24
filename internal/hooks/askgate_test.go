@@ -188,3 +188,28 @@ func TestRecentConversationKeepsLatest(t *testing.T) {
 		t.Errorf("conversation of %d characters (cap %d) or still holding the old turn", len(conv), policy.AskContextChars)
 	}
 }
+
+// TestStopOutputOnlyBlocks: on a Stop event every output makes Claude
+// continue, so the only output a guard gives there is a block; a note or a
+// rewrite gives none.
+func TestStopOutputOnlyBlocks(t *testing.T) {
+	stop := Input{HookEventName: "Stop"}
+	for _, c := range []struct {
+		mode string
+		res  result
+	}{
+		{"on", result{note: "a note"}},
+		{"on", result{updated: map[string]any{"k": "v"}, note: "n"}},
+		{"note", result{updated: map[string]any{"k": "v"}, explain: "e"}},
+		{"note", result{deny: "stop"}},
+	} {
+		out, err := render(stop, c.mode, c.res)
+		if err != nil || out != nil {
+			t.Errorf("%s %+v: output %s, %v; want none", c.mode, c.res, out, err)
+		}
+	}
+	out, err := render(stop, "on", result{deny: "answer first"})
+	if err != nil || string(out) != string(BlockStop("answer first")) {
+		t.Errorf("deny: %s, %v; want a block", out, err)
+	}
+}

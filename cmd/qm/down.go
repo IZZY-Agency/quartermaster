@@ -9,9 +9,7 @@ import (
 	"io"
 	"os"
 	"strings"
-	"time"
 
-	"github.com/IZZY-Agency/quartermaster/internal/declog"
 	"github.com/IZZY-Agency/quartermaster/internal/launch"
 	"github.com/IZZY-Agency/quartermaster/internal/up"
 )
@@ -131,7 +129,7 @@ func downMain(args []string, stdout, stderr io.Writer) error {
 	if !found {
 		return fmt.Errorf("%w: no qm up project here (%s)", up.ErrInput, where)
 	}
-	recs, err := declog.Read(time.Time{})
+	recs, err := readUpRecords(stdout)
 	if err != nil {
 		return err
 	}

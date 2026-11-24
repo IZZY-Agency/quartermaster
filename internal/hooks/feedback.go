@@ -50,6 +50,19 @@ const feedbackNoteSuffix = "-fb-note.txt"
 // analyzer: <session id>-fb-<n>.txt.
 var promptFileName = regexp.MustCompile(`^(.+)-fb-[0-9]+\.txt$`)
 
+// feedbackFileName matches every file the feedback hook leaves in the
+// sessions folder: a prompt file, a pending note, and a note's taken copy
+// (<note>.<n>) or temporary file (<note>.tmp-<n>), each named after a valid
+// session id. The sweep removes nothing else, so a session id that holds
+// "-fb-" does not expose that session's other files.
+var feedbackFileName = regexp.MustCompile(`^(.+)-fb-([0-9]+\.txt|note\.txt(\.[0-9]+|\.tmp-[0-9]+)?)$`)
+
+// isFeedbackFile tells whether name is one of the feedback hook's files.
+func isFeedbackFile(name string) bool {
+	m := feedbackFileName.FindStringSubmatch(name)
+	return m != nil && sessionIDPattern.MatchString(m[1])
+}
+
 // analyzerArgv is the command that analyzes one saved prompt: this qm's
 // feedback-analyze. Tests replace it.
 var analyzerArgv = func(file, memory string) ([]string, error) {
@@ -349,7 +362,7 @@ func sweepFeedback(dir string, now time.Time) {
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if !e.Type().IsRegular() || !strings.Contains(name, "-fb-") {
+		if !e.Type().IsRegular() || !isFeedbackFile(name) {
 			continue
 		}
 		maxAge := staleFeedbackFile

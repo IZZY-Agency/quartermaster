@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -26,7 +27,15 @@ type Last struct {
 	At      time.Time
 }
 
+// maxTail bounds how far back TailLines looks for the start of a last line
+// longer than its window.
+const maxTail = 64 << 20
+
 // TailLines returns the whole lines in the last n bytes of the file at path.
+// When the last line alone is longer than n, it is skipped and the lines in
+// the n bytes before it are returned instead, so one long line does not
+// hide the rest and the read stays near n bytes; when that line starts more
+// than maxTail bytes before the end, nothing is returned.
 func TailLines(path string, n int64) ([][]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -37,25 +46,83 @@ func TailLines(path string, n int64) ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	off := max(fi.Size()-n, 0)
-	b, err := io.ReadAll(io.NewSectionReader(f, off, fi.Size()-off))
+	size := fi.Size()
+	b, err := linesIn(f, max(size-n, 0), size)
 	if err != nil {
 		return nil, err
 	}
-	if off > 0 {
-		// Drop the line cut by the offset.
-		if i := bytes.IndexByte(b, '\n'); i >= 0 {
-			b = b[i+1:]
+	if len(b) == 0 && size > n {
+		// No line starts in the window: the last line is longer than n.
+		start, err := lastLineStart(f, size)
+		if err != nil {
+			return nil, err
+		}
+		b = nil
+		if start > 0 {
+			if b, err = linesIn(f, max(start-n, 0), start); err != nil {
+				return nil, err
+			}
 		}
 	}
 	var lines [][]byte
 	sc := bufio.NewScanner(bytes.NewReader(b))
-	sc.Buffer(make([]byte, 0, 64*1024), int(n)+1)
+	sc.Buffer(make([]byte, 0, min(64*1024, len(b)+1)), len(b)+1)
 	for sc.Scan() {
 		// Scanner reuses its buffer: keep a copy of each line.
 		lines = append(lines, bytes.Clone(sc.Bytes()))
 	}
 	return lines, sc.Err()
+}
+
+// linesIn returns the bytes of f before end from the first line that
+// starts at or after off: the line off cuts is dropped, and a line that
+// starts right at off is kept.
+func linesIn(f *os.File, off, end int64) ([]byte, error) {
+	from := max(off-1, 0)
+	b, err := io.ReadAll(io.NewSectionReader(f, from, end-from))
+	if err != nil || off == 0 || len(b) == 0 {
+		return b, err
+	}
+	if b[0] == '\n' {
+		return b[1:], nil
+	}
+	i := bytes.IndexByte(b, '\n')
+	if i < 0 {
+		return nil, nil
+	}
+	return b[i+1:], nil
+}
+
+// lastLineStart is the offset where f's last line starts (a final newline
+// ends that line), found by reading back in blocks; -1 when it starts more
+// than maxTail bytes before the end.
+func lastLineStart(f *os.File, size int64) (int64, error) {
+	end := size
+	last := make([]byte, 1)
+	if _, err := f.ReadAt(last, size-1); err != nil {
+		return 0, err
+	}
+	if last[0] == '\n' {
+		end--
+	}
+	// A newline just before the bound still starts a line inside it.
+	lo := max(size-maxTail-1, 0)
+	buf := make([]byte, min(1<<20, max(end-lo, 1)))
+	for hi := end; hi > lo; {
+		from := max(hi-int64(len(buf)), lo)
+		chunk := buf[:hi-from]
+		if _, err := f.ReadAt(chunk, from); err != nil && !errors.Is(err, io.EOF) {
+			return 0, err
+		}
+		if i := bytes.LastIndexByte(chunk, '\n'); i >= 0 {
+			return from + int64(i) + 1, nil
+		}
+		hi = from
+	}
+	if size <= maxTail {
+		return 0, nil
+	}
+	return -1, nil
 }
 
 // LastContext is the context size of the last main-thread assistant message

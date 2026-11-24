@@ -151,7 +151,7 @@ func spawnWorker(args []string, stdout, stderr io.Writer) error {
 			}
 			return st
 		},
-		Getenv: os.Getenv, PS: spawn.PS, Pick: launch.Pick, Exe: exe, Mark: rd.mark,
+		Getenv: os.Getenv, PS: spawn.PS, ProcExe: spawn.ProcExe, Pick: launch.Pick, Exe: exe, Mark: rd.mark,
 		Trusted: func(dir string) (bool, error) {
 			cj, err := paths.ClaudeJSON()
 			if err != nil {

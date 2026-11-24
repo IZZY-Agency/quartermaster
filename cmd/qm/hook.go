@@ -36,7 +36,8 @@ func runHook(args []string, stdout, _ io.Writer) int {
 	}
 	cfg, err := config.Load()
 	if err != nil {
-		// Load returns the defaults with its error; the hook runs on them.
+		// Load returns the config it could read (the defaults when the file
+		// does not parse) with its error; the hook runs on it.
 		_ = declog.Append(route.Record{Time: time.Now().UTC(), Kind: "error", Rule: name, Detail: err.Error()})
 	}
 	if out := hooks.Handle(name, hookStdin, cfg); len(out) > 0 {

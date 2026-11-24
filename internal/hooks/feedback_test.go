@@ -329,3 +329,44 @@ func TestFeedbackSweepsLeftovers(t *testing.T) {
 		}
 	}
 }
+
+// TestFeedbackSweepRemovesOnlyItsOwnFiles: the feedback sweep removes only
+// the files the feedback hook names, whatever a session id holds.
+func TestFeedbackSweepRemovesOnlyItsOwnFiles(t *testing.T) {
+	setup(t)
+	dir := sessionsDir(t)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	old := now.Add(-staleFeedbackNote - time.Hour)
+	files := map[string]bool{
+		"a-fb-1.txt":                        false,
+		"a" + feedbackNoteSuffix:            false,
+		"a" + feedbackNoteSuffix + ".12":    false,
+		"a" + feedbackNoteSuffix + ".tmp-3": false,
+		"x-fb-y.json":                       true, // session x-fb-y's state
+		"x-fb-1.txt.json":                   true, // session x-fb-1.txt's state
+		"x-fb-note.txt.json":                true,
+		"x-fb-y.json.lock":                  true,
+		"notes-fb-draft.md":                 true,
+		"a-fb-1.txt.lock":                   true,
+		".draft-fb-1.txt":                   true, // no session id starts with a dot
+	}
+	for name := range files {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sweepFeedback(dir, now)
+	for name, kept := range files {
+		_, err := os.Stat(filepath.Join(dir, name))
+		if got := err == nil; got != kept {
+			t.Errorf("%s: kept %v, want %v", name, got, kept)
+		}
+	}
+}

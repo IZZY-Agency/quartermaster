@@ -27,6 +27,8 @@ import (
 var (
 	// ps reads a process's command line and parent, for the permission source.
 	ps = spawn.PS
+	// procExe reads the executable a process runs, for the same.
+	procExe = spawn.ProcExe
 	// executable is qm's own path, for the qm-worker plugin lookup.
 	executable = os.Executable
 )
@@ -191,7 +193,7 @@ func detectLauncher(cfg config.Config, env func(string) string, look func(string
 }
 
 func detectPermission(env func(string) string) Status {
-	flags, why := spawn.ParentPermission(env, ps)
+	flags, why, _ := spawn.ParentPermission(env, ps, procExe)
 	return Status{Name: "permission", On: flags != nil, Why: why}
 }
 

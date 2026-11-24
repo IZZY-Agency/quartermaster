@@ -46,8 +46,9 @@ func TestPermissionMirrorsParent(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			ps := psOf(map[int]proc{4242: {c.cmd, 1}})
-			got, why := ParentPermission(envMap(map[string]string{"CLAUDE_PID": "4242"}), ps)
+			ps := psOf(map[int]proc{os.Getppid(): {"/bin/zsh -c qm", 4242}, 4242: {c.cmd, 1}})
+			exe := exeOf(map[int]string{4242: realClaude})
+			got, why, _ := ParentPermission(envMap(map[string]string{"CLAUDE_PID": "4242"}), ps, exe)
 			if !slices.Equal(got, c.want) {
 				t.Errorf("flags = %q, want %q", got, c.want)
 			}
@@ -65,7 +66,8 @@ func TestPermissionWalksParents(t *testing.T) {
 		900:    {"/opt/tools/bin/claude --permission-mode acceptEdits", 800},
 		800:    {"claude --dangerously-skip-permissions", 1},
 	})
-	got, _ := ParentPermission(envMap(nil), ps)
+	exe := exeOf(map[int]string{900: realClaude, 800: realClaude})
+	got, _, _ := ParentPermission(envMap(nil), ps, exe)
 	if want := []string{"--permission-mode", "acceptEdits"}; !slices.Equal(got, want) {
 		t.Errorf("flags = %q, want the first claude's %q", got, want)
 	}
@@ -84,7 +86,7 @@ func TestNoParentNoBypass(t *testing.T) {
 	}
 	for name, ps := range cases {
 		t.Run(name, func(t *testing.T) {
-			got, why := ParentPermission(envMap(nil), ps)
+			got, why, _ := ParentPermission(envMap(nil), ps, exeOf(nil))
 			if got != nil {
 				t.Errorf("flags = %q, want nil", got)
 			}
@@ -92,18 +94,6 @@ func TestNoParentNoBypass(t *testing.T) {
 				t.Errorf("why = %q, want %q", why, NoCoordinator)
 			}
 		})
-	}
-}
-
-func TestClaudePIDNotClaudeFallsBack(t *testing.T) {
-	parent := os.Getppid()
-	ps := psOf(map[int]proc{
-		4242:   {"/usr/bin/vim --dangerously-skip-permissions", 1},
-		parent: {"claude --permission-mode plan", 1},
-	})
-	got, _ := ParentPermission(envMap(map[string]string{"CLAUDE_PID": "4242"}), ps)
-	if want := []string{"--permission-mode", "plan"}; !slices.Equal(got, want) {
-		t.Errorf("flags = %q, want the walked-to claude's %q", got, want)
 	}
 }
 
@@ -115,14 +105,17 @@ func TestClaudePathWithSpaces(t *testing.T) {
 	if err := os.WriteFile(bin, nil, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	ps := psOf(map[int]proc{4242: {bin + " --permission-mode acceptEdits", 1}})
-	got, _ := ParentPermission(envMap(map[string]string{"CLAUDE_PID": "4242"}), ps)
+	parent := os.Getppid()
+	exe := exeOf(map[int]string{4242: bin})
+	ps := psOf(map[int]proc{parent: {"/bin/zsh", 4242}, 4242: {bin + " --permission-mode acceptEdits", 1}})
+	got, _, _ := ParentPermission(envMap(map[string]string{"CLAUDE_PID": "4242"}), ps, exe)
 	if want := []string{"--permission-mode", "acceptEdits"}; !slices.Equal(got, want) {
 		t.Errorf("flags = %q, want %q", got, want)
 	}
 	// A shell running a claude path is not claude itself.
-	ps = psOf(map[int]proc{4242: {"/bin/sh -c " + bin + " --dangerously-skip-permissions", 1}})
-	if got, why := ParentPermission(envMap(map[string]string{"CLAUDE_PID": "4242"}), ps); got != nil || why != NoCoordinator {
+	ps = psOf(map[int]proc{parent: {"/bin/zsh", 4242}, 4242: {"/bin/sh -c " + bin + " --dangerously-skip-permissions", 1}})
+	exe = exeOf(map[int]string{4242: "/bin/sh"})
+	if got, why, _ := ParentPermission(envMap(map[string]string{"CLAUDE_PID": "4242"}), ps, exe); got != nil {
 		t.Errorf("flags = %q (%s), want nil", got, why)
 	}
 }

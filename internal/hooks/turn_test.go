@@ -211,3 +211,27 @@ func TestTurnHooksListed(t *testing.T) {
 		t.Fatalf("Names() = %v", Names())
 	}
 }
+
+// TestSweepKeepsLockFiles: a sweep of old files never removes a lock file,
+// which another hook may hold or be about to take.
+func TestSweepKeepsLockFiles(t *testing.T) {
+	dir := t.TempDir()
+	old := time.Now().Add(-stateAge - time.Hour)
+	files := map[string]bool{"s.start": false, "s.start.lock": true, "s.stop.lock": true}
+	for name := range files {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sweepOld(dir, stateAge)
+	for name, kept := range files {
+		_, err := os.Stat(filepath.Join(dir, name))
+		if got := err == nil; got != kept {
+			t.Errorf("%s: kept %v, want %v", name, got, kept)
+		}
+	}
+}

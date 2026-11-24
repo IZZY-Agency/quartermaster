@@ -76,41 +76,42 @@ func qmDirOf(exe string) string {
 }
 
 // workerProfile is the logged launch profile of a worker step, re-resolved
-// for today (spec 5.5): the qm-worker plugin folder found again (BuildProfile
-// puts it first), the permission flags capped at the coordinator's current
-// ones (coordinator: its claude arguments, coordinatorCap), and the project
-// tie in the environment.
-func workerProfile(p *Project, s Step, exe string, coordinator []string) (route.Profile, error) {
+// for today (spec 5.5): the qm-worker plugin folder found again, and no
+// other plugin folder (BuildProfile writes that one only, so another in the
+// Record is not qm's); the MCP config only when it is one of mcpConfigs, the
+// config's project_mcp files, else none, with a warning; the permission
+// flags capped at the coordinator's current ones (coordinator: its claude
+// arguments, coordinatorCap); and the project tie in the environment.
+func workerProfile(p *Project, s Step, exe string, coordinator, mcpConfigs []string) (prof route.Profile, warning string, err error) {
 	if !hasProfile(s.Record) {
-		return route.Profile{}, fmt.Errorf("%s: no launch profile in its Record", s.Name)
+		return route.Profile{}, "", fmt.Errorf("%s: no launch profile in its Record", s.Name)
 	}
-	prof := *s.Record.Decision.Profile
+	prof = *s.Record.Decision.Profile
 	prof.PluginsOn = slices.Clone(prof.PluginsOn)
 	prof.PluginsOff = slices.Clone(prof.PluginsOff)
-	prof.PluginDirs = slices.Clone(prof.PluginDirs)
 	prof.Env = maps.Clone(prof.Env)
 	dir, err := spawn.WorkerPluginDir(exe)
 	if err != nil {
-		return route.Profile{}, err
+		return route.Profile{}, "", err
 	}
-	if len(prof.PluginDirs) > 0 {
-		prof.PluginDirs[0] = dir
-	} else {
-		prof.PluginDirs = []string{dir}
+	prof.PluginDirs = []string{dir}
+	if prof.MCPConfig != "" && !slices.Contains(mcpConfigs, prof.MCPConfig) {
+		prof.MCPConfig = ""
+		warning = "its recorded MCP config is not a project_mcp file of the config: started without MCP servers"
 	}
 	// Never raised: the weaker of the worker's own flags and the
 	// coordinator's, as for a hand-started worker; not started when the two
 	// have no mode in common.
 	perm, err := spawn.LowerPermission(prof.Permission, coordinator)
 	if err != nil {
-		return route.Profile{}, fmt.Errorf("%s: not started, its own permission flags against the coordinator's: %w", s.Name, err)
+		return route.Profile{}, "", fmt.Errorf("%s: not started, its own permission flags against the coordinator's: %w", s.Name, err)
 	}
 	prof.Permission = perm
 	if prof.Env == nil {
 		prof.Env = map[string]string{}
 	}
 	prof.Env["QM_PROJECT_ID"], prof.Env["QM_WORKSPACE"] = p.ID, p.Workspace
-	return prof, nil
+	return prof, warning, nil
 }
 
 // The flags adoptedArgs sorts out of a hand-started worker's arguments.
@@ -202,11 +203,16 @@ func writeNote(p *Project, s Step) (string, error) {
 }
 
 // writeUpFile writes text to <state>/up/<projectID>/<prefix><unixnano>.md,
-// mode 0600 in a 0700 folder, never over an existing file. Notes there older
+// mode 0600 in a 0700 folder, never over an existing file. projectID must
+// be a file name (safeName) and prefix a session name spawn.FileName takes
+// followed by -. Notes there older
 // than spawn.ScriptAge are removed first.
 func writeUpFile(projectID, prefix, text string) (string, error) {
-	if projectID == "" || strings.ContainsAny(projectID, "/\x00") || projectID == "." || projectID == ".." {
+	if !safeName(projectID) {
 		return "", fmt.Errorf("prompt file: bad project id %q", projectID)
+	}
+	if name, ok := strings.CutSuffix(prefix, "-"); !ok || !spawn.FileName(name) {
+		return "", fmt.Errorf("prompt file: name %q is not usable in a file name", prefix)
 	}
 	state, err := paths.StateDir()
 	if err != nil {
@@ -285,31 +291,5 @@ func LiveArgs(id string, live map[string]claudecode.LiveSession, procs []claudec
 // --allow-dangerously-skip-permissions is never passed on from a live read.
 // An error when two readings have no mode in common.
 func livePermission(words []string) ([]string, error) {
-	if i := slices.Index(words, "--"); i >= 0 {
-		words = words[:i]
-	}
-	var out []string
-	seen := false
-	for i := 0; i < len(words); i++ {
-		var reading []string
-		switch a := words[i]; {
-		case a == bypassFlag || strings.HasPrefix(a, modeFlag+"="):
-			reading = []string{a}
-		case a == modeFlag && i+1 < len(words):
-			reading = []string{a, words[i+1]}
-			i++
-		default:
-			continue
-		}
-		flags, _ := spawn.PermissionOf(reading, 0)
-		if !seen {
-			out, seen = flags, true
-			continue
-		}
-		var err error
-		if out, err = spawn.LowerPermission(out, flags); err != nil {
-			return nil, err
-		}
-	}
-	return out, nil
+	return spawn.WeakestPermission(words)
 }

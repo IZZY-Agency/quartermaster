@@ -217,9 +217,14 @@ func render(in Input, mode string, res result) ([]byte, error) {
 	if event == "" {
 		event = "PreToolUse"
 	}
+	if event == "Stop" {
+		// Any Stop output makes Claude continue: only a block may give one.
+		if res.deny != "" && mode != "note" {
+			return BlockStop(res.deny), nil
+		}
+		return nil, nil
+	}
 	switch {
-	case res.deny != "" && event == "Stop":
-		return BlockStop(res.deny), nil
 	case res.deny != "" && mode == "note":
 		return Note(event, res.deny), nil
 	case res.deny != "":

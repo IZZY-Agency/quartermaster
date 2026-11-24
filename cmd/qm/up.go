@@ -271,7 +271,7 @@ func upRunMain(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	recs, err := declog.Read(time.Time{})
+	recs, err := readUpRecords(stdout)
 	if err != nil {
 		return err
 	}
@@ -304,13 +304,14 @@ func upRunMain(args []string, stdout, stderr io.Writer) error {
 func upDeps(l launch.Launcher, exe string, cfg config.Config) up.Deps {
 	d := up.Deps{
 		Launcher: l, Exe: exe, Coordinator: cfg.Up.ClaudeArgs, Log: declog.Append,
-		Now:     func() time.Time { return time.Now().UTC() },
-		Self:    selfSessions(),
-		Pin:     upAgtermPin,
-		Trusted: trusted,
-		Run:     upRun,
-		Live:    upLive,
-		Sleep:   upSleep,
+		MCPConfigs: slices.Collect(maps.Values(cfg.ProjectMCP)),
+		Now:        func() time.Time { return time.Now().UTC() },
+		Self:       selfSessions(),
+		Pin:        upAgtermPin,
+		Trusted:    trusted,
+		Run:        upRun,
+		Live:       upLive,
+		Sleep:      upSleep,
 		// A worker's permission is capped at the running coordinator's own
 		// flags, read off its process right before the worker starts.
 		CoordinatorArgs: upCoordinatorArgs,
@@ -731,7 +732,7 @@ func upDone(args []string, stdout io.Writer) error {
 	if !found {
 		return fmt.Errorf("%w: no qm up project here (%s)", up.ErrInput, where)
 	}
-	recs, err := declog.Read(time.Time{})
+	recs, err := readUpRecords(stdout)
 	if err != nil {
 		return err
 	}
@@ -1003,7 +1004,9 @@ func upAdoptDeps(d up.Deps, claudeDir string) up.AdoptDeps {
 			return claudecode.Live(claudeDir, procs)
 		},
 		Trusted: d.Trusted, Log: d.Log, Now: d.Now, Config: d.Coordinator,
-		Records: func() ([]route.Record, error) { return declog.Read(time.Time{}) },
+		// Read again during adoption: its notes were printed by the run's
+		// first read.
+		Records: func() ([]route.Record, error) { return readUpRecords(io.Discard) },
 		// Signal 0 checks that the process exists; EPERM: it runs as
 		// another user.
 		Running: func(pid int) bool {

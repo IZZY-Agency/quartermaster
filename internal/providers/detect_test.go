@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/IZZY-Agency/quartermaster/internal/config"
+	"github.com/IZZY-Agency/quartermaster/internal/spawn"
 )
 
 // hermetic points every folder Detect reads at a temporary one, with no
@@ -168,11 +169,21 @@ func TestDetectLauncher(t *testing.T) {
 func TestDetectPermissionFromParent(t *testing.T) {
 	hermetic(t)
 	ps = func(pid int) (string, int, error) {
-		if pid == 42 {
+		switch pid {
+		case os.Getppid():
+			return "/bin/zsh -c qm status", 42, nil
+		case 42:
 			return "claude --dangerously-skip-permissions", 1, nil
 		}
 		return "", 0, errors.New("no process")
 	}
+	procExe = func(pid int) (string, error) {
+		if pid == 42 {
+			return "/usr/local/bin/claude", nil
+		}
+		return "", errors.New("no process")
+	}
+	t.Cleanup(func() { procExe = spawn.ProcExe })
 	s := byName(t, Detect(context.Background(), config.Defaults(), envOf(map[string]string{"CLAUDE_PID": "42"}), lookIn()), "permission")
 	if !s.On || !strings.Contains(s.Why, "--dangerously-skip-permissions") {
 		t.Errorf("permission = %+v", s)

@@ -769,7 +769,7 @@ func (t *adoptTerminal) planWorkers(ctx context.Context, p *Project, ap *AdoptPl
 			p.Adopted[w.SessionID] = AdoptedSession{}
 		} else {
 			if !spawn.ValidName(name) {
-				name = "w-" + w.SessionID[:min(8, len(w.SessionID))]
+				name = fallbackName(w.SessionID)
 				ap.Notes = append(ap.Notes, fmt.Sprintf("worker named %s in qm's state and from its next restart (its name %q is not a safe session name)", name, w.Name))
 			}
 			p.Adopted[w.SessionID] = AdoptedSession{

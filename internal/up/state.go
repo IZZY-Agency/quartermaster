@@ -207,26 +207,54 @@ func LoadID(id string) (Project, bool, error) {
 	return p, true, nil
 }
 
+// readProject reads the state file at path, <id>.json, whose id must be
+// that file name's, with an absolute project folder. A file that cannot be read, is not a project's state or
+// holds another id is an unreadable error (unreadable), which says how to
+// move it aside; one a newer qm wrote asks for an upgrade instead.
 func readProject(path string) (Project, error) {
 	b, err := os.ReadFile(path)
-	if err != nil {
+	if errors.Is(err, fs.ErrNotExist) {
+		if fi, lerr := os.Lstat(path); lerr == nil && fi.Mode()&fs.ModeSymlink != 0 {
+			return Project{}, unreadable(path, errors.New("it is a link to a missing file"))
+		}
 		return Project{}, err
+	}
+	if err != nil {
+		return Project{}, unreadable(path, err)
 	}
 	var p Project
 	if err := json.Unmarshal(b, &p); err != nil {
-		return Project{}, fmt.Errorf("%s: %w", path, err)
+		return Project{}, unreadable(path, err)
 	}
 	if p.Version > stateVersion {
 		return Project{}, fmt.Errorf("%s: version %d, newer than this qm reads (%d): upgrade qm", path, p.Version, stateVersion)
 	}
+	if id := strings.TrimSuffix(filepath.Base(path), ".json"); p.ID != id {
+		return Project{}, unreadable(path, fmt.Errorf("it holds project id %q, not its file name's %q", p.ID, id))
+	}
+	if !filepath.IsAbs(p.Root) {
+		return Project{}, unreadable(path, fmt.Errorf("its project folder %q is not an absolute path", p.Root))
+	}
 	return p, nil
+}
+
+// unreadable is the error of a state file qm cannot use: it names the
+// file and the cause, says what qm cannot tell without it, and gives the
+// command that moves it aside (to a name without .json, which qm does not
+// read, made unique by the time so an earlier one is kept), at the cost of
+// that project's saved state.
+func unreadable(path string, cause error) error {
+	aside := path + ".unreadable-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+	return fmt.Errorf("state file %s is unreadable (%w): qm cannot tell which sessions that project holds; "+
+		"to go on without that project's saved state, move the file aside: mv %s %s",
+		path, cause, launch.Quote(path), launch.Quote(aside))
 }
 
 // Save writes p to <state>/projects/<id>.json atomically (mode 0600, folder
 // 0700), with Updated set to now and Version to the current one.
 func Save(p Project) error {
-	if p.ID == "" {
-		return errors.New("save project: no id")
+	if !safeName(p.ID) {
+		return fmt.Errorf("save project: bad id %q", p.ID)
 	}
 	dir, err := projectsDir()
 	if err != nil {

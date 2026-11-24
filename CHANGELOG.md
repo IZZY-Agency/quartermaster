@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.2.1
+
+A hardening release, after an audit of the code.
+
+- **The worker's permission flag comes from a verified coordinator.** `qm
+  spawn worker` copies the flag only from the nearest `claude` among its own
+  parent processes, checked to run a claude executable; `CLAUDE_PID` must
+  name that same process. In every other case the worker gets no flag and
+  prompts, and `qm status` says why.
+- **Names and ids are checked before they become file names or command
+  arguments.** Worker names, project ids, branches and folders read from
+  qm's state and decision log are validated where they are read and again
+  where files are written. An unusable field is cleared with a `note:` and
+  the rest of the project goes on.
+- **A restored worker follows the config, not its Record.** `qm up` gives it
+  this qm's own plugin folder, and its MCP config only when `project_mcp`
+  still names that file.
+- **Redaction covers more.** Long hex keys, keys with well-known vendor
+  prefixes, values of credential fields, IPv6 addresses, non-ASCII and
+  fullwidth email forms, more phone forms, and person names regardless of
+  case, width or zero-width characters. A placeholder already in the text
+  can no longer pass for one redaction wrote. Versions after `@`, timestamps
+  in file names and UUIDs are no longer redacted.
+- **An invalid `privacy.clients` entry is a config error** (an empty
+  `replace`, or a `pattern` that can match empty text), and keeps all text on
+  your machine until it is fixed.
+- **The launch gate reads wrapped launches.** It sees a `claude` or `codex`
+  launch behind `env`, `sudo`, `nice`, `xargs`, `find -exec`, `eval` and
+  similar wrappers, shell reserved words, command substitutions and quoting.
+  A `codex` run with a prompt is denied like `codex exec`. Commands hidden in
+  an interpreter's string (`python3 -c`, say) are outside what it reads.
+- **One bad line or file no longer breaks a command.** An overlong line in
+  the decision log is skipped; a very long last line in a transcript no
+  longer hides the lines before it; the decision log is not opened through a
+  symbolic link; two simultaneous appends can no longer leave a blank line.
+- **An unreadable project state file says how to recover.** It still stops
+  first runs and adoptions, since qm cannot tell which sessions that project
+  holds, and the error now names the file and the command that moves it
+  aside.
+- Sweeps of qm's state folders remove only their own files, and never a lock
+  file.
+
 ## 0.2.0
 
 - **`qm watch` and worker states.** `qm watch` waits in the background until a

@@ -715,6 +715,9 @@ func TestUndoYesKeepsEditedLine(t *testing.T) {
 }
 
 func TestInitRecordsConfigBeforeLaterFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a read-only folder, so the failure this test needs cannot be made")
+	}
 	settings := env(t)
 	writeFile(t, settings, userLine)
 	dir := filepath.Dir(settings)

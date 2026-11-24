@@ -29,8 +29,8 @@ Without a TypeSafe key, nothing goes to TypeSafe: routing uses the type, size
 and hint you give it and a fixed pattern for risky words, and the ask gate and
 feedback hook are off. `qm status` shows which providers are on.
 
-The privacy gate redacts secrets, emails, phone numbers, IPv4 addresses other than loopback,
-long tokens, your home folder, the client names you list in
+The privacy gate redacts secrets, emails, phone numbers, IP addresses other than loopback,
+long tokens and keys, your home folder, the client names you list in
 `privacy.clients` and, with the local Foundation Model helper, person names. If
 a secret cannot be redacted, or the local check finds something private left,
 the text stays on your machine and routing falls back to the coordinator's own
@@ -63,6 +63,13 @@ clients and suppliers in `privacy.clients`.
     coordinator (`up/`), the project state, launch scripts, the list of
     pending reviews, the Claude limit file and the Codex limit file
     (`limits/codex-limited.json`).
+- qm reads these files back as its own. A worker's handoff note, written by
+  that worker, becomes part of the first prompt of the session `qm up` starts
+  in its place: that is how work is carried over, and it means the note's
+  text steers the next session. Names, ids, branches and folders read from
+  the state and the decision log are checked before they become file names or
+  command arguments, but the folders are only as safe as their owner-only
+  permissions: do not loosen them.
 - `XDG_CONFIG_HOME` and `XDG_STATE_HOME` move both folders.
 
 ## What qm changes outside its own folders

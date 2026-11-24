@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -36,11 +37,14 @@ type Deps struct {
 	Pin         func(ctx context.Context, id string) error
 	Exe         string
 	Coordinator []string
-	Log         func(route.Record) error
-	Now         func() time.Time
-	Self        []string
-	Trusted     func(dir string) (bool, error)
-	Run         DirRunner
+	// MCPConfigs are the config's project_mcp files: a restored worker
+	// keeps its recorded MCP config only when it is one of them.
+	MCPConfigs []string
+	Log        func(route.Record) error
+	Now        func() time.Time
+	Self       []string
+	Trusted    func(dir string) (bool, error)
+	Run        DirRunner
 	// Stale is the reuse and stale-shell plan shown before asking
 	// (PlanStale); nil makes Apply list the workspace itself.
 	Stale *StalePlan
@@ -147,6 +151,8 @@ type Outcome struct {
 	// waitFor is the session id typed into a reused tab, which Apply waits
 	// to see running once every step has started.
 	waitFor string
+	// warn is a warning of the start itself, joined into Ref.Warning.
+	warn string
 }
 
 // Apply carries out the plan (spec 6): stale tmux windows closed, then the
@@ -191,7 +197,7 @@ func Apply(ctx context.Context, p *Project, steps []Step, d Deps) []Outcome {
 			}
 		case Resume, Fresh:
 			start(ctx, p, order, s, d, sp, coordIDs, &o)
-			if w := warnings[s.SessionID]; len(w) > 0 {
+			if w := append(slices.Clone(warnings[s.SessionID]), nonEmpty(o.warn)...); len(w) > 0 {
 				o.Ref.Warning = strings.Join(append(w, nonEmpty(o.Ref.Warning)...), "; ")
 			}
 		}
@@ -489,6 +495,10 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 			err = fmt.Errorf("hand-started worker %s: name %q is not a usable session name: resume it by hand: cd %s && claude --resume %s", s.SessionID, s.Name, launch.Quote(s.Cwd), s.SessionID)
 			break
 		}
+		if !filepath.IsAbs(s.Cwd) {
+			err = fmt.Errorf("hand-started worker %s: folder %q is not an absolute path: not started", s.SessionID, s.Cwd)
+			break
+		}
 		var capArgs []string
 		if capArgs, err = coordinatorCap(p, coordIDs, d); err != nil {
 			break
@@ -501,12 +511,20 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 		}
 		script = spawn.PlainResumeScript(args, env, s.Name, sid, s.Cwd, qmDirOf(d.Exe))
 	default:
+		if !spawn.ValidName(s.Name) {
+			err = fmt.Errorf("worker %s: name %q is not a usable session name: not started", s.SessionID, s.Name)
+			break
+		}
+		if !filepath.IsAbs(s.Cwd) {
+			err = fmt.Errorf("worker %s: folder %q is not an absolute path: not started", s.SessionID, s.Cwd)
+			break
+		}
 		var capArgs []string
 		if capArgs, err = coordinatorCap(p, coordIDs, d); err != nil {
 			break
 		}
 		var prof route.Profile
-		if prof, err = workerProfile(p, s, d.Exe, capArgs); err != nil {
+		if prof, o.warn, err = workerProfile(p, s, d.Exe, capArgs, d.MCPConfigs); err != nil {
 			break
 		}
 		tier, qmDir := s.Record.Decision.Tier, qmDirOf(d.Exe)

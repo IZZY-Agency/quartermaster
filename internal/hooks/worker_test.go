@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -705,5 +706,93 @@ func TestStateConcurrent(t *testing.T) {
 	}
 	if got != 20 {
 		t.Errorf("reads %d, want 20", got)
+	}
+}
+
+// TestStateSweepKeepsHeldState: the sweep does not remove an old state file
+// a hook holds.
+func TestStateSweepKeepsHeldState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "held.json")
+	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-stateAge - time.Hour)
+	if err := os.Chtimes(path, past, past); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	sweepOld(dir, stateAge)
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("held state removed: %v", err)
+	}
+}
+
+// TestStateUpdateFollowsReplacedFile: when the state file is removed between
+// a hook's open and its lock, the hook's update goes to the file now at the
+// path, not to the removed one.
+func TestStateUpdateFollowsReplacedFile(t *testing.T) {
+	setup(t)
+	if err := withState("s1", func(s *State) error { s.Reads = 5; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	once := true
+	afterStateOpen = func(path string) {
+		if once {
+			once = false
+			_ = os.Remove(path)
+		}
+	}
+	defer func() { afterStateOpen = func(string) {} }()
+	if err := withState("s1", func(s *State) error { s.Reads++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	var got int
+	if err := withState("s1", func(s *State) error { got = s.Reads; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if got != 1 {
+		t.Errorf("reads %d, want 1 (a fresh state, updated once)", got)
+	}
+}
+
+// TestSweepKeepsFileMadeAfterItsOpen: when the old file a sweep opened is
+// replaced before the sweep locks it, the new file is kept.
+func TestSweepKeepsFileMadeAfterItsOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.json")
+	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-stateAge - time.Hour)
+	if err := os.Chtimes(path, past, past); err != nil {
+		t.Fatal(err)
+	}
+	afterSweepOpen = func(p string) {
+		_ = os.Remove(p)
+		_ = os.WriteFile(p, []byte(`{"reads":1}`), 0o600)
+	}
+	defer func() { afterSweepOpen = func(string) {} }()
+	sweepOld(dir, stateAge)
+	if b, err := os.ReadFile(path); err != nil || string(b) != `{"reads":1}` {
+		t.Errorf("new file: %q, %v; want it kept", b, err)
+	}
+}
+
+// TestStateGivesUpOnEndlessReplacement: a state file that is replaced on
+// every try is an error, not an endless loop.
+func TestStateGivesUpOnEndlessReplacement(t *testing.T) {
+	setup(t)
+	afterStateOpen = func(path string) { _ = os.Remove(path) }
+	defer func() { afterStateOpen = func(string) {} }()
+	if err := withState("s1", func(*State) error { return nil }); err == nil {
+		t.Error("no error")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/IZZY-Agency/quartermaster/internal/config"
@@ -178,16 +179,52 @@ func logPendingReview(in Input) error {
 	return declog.AppendDecision(p.Decision, p.Record)
 }
 
-// sweepOld removes the files in dir last changed more than age ago.
+// sweepOld removes the files in dir last changed more than age ago, except
+// lock files: a hook may hold one, or have it open and be about to lock it,
+// and removing it would let the next hook lock a new file of the same name
+// at the same time.
 func sweepOld(dir string, age time.Duration) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
-		if fi, err := e.Info(); err == nil && fi.Mode().IsRegular() && time.Since(fi.ModTime()) > age {
-			_ = os.Remove(filepath.Join(dir, e.Name()))
+		if strings.HasSuffix(e.Name(), ".lock") {
+			continue
 		}
+		if fi, err := e.Info(); err == nil && fi.Mode().IsRegular() && time.Since(fi.ModTime()) > age {
+			removeIfStill(filepath.Join(dir, e.Name()), age)
+		}
+	}
+}
+
+// afterSweepOpen runs between removeIfStill's open and its lock; tests use
+// it.
+var afterSweepOpen = func(string) {}
+
+// removeIfStill removes the file at path if no one holds a lock on it, it
+// is still older than age once locked, and it is still the file at path. A file that is its own lock (a
+// session's state) is then not removed under a hook that holds it, and a
+// hook that opened it just before is told by withState's check that it was
+// replaced.
+func removeIfStill(path string, age time.Duration) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	afterSweepOpen(path)
+	if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+		return
+	}
+	held, err := f.Stat()
+	if err != nil || time.Since(held.ModTime()) <= age {
+		return
+	}
+	// Another sweep may have removed this file and a hook made a new one
+	// at path: remove only the file locked here.
+	if now, err := os.Lstat(path); err == nil && os.SameFile(held, now) {
+		_ = os.Remove(path)
 	}
 }
 

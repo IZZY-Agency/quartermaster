@@ -67,18 +67,15 @@ func withState(sessionID string, fn func(*State) error) (err error) {
 		// A new session: sweep the state of sessions long gone.
 		sweepOld(dir, stateAge)
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := lockState(path)
 	if err != nil {
-		return fmt.Errorf("session state: %w", err)
+		return err
 	}
 	defer func() {
 		if cerr := f.Close(); err == nil && cerr != nil {
 			err = fmt.Errorf("session state: %w", cerr)
 		}
 	}()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("session state: lock: %w", err)
-	}
 	// Closing the file releases the lock.
 	b, err := io.ReadAll(f)
 	if err != nil {
@@ -116,4 +113,39 @@ func withState(sessionID string, fn func(*State) error) (err error) {
 		return fmt.Errorf("session state: %w", err)
 	}
 	return nil
+}
+
+// afterStateOpen runs between lockState's open and its lock; tests use it.
+var afterStateOpen = func(string) {}
+
+// lockState opens the state file at path and takes its exclusive lock. The
+// sweep of old sessions may remove the file between the open and the lock;
+// a file that is no longer the one at path is closed and the next one
+// opened, so no update goes to a removed file. It gives up after 100 tries.
+func lockState(path string) (*os.File, error) {
+	for range 100 {
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("session state: %w", err)
+		}
+		afterStateOpen(path)
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("session state: lock: %w", err)
+		}
+		held, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("session state: %w", err)
+		}
+		now, err := os.Lstat(path)
+		if err == nil && os.SameFile(held, now) {
+			return f, nil
+		}
+		_ = f.Close()
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("session state: %w", err)
+		}
+	}
+	return nil, errors.New("session state: the file keeps being replaced")
 }

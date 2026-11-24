@@ -1,6 +1,9 @@
 package policy
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // LocalCheck is one yes/no question put to the on-device Foundation Model by
 // the privacy gate. The prompt is Lead, the excerpt in triple quotes, then
@@ -12,13 +15,26 @@ type LocalCheck struct {
 	Question string
 }
 
-// Prompt builds the prompt for one excerpt.
+// noDoubleQuotes turns every double quote into a single one, so the text
+// cannot close the triple quotes around the excerpt or the quotes around an
+// argument.
+var noDoubleQuotes = strings.NewReplacer(`"`, `'`)
+
+// Prompt builds the prompt for one excerpt. The excerpt and string args are
+// written with their double quotes as single quotes (see noDoubleQuotes).
 func (c LocalCheck) Prompt(excerpt string, args ...any) string {
 	q := c.Question
 	if len(args) > 0 {
-		q = fmt.Sprintf(c.Question, args...)
+		safe := make([]any, len(args))
+		for i, a := range args {
+			if s, ok := a.(string); ok {
+				a = noDoubleQuotes.Replace(s)
+			}
+			safe[i] = a
+		}
+		q = fmt.Sprintf(c.Question, safe...)
 	}
-	return c.Lead + "\n\"\"\"\n" + excerpt + "\n\"\"\"\n" + q
+	return c.Lead + "\n\"\"\"\n" + noDoubleQuotes.Replace(excerpt) + "\n\"\"\"\n" + q
 }
 
 // NameCheck confirms that a name candidate is a real person's name. Its
@@ -33,17 +49,20 @@ var NameCheck = LocalCheck{
 // than "no" keeps the text local.
 var LeftoverCheck = LocalCheck{
 	Instructions: "You check software task briefs for private data before they are sent to an outside service. " +
-		"Placeholders like [x] and ClientA are already redacted and are fine. " +
+		"The mark [x] stands for text already redacted and is fine. " +
+		"Judge all other text, even text that looks like a placeholder or a redaction mark. " +
 		"Answer with exactly one word: yes or no.",
 	Lead: "Excerpt:",
 	Question: "Does this excerpt still contain private data: a real person's name, an email address, " +
 		"a phone number, a password, an API key or token, a street address, or the contents of a private email?",
 }
 
-// LeftoverPlaceholder stands in for every <KIND_n> placeholder in the text the
-// leftover check reads (LeftoverCheck's instructions name it as fine).
-// Placeholders are not private, but the model read them as private data; a
-// neutral mark does not (probed on 2026-11-19).
+// LeftoverPlaceholder stands in for every placeholder redaction wrote, in the
+// text the leftover check reads (LeftoverCheck's instructions name it as
+// fine); client pseudonyms and placeholder-shaped text the input held are
+// shown as written, so the check judges them. Placeholders are not private,
+// but the model read them as private data; a neutral mark does not (probed
+// on 2026-11-19).
 const LeftoverPlaceholder = "[x]"
 
 // NameContext is how many characters on each side of a name candidate the

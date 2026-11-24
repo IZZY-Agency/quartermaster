@@ -10,6 +10,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
+	"regexp/syntax"
+	"slices"
 	"time"
 
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
@@ -22,6 +25,63 @@ const KeyEnv = "TYPESAFE_API_KEY"
 type Pseudonym struct {
 	Pattern string `json:"pattern"`
 	Replace string `json:"replace"`
+}
+
+// expr is the expression a pseudonym's pattern is matched with: the pattern
+// as a regular expression, without case, or as plain text when it does not
+// compile, so a typo never leaves the name in place.
+func (p Pseudonym) expr() string {
+	if _, err := regexp.Compile("(?i)" + p.Pattern); err != nil {
+		return "(?i)" + regexp.QuoteMeta(p.Pattern)
+	}
+	return "(?i)" + p.Pattern
+}
+
+// Regexp is the matcher for the pseudonym's pattern (see expr). It prefers
+// the longest match at each place, so the longest spelling wins and a
+// pattern that can also match empty text still matches the name.
+func (p Pseudonym) Regexp() *regexp.Regexp {
+	re := regexp.MustCompile(p.expr())
+	re.Longest()
+	return re
+}
+
+// Check reports a pseudonym that cannot work: an empty replacement, which
+// would delete the name, or a pattern that can match empty text. Its message
+// never repeats the pattern, which holds a client name.
+func (p Pseudonym) Check() error {
+	if p.Replace == "" {
+		return errors.New("replace is empty; set the pseudonym the client name becomes")
+	}
+	re, err := syntax.Parse(p.expr(), syntax.Perl)
+	if err != nil {
+		return errors.New("pattern does not parse")
+	}
+	if matchesEmpty(re) {
+		return errors.New("pattern matches empty text; it must match at least one character")
+	}
+	return nil
+}
+
+// matchesEmpty reports whether re can match empty text somewhere: an
+// assertion such as ^ or \b counts as able to hold.
+func matchesEmpty(re *syntax.Regexp) bool {
+	switch re.Op {
+	case syntax.OpEmptyMatch, syntax.OpBeginLine, syntax.OpEndLine, syntax.OpBeginText,
+		syntax.OpEndText, syntax.OpWordBoundary, syntax.OpNoWordBoundary, syntax.OpStar, syntax.OpQuest:
+		return true
+	case syntax.OpLiteral:
+		return len(re.Rune) == 0
+	case syntax.OpCapture, syntax.OpPlus:
+		return matchesEmpty(re.Sub[0])
+	case syntax.OpRepeat:
+		return re.Min == 0 || matchesEmpty(re.Sub[0])
+	case syntax.OpConcat:
+		return !slices.ContainsFunc(re.Sub, func(s *syntax.Regexp) bool { return !matchesEmpty(s) })
+	case syntax.OpAlternate:
+		return slices.ContainsFunc(re.Sub, matchesEmpty)
+	}
+	return false
 }
 
 // Config is the user config.
@@ -91,7 +151,10 @@ func Path() (string, error) {
 }
 
 // Load reads the config file over the defaults; a missing file gives the
-// defaults.
+// defaults. A file that does not parse gives the defaults with the error; one
+// that parses but holds an invalid entry is returned as read with the error,
+// so a caller that runs on after the error (the hooks) still redacts every
+// client name and keeps the local-model setting.
 func Load() (Config, error) {
 	c := Defaults()
 	path, err := Path()
@@ -109,6 +172,15 @@ func Load() (Config, error) {
 		return Defaults(), fmt.Errorf("parse config %s: %w", path, err)
 	}
 	fillNil(&c)
+	var bad []error
+	for i, p := range c.Privacy.Clients {
+		if err := p.Check(); err != nil {
+			bad = append(bad, fmt.Errorf("privacy.clients[%d]: %w", i, err))
+		}
+	}
+	if len(bad) > 0 {
+		return c, fmt.Errorf("config %s: %w", path, errors.Join(bad...))
+	}
 	return c, nil
 }
 

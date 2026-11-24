@@ -90,11 +90,12 @@ func (f *fakeLauncher) Spawn(_ context.Context, s launch.LaunchSpec) (launch.Ses
 // launcher whatever the choice.
 func testDeps(l launch.Launcher) Deps {
 	return Deps{
-		Config: config.Defaults(),
-		Claude: limits.ClaudeState{},
-		Codex:  func() limits.CodexState { return limits.CodexState{Reason: "not installed"} },
-		Getenv: func(string) string { return "" },
-		PS:     func(int) (string, int, error) { return "", 0, errors.New("no ps in tests") },
+		Config:  config.Defaults(),
+		Claude:  limits.ClaudeState{},
+		Codex:   func() limits.CodexState { return limits.CodexState{Reason: "not installed"} },
+		Getenv:  func(string) string { return "" },
+		PS:      func(int) (string, int, error) { return "", 0, errors.New("no ps in tests") },
+		ProcExe: func(int) (string, error) { return "", errors.New("no executables in tests") },
 		Pick: func(string, func(string) string) (launch.Launcher, error) {
 			return l, nil
 		},

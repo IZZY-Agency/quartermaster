@@ -57,7 +57,10 @@ type Deps struct {
 	Codex  func() limits.CodexState // read only for --type review
 	Getenv func(string) string
 	PS     func(pid int) (cmd string, ppid int, err error)
-	Pick   func(choice string, env func(string) string) (launch.Launcher, error)
+	// ProcExe returns the executable a process runs, as the system
+	// reports it (spawn.ProcExe).
+	ProcExe func(pid int) (string, error)
+	Pick    func(choice string, env func(string) string) (launch.Launcher, error)
 	// Trusted reports whether Claude Code trusts a folder; nil skips the
 	// check.
 	Trusted func(dir string) (bool, error)
@@ -132,7 +135,10 @@ func Worker(ctx context.Context, req WorkerRequest, deps Deps) (Result, error) {
 		return res, err
 	}
 
-	perm, why := ParentPermission(deps.Getenv, deps.PS)
+	perm, why, err := ParentPermission(deps.Getenv, deps.PS, deps.ProcExe)
+	if err != nil {
+		return res, err
+	}
 	workerDir, err := WorkerPluginDir(deps.Exe)
 	if err != nil {
 		return res, err
@@ -356,10 +362,23 @@ func inputError(err error) error {
 // launch, and stays only to be read when a launch went wrong.
 const ScriptAge = 7 * 24 * time.Hour
 
+// fileName is what a session name must be to become part of a file name:
+// letters, digits, - and _ only, so it never names another folder. It
+// holds every ValidName and a qm up coordinator's name, which may start
+// with - or _.
+var fileName = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// FileName says whether s may be part of a file name qm writes (fileName).
+func FileName(s string) bool { return fileName.MatchString(s) }
+
 // WriteScript writes a launch script to <state>/launch/<name>-<unixnano>.sh,
 // mode 0700, never over an existing file, and returns its path. Scripts
-// older than ScriptAge are removed first.
+// older than ScriptAge are removed first. A name FileName refuses is an
+// error, and nothing is written.
 func WriteScript(name, script string) (string, error) {
+	if !FileName(name) {
+		return "", fmt.Errorf("launch script: session name %q is not usable in a file name", name)
+	}
 	state, err := paths.StateDir()
 	if err != nil {
 		return "", fmt.Errorf("launch script: %w", err)

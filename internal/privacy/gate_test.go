@@ -247,6 +247,25 @@ func TestGateConfirmsNames(t *testing.T) {
 	}
 }
 
+func TestGatePlaceholderInInput(t *testing.T) {
+	log := filepath.Join(t.TempDir(), "asks")
+	fakes(t, true, true, map[string]string{fakeAsk: "no", fakeAskLog: log})
+	res, err := checker("auto").Gate(context.Background(), "Ask <EMAIL_1> about ops@example.com.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Text != "Ask <EMAIL_1> about <EMAIL_2>." || res.Counts["EMAIL"] != 1 {
+		t.Errorf("result = %+v", res)
+	}
+	asked, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(asked), "\nAsk <EMAIL_1> about [x].\n") {
+		t.Errorf("leftover check must see the input's own placeholder as written:\n%s", asked)
+	}
+}
+
 func TestGateLeftoverYesIsLocal(t *testing.T) {
 	fakes(t, true, true, map[string]string{fakeAsk: "yes"})
 	res, err := checker("auto").Gate(context.Background(), "Plain text with nothing in it.")
@@ -439,5 +458,22 @@ func TestAskRunsHelpersConcurrently(t *testing.T) {
 	}
 	if starts != 8 || peak < 2 || peak > policy.HelperConcurrency {
 		t.Errorf("%d helper processes, at most %d at once; want 8 (4 per ask), between 2 and %d at once", starts, peak, policy.HelperConcurrency)
+	}
+}
+
+func TestGateBadClientsStayLocal(t *testing.T) {
+	fakes(t, true, true, map[string]string{fakeAsk: "no"})
+	for _, clients := range [][]config.Pseudonym{
+		{{Pattern: "|Example Corp", Replace: "ClientA"}},
+		{{Pattern: "Example Corp", Replace: ""}},
+	} {
+		g := New(Options{Helper: FindHelper(), Gitleaks: FindGitleaks(), LocalModel: "auto", Clients: clients})
+		res, err := g.Gate(context.Background(), "Fix Example Corp")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !res.Local || res.Reason != ReasonBadClients || res.Text != "" {
+			t.Errorf("clients %+v: result = %+v, want local", clients, res)
+		}
 	}
 }

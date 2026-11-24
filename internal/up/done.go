@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -56,12 +57,12 @@ func Finished(p Project, run DirRunner) func(Candidate) string {
 		if _, ok := p.Done[c.SessionID]; ok {
 			return "marked done"
 		}
-		if c.Cwd != "" {
+		if filepath.IsAbs(c.Cwd) {
 			if _, err := os.Stat(c.Cwd); errors.Is(err, fs.ErrNotExist) {
 				return "worktree gone"
 			}
 		}
-		if run == nil || c.Cwd == "" || c.Branch == "" || c.Branch == "HEAD" {
+		if run == nil || !filepath.IsAbs(c.Cwd) || c.Branch == "HEAD" || !validBranch(c.Branch) {
 			return ""
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), checkTimeout)
@@ -74,7 +75,10 @@ func Finished(p Project, run DirRunner) func(Candidate) string {
 		if c.Record != nil && c.Record.Project != "" {
 			dir = c.Record.Project
 		}
-		out, err := run(ctx, dir, "gh", "pr", "list", "--head", c.Branch, "--state", "all", "--json", "state,createdAt", "--limit", ghPRLimit)
+		out, err := []byte(nil), errors.New("no usable project folder")
+		if isDir(dir) {
+			out, err = run(ctx, dir, "gh", "pr", "list", "--head", c.Branch, "--state", "all", "--json", "state,createdAt", "--limit", ghPRLimit)
+		}
 		if err == nil {
 			var prs []struct {
 				State     string    `json:"state"`
@@ -102,7 +106,7 @@ func Finished(p Project, run DirRunner) func(Candidate) string {
 				return ""
 			}
 		}
-		if def == "" {
+		if !validBranch(def) {
 			return ""
 		}
 		if _, err := run(ctx, c.Cwd, "git", "merge-base", "--is-ancestor", c.Branch, def); err != nil {
@@ -127,7 +131,7 @@ func Finished(p Project, run DirRunner) func(Candidate) string {
 // is found.
 func defaultBranch(ctx context.Context, run DirRunner, dir string) string {
 	if out, err := run(ctx, dir, "git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
-		if b := strings.TrimPrefix(strings.TrimSpace(string(out)), "origin/"); b != "" {
+		if b := strings.TrimPrefix(gitLine(out), "origin/"); b != "" {
 			return b
 		}
 	}
@@ -147,7 +151,7 @@ func currentBranch(run DirRunner, dir string) string {
 
 // currentBranchCtx is currentBranch under ctx's deadline too.
 func currentBranchCtx(parent context.Context, run DirRunner, dir string) string {
-	if run == nil || dir == "" {
+	if run == nil || !filepath.IsAbs(dir) {
 		return ""
 	}
 	if _, err := os.Stat(dir); err != nil {
@@ -159,5 +163,11 @@ func currentBranchCtx(parent context.Context, run DirRunner, dir string) string 
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(out))
+	return gitLine(out)
+}
+
+// gitLine is git's one-line answer without its line end: only that, since
+// a branch name may end in a character strings.TrimSpace would take too.
+func gitLine(out []byte) string {
+	return strings.TrimSuffix(strings.TrimSuffix(string(out), "\n"), "\r")
 }

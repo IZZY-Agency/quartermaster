@@ -4,9 +4,11 @@ package declog
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -16,6 +18,10 @@ import (
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
 )
+
+// maxLine is the longest line Read takes for a record; a longer one is
+// skipped.
+const maxLine = 16 << 20
 
 // Path is the decision log's path.
 func Path() (string, error) {
@@ -49,7 +55,9 @@ func Append(r route.Record) error {
 	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("decision log: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0o600)
+	// O_NOFOLLOW: a log that is a symbolic link is refused, not written
+	// through.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return fmt.Errorf("decision log: %w", err)
 	}
@@ -104,14 +112,15 @@ func AppendDecision(d route.Decision, rec route.Record) error {
 }
 
 // Read returns the records whose Time is not before since, in file order. A
-// missing log is empty. A line that is not a valid record (a write cut short
-// by a crash, say) is skipped, so one bad line does not hide the rest.
+// missing log is empty; a log that is a symbolic link is an error. A line
+// that is not a valid record (a write cut short by a crash, say) or is
+// longer than maxLine is skipped, so one bad line does not hide the rest.
 func Read(since time.Time) ([]route.Record, error) {
 	path, err := Path()
 	if err != nil {
 		return nil, fmt.Errorf("decision log: %w", err)
 	}
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
@@ -120,19 +129,44 @@ func Read(since time.Time) ([]route.Record, error) {
 	}
 	defer func() { _ = f.Close() }()
 	var out []route.Record
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for sc.Scan() {
+	err = eachLine(bufio.NewReaderSize(f, 64*1024), func(line []byte) {
 		var r route.Record
-		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
-			continue
-		}
-		if !r.Time.Before(since) {
+		if json.Unmarshal(line, &r) == nil && !r.Time.Before(since) {
 			out = append(out, r)
 		}
-	}
-	if err := sc.Err(); err != nil {
+	})
+	if err != nil {
 		return out, fmt.Errorf("decision log: %w", err)
 	}
 	return out, nil
+}
+
+// eachLine calls fn with each line rd holds, its newline included, and
+// skips the lines longer than maxLine (the newline aside) without holding
+// them in memory.
+func eachLine(rd *bufio.Reader, fn func([]byte)) error {
+	var line []byte
+	long := false
+	for {
+		chunk, err := rd.ReadSlice('\n')
+		if !long && len(line)+len(chunk) > maxLine+1 {
+			long, line = true, nil
+		}
+		if !long {
+			line = append(line, chunk...)
+		}
+		switch {
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case err != nil && !errors.Is(err, io.EOF):
+			return err
+		}
+		if !long && len(bytes.TrimSuffix(line, []byte("\n"))) <= maxLine && len(line) > 0 {
+			fn(line)
+		}
+		if err != nil {
+			return nil
+		}
+		line, long = line[:0], false
+	}
 }

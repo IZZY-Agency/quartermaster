@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -26,23 +27,29 @@ const maxParents = 64
 var modeName = regexp.MustCompile(`^[A-Za-z]+$`)
 
 // ParentPermission returns the permission flags of the coordinator, the
-// claude process qm runs under, for its worker to copy (design 5.12). It reads
-// the process at CLAUDE_PID when that is set, else walks up from qm's parent
-// to the first process whose argv[0] base name is claude. A bypass flag or
-// --permission-mode bypassPermissions gives --dangerously-skip-permissions;
-// --permission-mode X gives the same mode; no flag, or no coordinator, gives
-// nil, so the worker never gets a stronger flag than its coordinator. why
-// says where the flags came from. ps returns a process's command line and
-// parent pid.
-func ParentPermission(env func(string) string, ps func(pid int) (cmd string, ppid int, err error)) (flags []string, why string) {
+// claude process qm runs under, for its worker to copy (design 5.12). It
+// walks up from qm's parent (ps gives each process's command line and
+// parent pid) to the nearest process whose command line is claude's, and
+// trusts it only when exe (the executable the system reports for a pid, not
+// its argv[0]) is a claude executable (claudeExecutable) and, when
+// CLAUDE_PID is set, CLAUDE_PID names that same process. Otherwise, or when
+// any of that cannot be read, the answer is nil and the worker prompts. The
+// flags are read with WeakestPermission: a bypass flag or --permission-mode
+// bypassPermissions gives --dangerously-skip-permissions, --permission-mode
+// X the same mode, no flag nil, so the worker never gets a stronger flag
+// than its coordinator. A parent that runs a claude executable under a
+// command line that is not claude's stops the walk too, with nil. why says
+// where the flags came from. err is set only when the coordinator is found
+// but its words give permission readings with no mode in common: then no
+// flag is safe, prompting included, and the worker must not start.
+func ParentPermission(env func(string) string, ps func(pid int) (cmd string, ppid int, err error), exe func(pid int) (string, error)) (flags []string, why string, err error) {
+	named := 0
 	if s := env("CLAUDE_PID"); s != "" {
-		if pid, err := strconv.Atoi(s); err == nil && pid > 0 {
-			if cmd, _, err := ps(pid); err == nil {
-				if args, ok := claudecode.IsClaude(cmd); ok {
-					return PermissionOf(args, pid)
-				}
-			}
+		pid, err := strconv.Atoi(s)
+		if err != nil || pid <= 0 {
+			return nil, fmt.Sprintf("CLAUDE_PID %q is not a process id: worker will prompt", s), nil
 		}
+		named = pid
 	}
 	pid := os.Getppid()
 	for range maxParents {
@@ -53,15 +60,85 @@ func ParentPermission(env func(string) string, ps func(pid int) (cmd string, ppi
 		if err != nil {
 			break
 		}
-		if args, ok := claudecode.IsClaude(cmd); ok {
-			return PermissionOf(args, pid)
+		args, isClaude := claudecode.IsClaude(cmd)
+		path, exeErr := exe(pid)
+		isExe := exeErr == nil && claudeExecutable(path)
+		switch {
+		case isClaude && !isExe:
+			return nil, fmt.Sprintf("process %d does not run a claude executable: worker will prompt", pid), nil
+		case !isClaude && isExe:
+			return nil, fmt.Sprintf("process %d runs claude under a command line qm cannot read: worker will prompt", pid), nil
+		case isClaude:
+			if named != 0 && named != pid {
+				return nil, fmt.Sprintf("CLAUDE_PID %d is not the nearest claude among qm's parent processes (pid %d): worker will prompt", named, pid), nil
+			}
+			flags, err := WeakestPermission(args)
+			if err != nil {
+				return nil, fmt.Sprintf("coordinator (pid %d): %v", pid, err), fmt.Errorf("coordinator (pid %d): %w: start the worker by hand with the mode you want", pid, err)
+			}
+			_, why := PermissionOf(flags, pid)
+			return flags, why, nil
 		}
 		if ppid == pid {
 			break
 		}
 		pid = ppid
 	}
-	return nil, NoCoordinator
+	if named != 0 {
+		return nil, fmt.Sprintf("CLAUDE_PID %d is not a claude among qm's parent processes: worker will prompt", named), nil
+	}
+	return nil, NoCoordinator, nil
+}
+
+// WeakestPermission reads the permission flags off claude's words as ps
+// gives them: the words up to --, and of every permission reading among
+// them the one that allows least (LowerPermission), so a prompt that names
+// a stronger flag than the session's own cannot raise it. ps keeps no
+// argument boundaries, so a session with no permission flag whose prompt
+// (before any --) names one is still read as having it. An error when two
+// readings have no mode in common.
+func WeakestPermission(words []string) ([]string, error) {
+	if i := slices.Index(words, "--"); i >= 0 {
+		words = words[:i]
+	}
+	var out []string
+	seen := false
+	for i := 0; i < len(words); i++ {
+		var reading []string
+		switch a := words[i]; {
+		case a == bypass || strings.HasPrefix(a, "--permission-mode="):
+			reading = []string{a}
+		case a == "--permission-mode" && i+1 < len(words):
+			reading = []string{a, words[i+1]}
+			i++
+		default:
+			continue
+		}
+		flags, _ := PermissionOf(reading, 0)
+		if !seen {
+			out, seen = flags, true
+			continue
+		}
+		var err error
+		if out, err = LowerPermission(out, flags); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// claudeExecutable says whether exe, the path of the executable a process
+// runs as the system reports it, is claude's: an absolute path to a file
+// named claude, or to a version file of Claude Code's own installer
+// (.../claude/versions/<version>). The check is by name and place, not
+// signature.
+func claudeExecutable(exe string) bool {
+	if !filepath.IsAbs(exe) {
+		return false
+	}
+	dir := filepath.Dir(exe)
+	return filepath.Base(exe) == "claude" ||
+		filepath.Base(dir) == "versions" && filepath.Base(filepath.Dir(dir)) == "claude"
 }
 
 // PermissionOf reads the permission flags off claude's arguments: as
@@ -152,10 +229,24 @@ func LowerPermission(own, coordinator []string) ([]string, error) {
 	return nil, fmt.Errorf("%s and %s have no permission mode in common that allows no more than either", describe(have), describe(limit))
 }
 
+// psPaths are where ps is looked for: by absolute path, never through PATH,
+// whose ps could report any command line.
+var psPaths = []string{"/bin/ps", "/usr/bin/ps"}
+
 // PS returns a process's command line (its arguments joined by spaces) and
-// parent pid, read with ps.
+// parent pid, read with the system's ps (psPaths).
 func PS(pid int) (cmd string, ppid int, err error) {
-	out, err := exec.Command("ps", "-o", "ppid=", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
+	bin := ""
+	for _, p := range psPaths {
+		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() {
+			bin = p
+			break
+		}
+	}
+	if bin == "" {
+		return "", 0, fmt.Errorf("ps %d: no ps in %s", pid, strings.Join(psPaths, " or "))
+	}
+	out, err := exec.Command(bin, "-o", "ppid=", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
 	if err != nil {
 		return "", 0, fmt.Errorf("ps %d: %w", pid, err)
 	}

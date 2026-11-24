@@ -34,7 +34,8 @@ func runFeedbackAnalyze(args []string, _, stderr io.Writer) int {
 	}
 	cfg, err := config.Load()
 	if err != nil {
-		// Load returns the defaults with its error; the analysis runs on them.
+		// Load returns the config it could read (the defaults when the file
+		// does not parse) with its error; the analysis runs on it.
 		logFeedbackError(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), hooks.FeedbackTimeout)

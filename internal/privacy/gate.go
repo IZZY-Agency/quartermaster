@@ -43,6 +43,7 @@ const (
 	ReasonHelperUnavailable = "privacy helper unavailable"
 	ReasonStillPrivate      = "still private after redaction"
 	ReasonSecretNotRedacted = "a secret could not be redacted"
+	ReasonBadClients        = "privacy.clients holds an invalid entry"
 )
 
 // errUnavailable: the helper says the Foundation Model is not available.
@@ -50,8 +51,16 @@ var errUnavailable = errors.New("foundation model unavailable")
 
 // Gate redacts text and decides whether it may leave the machine. A missing
 // provider turns its check off (listed in Off); a provider that fails is an
-// error. A Local result carries no text.
+// error. A Local result carries no text. An invalid client pseudonym (see
+// config.Pseudonym.Check) keeps every text local: the config load reported
+// it, and a caller that runs on after that error must not send text the
+// user meant to have redacted.
 func (c *Checker) Gate(ctx context.Context, text string) (Result, error) {
+	for _, p := range c.o.Clients {
+		if p.Check() != nil {
+			return Result{Local: true, Reason: ReasonBadClients}, nil
+		}
+	}
 	var res Result
 	required := c.o.LocalModel == "required"
 	if c.o.Helper == "" {
@@ -99,15 +108,16 @@ func (c *Checker) Gate(ctx context.Context, text string) (Result, error) {
 		}
 	}
 
-	redacted, found, missing := redact(text, secrets, c.o.Clients, persons)
-	if missing {
+	red := redact(text, secrets, c.o.Clients, persons)
+	if red.missing {
 		return Result{Local: true, Reason: ReasonSecretNotRedacted}, nil
 	}
 
 	if model {
-		// Placeholders are not private; the model reads them as a neutral
-		// word, so it judges only what redaction left.
-		private, err := c.leftover(ctx, placeholderRe.ReplaceAllString(redacted, policy.LeftoverPlaceholder))
+		// What redaction wrote is not private; the model reads it as a
+		// neutral mark, so it judges only what redaction left, including any
+		// placeholder-shaped text the input held.
+		private, err := c.leftover(ctx, red.view)
 		switch {
 		case errors.Is(err, errUnavailable):
 			if required {
@@ -121,20 +131,21 @@ func (c *Checker) Gate(ctx context.Context, text string) (Result, error) {
 		}
 	}
 
-	res.Text = redacted
-	res.Counts = counts(found)
+	res.Text = red.text
+	res.Counts = counts(red)
 	return res, nil
 }
 
-// counts tallies placeholders by kind; client pseudonyms count as CLIENT.
-func counts(found map[string]string) map[string]int {
-	if len(found) == 0 {
+// counts tallies the placeholders redaction wrote by kind; client pseudonyms
+// count as CLIENT.
+func counts(red redaction) map[string]int {
+	if len(red.found) == 0 {
 		return nil
 	}
 	out := map[string]int{}
-	for p := range found {
-		if m := placeholderRe.FindStringSubmatch(p); m != nil && m[0] == p {
-			out[m[1]]++
+	for p := range red.found {
+		if k, ok := red.kinds[p]; ok {
+			out[k]++
 		} else {
 			out["CLIENT"]++
 		}

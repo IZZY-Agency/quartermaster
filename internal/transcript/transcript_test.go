@@ -162,3 +162,152 @@ func TestFirstAt(t *testing.T) {
 		t.Errorf("no timestamp: %v, %v", got, err)
 	}
 }
+
+// TestTailLinesLineLongerThanWindow: when the last line is longer than the
+// window, the read still succeeds: it skips that line and returns the lines
+// in the window before it.
+func TestTailLinesLineLongerThanWindow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "long.jsonl")
+	long := strings.Repeat("x", 40)
+	if err := os.WriteFile(path, []byte("a\nb\n"+long+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := TailLines(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"a", "b"}; !reflect.DeepEqual(asStrings(got), want) {
+		t.Errorf("lines %q, want %q", got, want)
+	}
+}
+
+// TestLastContextAfterLongLine: a last line longer than Tail does not hide
+// the assistant message before it.
+func TestLastContextAfterLongLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "long.jsonl")
+	assistant := `{"type":"assistant","timestamp":"2026-01-02T10:00:05.000Z","message":{"usage":{"input_tokens":1,"cache_creation_input_tokens":2,"cache_read_input_tokens":3}}}`
+	user := `{"type":"user","message":{"content":"` + strings.Repeat("y", Tail+10) + `"}}`
+	if err := os.WriteFile(path, []byte(assistant+"\n"+user+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LastContext(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Context != 6 {
+		t.Errorf("context %d, want 6", got.Context)
+	}
+}
+
+func asStrings(lines [][]byte) []string {
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = string(l)
+	}
+	return out
+}
+
+// TestTailLinesLongLineCutsEarlierLine: the stretched window still drops a
+// line it cuts.
+func TestTailLinesLongLineCutsEarlierLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "long.jsonl")
+	long := strings.Repeat("x", 40)
+	if err := os.WriteFile(path, []byte(strings.Repeat("a", 20)+"\nbb\n"+long+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := TailLines(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"bb"}; !reflect.DeepEqual(asStrings(got), want) {
+		t.Errorf("lines %q, want %q", got, want)
+	}
+}
+
+// TestTailLinesLineLongerThanBound: a last line longer than maxTail gives
+// no lines and no error.
+func TestTailLinesLineLongerThanBound(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "huge.jsonl")
+	b := make([]byte, 0, maxTail+16)
+	b = append(b, "a\n"...)
+	b = append(b, strings.Repeat("x", maxTail+1)...)
+	if err := os.WriteFile(path, append(b, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := TailLines(path, 16)
+	if err != nil || len(got) != 0 {
+		t.Errorf("lines %d, %v; want none, no error", len(got), err)
+	}
+}
+
+// TestTailLinesWindowOnLineStart: a window that starts right at a line keeps
+// that line; one that cuts a line drops it.
+func TestTailLinesWindowOnLineStart(t *testing.T) {
+	for _, c := range []struct {
+		data string
+		n    int64
+		want []string
+	}{
+		{"old\nA\nB\n", 4, []string{"A", "B"}},
+		{"old\nA\nB", 3, []string{"A", "B"}},
+		{"ab\ncd\n", 3, []string{"cd"}},
+		{"ab\ncd", 2, []string{"cd"}},
+		{"ab\ncd\n", 2, nil},
+		{"a\nbcd\n", 2, []string{"a"}},
+		{"ab\ncd\nef\n", 5, []string{"ef"}},
+	} {
+		path := filepath.Join(t.TempDir(), "t.jsonl")
+		if err := os.WriteFile(path, []byte(c.data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := TailLines(path, c.n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(asStrings(got), c.want) && len(got)+len(c.want) > 0 {
+			t.Errorf("%q n=%d: lines %q, want %q", c.data, c.n, got, c.want)
+		}
+	}
+}
+
+// TestTailLinesLineAtBound: the lines before a long last line are read when
+// that line starts no more than maxTail bytes before the end, with or
+// without a final newline, and not when it starts further back.
+func TestTailLinesLineAtBound(t *testing.T) {
+	for _, c := range []struct {
+		final string
+		extra int
+		want  []string
+	}{
+		{"\n", 0, []string{"a"}},
+		{"", 0, []string{"a"}},
+		{"\n", 1, nil},
+		{"", 1, nil},
+	} {
+		path := filepath.Join(t.TempDir(), "bound.jsonl")
+		line := strings.Repeat("x", maxTail-len(c.final)+c.extra)
+		if err := os.WriteFile(path, []byte("a\n"+line+c.final), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := TailLines(path, 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(asStrings(got), c.want) && len(got)+len(c.want) > 0 {
+			t.Errorf("final %q extra %d: lines %q, want %q", c.final, c.extra, got, c.want)
+		}
+	}
+}
+
+// TestTailLinesOneLongLine: a file that is one line longer than the window
+// gives no lines and no error.
+func TestTailLinesOneLongLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "one.jsonl")
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", 40)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := TailLines(path, 16)
+	if err != nil || len(got) != 0 {
+		t.Errorf("lines %q, %v; want none", got, err)
+	}
+}

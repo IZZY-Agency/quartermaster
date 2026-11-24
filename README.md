@@ -253,7 +253,7 @@ do not block) or `off`; a rule not listed is on.
 
 | Rule | Plugin | What it does |
 |---|---|---|
-| `raw-launch-gate` | both | denies a raw `codex exec`/`codex review`, a worker started by hand in agterm or tmux, or a raw `claude` launch; says "use qm spawn" |
+| `raw-launch-gate` | both | denies a raw `codex` run (`exec`, `review` or a prompt), a worker started by hand in agterm or tmux, or a raw `claude` launch, also behind wrappers such as `env`, `sudo`, `xargs` or `eval`; says "use qm spawn". It is a guard rail for a cooperating session, not a sandbox: a command inside an interpreter's string (`python3 -c`) is not read |
 | `reviewer-model` | both | sets the model and effort of a review sub-agent that has none |
 | `ask-gate` | coordinator | denies a question to you that Jev judges answerable from the context, cheap to undo and not a product ruling (needs a TypeSafe key) |
 | `feedback`, `feedback-deliver` | coordinator | when your message states a lasting rule no written rule covers, tells the coordinator to save it; never saves anything itself (needs a TypeSafe key) |
@@ -276,7 +276,9 @@ the privacy gate:
 
 - replaces secrets (found by gitleaks, when installed, and by patterns for
   tokens and keys), emails (except the Anthropic no-reply address), phone
-  numbers, IPv4 addresses other than loopback and long high-entropy tokens with placeholders
+  numbers, IPv4 and IPv6 addresses other than loopback, and tokens (long
+  high-entropy or hex runs other than a 40-character commit id, and keys
+  with well-known vendor prefixes) with placeholders
   such as `<SECRET_1>`, `<EMAIL_1>`, `<PHONE_1>`, `<IP_1>` and `<TOKEN_1>`;
 - turns your home folder into `~`;
 - replaces each client or supplier name you list in `privacy.clients` with a

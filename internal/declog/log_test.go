@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -177,5 +178,104 @@ func TestAppendAfterPartialLine(t *testing.T) {
 	}
 	if b[len(b)-1] != '\n' {
 		t.Errorf("log does not end with a newline: %q", b)
+	}
+}
+
+// TestReadSkipsOverlongLine: a line longer than maxLine is skipped like any
+// other bad line; the records around it are read.
+func TestReadSkipsOverlongLine(t *testing.T) {
+	path := isolate(t)
+	t0 := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	if err := Append(route.Record{Time: t0, Kind: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(append(paddedRecord(t, maxLine+10), '\n')); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := Append(route.Record{Time: t0, Kind: "review"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Read(time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Kind != "worker" || got[1].Kind != "review" {
+		t.Errorf("got %+v", got)
+	}
+}
+
+// TestLogIsNotOpenedThroughSymlink: a decision log that is a symbolic link
+// is neither appended to nor read.
+func TestLogIsNotOpenedThroughSymlink(t *testing.T) {
+	path := isolate(t)
+	target := filepath.Join(t.TempDir(), "elsewhere.jsonl")
+	if err := os.WriteFile(target, []byte(`{"kind":"worker"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := Append(route.Record{Kind: "review"}); err == nil {
+		t.Error("Append through a symlink: no error")
+	}
+	if got, err := Read(time.Time{}); err == nil || len(got) != 0 {
+		t.Errorf("Read through a symlink: %v, %v; want an error", got, err)
+	}
+	if b, _ := os.ReadFile(target); string(b) != `{"kind":"worker"}`+"\n" {
+		t.Errorf("target changed: %q", b)
+	}
+}
+
+// paddedRecord is a valid record of exactly size bytes, its Kind "padded".
+func paddedRecord(t *testing.T, size int) []byte {
+	t.Helper()
+	head, tail := `{"kind":"padded","detail":"`, `"}`
+	b := []byte(head + strings.Repeat("x", size-len(head)-len(tail)) + tail)
+	var r route.Record
+	if err := json.Unmarshal(b, &r); err != nil || r.Kind != "padded" || len(b) != size {
+		t.Fatalf("padded record: %v", err)
+	}
+	return b
+}
+
+// TestReadLineLimit: a record of maxLine bytes is read and one of maxLine+1
+// is skipped, whether or not a newline ends it.
+func TestReadLineLimit(t *testing.T) {
+	for _, c := range []struct {
+		size int
+		nl   bool
+		read bool
+	}{
+		{maxLine, true, true}, {maxLine, false, true},
+		{maxLine + 1, true, false}, {maxLine + 1, false, false},
+	} {
+		path := isolate(t)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		b := paddedRecord(t, c.size)
+		if c.nl {
+			b = append(b, '\n')
+		}
+		if err := os.WriteFile(path, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := Read(time.Time{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if read := len(got) == 1 && got[0].Kind == "padded"; read != c.read {
+			t.Errorf("size %d newline %v: read %v, want %v", c.size, c.nl, read, c.read)
+		}
 	}
 }

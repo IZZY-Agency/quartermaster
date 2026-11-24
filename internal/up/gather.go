@@ -288,7 +288,12 @@ func seedSessions(p *Project, recs []route.Record) {
 
 // termRef is the terminal session worker Record r names: its term_launcher
 // and term_id, else, for a Record of an older qm, its Detail "LAUNCHER ID".
+// A Record with no name (UsableRecords cleared it) names none: a tmux window
+// is known by its id and name together.
 func termRef(r *route.Record) (launch.SessionRef, bool) {
+	if r.Name == "" {
+		return launch.SessionRef{}, false
+	}
 	l, id := r.TermLauncher, r.TermID
 	if l == "" && id == "" {
 		if f := strings.Fields(r.Detail); len(f) == 2 && (f[0] == "agterm" || f[0] == "tmux") {
@@ -398,7 +403,9 @@ func fill(c *Candidate, projectID string, env Env) {
 			c.Branch = b
 		}
 	}
-	if c.Cwd != "" && env.Trusted != nil {
+	if c.Cwd != "" && !filepath.IsAbs(c.Cwd) {
+		c.addNote(fmt.Sprintf("folder %q is not an absolute path, counted as not trusted", c.Cwd))
+	} else if c.Cwd != "" && env.Trusted != nil {
 		ok, err := env.Trusted(c.Cwd)
 		if err != nil {
 			c.addNote(fmt.Sprintf("trust of %s not read, counted as not trusted: %v", c.Cwd, err))

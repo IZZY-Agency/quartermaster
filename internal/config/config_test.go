@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -235,5 +236,34 @@ func TestSilentMinutesWrongTypeFailsLikeOtherKeys(t *testing.T) {
 		if _, err := Load(); err == nil {
 			t.Fatalf("%s: no error", body)
 		}
+	}
+}
+
+func TestConfigBadPseudonym(t *testing.T) {
+	cases := []struct{ name, clients, want string }{
+		{"empty replace", `[{"pattern":"acme","replace":""}]`, `privacy.clients[0]: replace is empty`},
+		{"pattern matching empty text", `[{"pattern":"acme","replace":"ClientA"},{"pattern":"a*","replace":"ClientB"}]`, `privacy.clients[1]: pattern matches empty text`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := isolate(t)
+			p := filepath.Join(dir, "quartermaster", "config.json")
+			if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			body := `{"privacy":{"local_model":"required","clients":` + c.clients + `}}`
+			if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := Load()
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("error = %v, want one saying %q", err, c.want)
+			}
+			// The config comes back as read, so a caller that runs on it after
+			// the error keeps every client name and the local-model setting.
+			if got.Privacy.LocalModel != "required" || len(got.Privacy.Clients) == 0 {
+				t.Errorf("config = %+v, want it as read", got.Privacy)
+			}
+		})
 	}
 }
