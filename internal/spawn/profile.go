@@ -2,19 +2,20 @@ package spawn
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/IZZY-Agency/quartermaster/internal/config"
+	"github.com/IZZY-Agency/quartermaster/internal/gitcmd"
 	"github.com/IZZY-Agency/quartermaster/internal/launch"
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
 	"github.com/IZZY-Agency/quartermaster/internal/policy"
@@ -184,7 +185,7 @@ func (l LSP) InstallCommand() string { return "/plugin install " + l.Key() }
 // repository's tracked files and says whether it is installed. note says why
 // no plugin is loaded ("" when one is).
 func RepoLSP(repo string) (l LSP, note string) {
-	out, err := exec.Command("git", "-C", repo, "ls-files", "-z").Output()
+	out, err := gitcmd.Command(context.Background(), repo, "ls-files", "-z").Output()
 	if err != nil {
 		return LSP{}, "no LSP plugin: not a git repository"
 	}
@@ -289,7 +290,7 @@ func BuildProfile(d route.Decision, repo string, cfg config.Config, enabled map[
 			"QM_ROLE":                "worker",
 			"QM_AUTOCOMPACT":         strconv.Itoa(n),
 			"BASH_MAX_OUTPUT_LENGTH": bashMaxOutput,
-			"CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": fileReadMaxTokens,
+			readTokensEnv:            fileReadMaxTokens,
 		},
 		Permission: perm,
 	}
@@ -372,7 +373,7 @@ func sortedKeys(m map[string]bool) []string {
 }
 
 // scriptEnv is the order of the profile's variables in the launch script.
-var scriptEnv = []string{"QM_AUTOCOMPACT", "QM_LSP", "QM_PROJECT_ID", "QM_WORKSPACE", "BASH_MAX_OUTPUT_LENGTH", "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS"}
+var scriptEnv = []string{"QM_AUTOCOMPACT", "QM_LSP", "QM_PROJECT_ID", "QM_WORKSPACE", "BASH_MAX_OUTPUT_LENGTH", readTokensEnv}
 
 // spawnerPath is the PATH of the process that runs qm spawn: the
 // coordinator's, with the user's login folders. Terminals such as agterm run
@@ -384,22 +385,30 @@ var spawnerPath = func() string { return os.Getenv("PATH") }
 // qm's own folder ("" for none), then the spawner's PATH, then the session's
 // own; then cd to cwd, then exec
 // claude on tier t with the profile's flags, named name, with the Claude
-// session id sessionID ("" lets Claude pick one), the brief file's text as
-// the first prompt. The prompt starts with a newline, so a brief that starts
-// with "-" is not read as a flag.
+// session id sessionID ("" lets Claude pick one), and a first prompt that
+// points to the file briefPath, the worker's task (workerPrompt), which the
+// worker may read whole and without asking.
 func LaunchScript(p route.Profile, t route.Tier, name, sessionID, cwd, briefPath, qmDir string) string {
-	w := claudeLine(p, t, name)
+	return launchScript(p, t, name, sessionID, cwd, briefFile{briefPath, briefPath}, qmDir)
+}
+
+// launchScript is LaunchScript for a brief that may not be copied yet.
+func launchScript(p route.Profile, t route.Tier, name, sessionID, cwd string, brief briefFile, qmDir string) string {
+	w := claudeLine(p, t, name, brief)
 	if sessionID != "" {
 		w = append(w, "--session-id", sessionID)
 	}
-	return script(cwd, qmDir, w, briefPath)
+	return script(cwd, qmDir, w, workerPrompt(brief))
 }
 
 // ResumeScript is the /bin/sh script that resumes a worker's session
 // sessionID (design 5.5): LaunchScript's script with --resume in place of
-// --session-id, and no first prompt.
+// --session-id, and no first prompt. The session's brief copy, when it is
+// still there, stays readable: a worker that had no turn yet has only its
+// prompt, which points to it.
 func ResumeScript(p route.Profile, t route.Tier, name, sessionID, cwd, qmDir string) string {
-	return script(cwd, qmDir, append(claudeLine(p, t, name), "--resume", sessionID), "")
+	b := briefOf(sessionID)
+	return script(cwd, qmDir, append(claudeLine(p, t, name, briefFile{b, b}), "--resume", sessionID), "")
 }
 
 // PlainResumeScript is the /bin/sh script that resumes a hand-started
@@ -421,11 +430,17 @@ func PlainResumeScript(args []string, env map[string]string, name, sessionID, cw
 }
 
 // claudeLine is a worker's command, unquoted: exec env with the worker's
-// variables, then claude on tier t with the profile's flags, named name.
-func claudeLine(p route.Profile, t route.Tier, name string) []string {
+// variables, then claude on tier t with the profile's flags, named name, its
+// task in the file brief (no path for none).
+func claudeLine(p route.Profile, t route.Tier, name string, brief briefFile) []string {
 	w := []string{"exec", "env", "QM_ROLE=worker", "QM_SESSION_NAME=" + name}
+	env := p.Env
+	if brief.path != "" {
+		w = append(w, BriefEnv+"="+brief.path)
+		env = withReadCap(env, brief.text)
+	}
 	for _, k := range scriptEnv {
-		if v, ok := p.Env[k]; ok && v != "" {
+		if v, ok := env[k]; ok && v != "" {
 			w = append(w, k+"="+v)
 		}
 	}
@@ -439,7 +454,7 @@ func claudeLine(p route.Profile, t route.Tier, name string) []string {
 	if p.MCPConfig != "" {
 		w = append(w, "--mcp-config", p.MCPConfig)
 	}
-	w = append(w, "--settings", settingsJSON(p))
+	w = append(w, "--settings", settingsJSON(p, brief.path))
 	for _, d := range p.PluginDirs {
 		w = append(w, "--plugin-dir", d)
 	}
@@ -454,8 +469,8 @@ type CoordinatorLaunch struct {
 	// (QM_HANDOFF), <state>/handoff/<project id>/NAME.md; "" leaves
 	// QM_HANDOFF out.
 	HandoffPath string
-	// PromptPath is the first prompt's file (a fresh coordinator's summary);
-	// "" gives none.
+	// PromptPath is the file the first prompt points to (a fresh
+	// coordinator's summary); "" gives no prompt.
 	PromptPath string
 	Args       []string // the coordinator's own claude arguments
 	// Resume resumes SessionID; otherwise a new session takes that id.
@@ -466,7 +481,9 @@ type CoordinatorLaunch struct {
 // coordinator (design 5.5): the PATH and cd of LaunchScript, then exec claude
 // with the project, workspace, session name and handoff note file in its
 // environment, the coordinator's own arguments, -n NAME, and --resume ID or
-// --session-id ID; then the prompt file's text when there is one. An empty
+// --session-id ID; then a prompt that points to the prompt file when there is
+// one (coordinatorPrompt), readable without asking unless the arguments name
+// settings of their own. An empty
 // session id, or a name that is not a plain file name, is an error.
 func CoordinatorScript(c CoordinatorLaunch) (string, error) {
 	switch {
@@ -479,22 +496,33 @@ func CoordinatorScript(c CoordinatorLaunch) (string, error) {
 	if c.HandoffPath != "" {
 		w = append(w, "QM_HANDOFF="+c.HandoffPath)
 	}
+	prompt, readable := "", c.PromptPath
+	if readable != "" {
+		prompt = coordinatorPrompt(briefFile{readable, readable})
+	} else if c.Resume {
+		// The file the resumed session was pointed to: it may have had no turn.
+		readable = briefOf(c.SessionID)
+	}
 	w = append(w, "claude")
 	w = append(w, c.Args...)
+	if readable != "" && !slices.ContainsFunc(c.Args, func(a string) bool { return a == "--settings" || strings.HasPrefix(a, "--settings=") }) {
+		b, _ := json.Marshal(map[string]any{"permissions": map[string]any{"allow": readRules(readable)}}) // always encodes
+		w = append(w, "--settings", string(b))
+	}
 	w = append(w, "-n", c.Name)
 	if c.Resume {
 		w = append(w, "--resume", c.SessionID)
 	} else {
 		w = append(w, "--session-id", c.SessionID)
 	}
-	return script(c.Cwd, c.QMDir, w, c.PromptPath), nil
+	return script(c.Cwd, c.QMDir, w, prompt), nil
 }
 
 // script is a /bin/sh launch script: PATH is qmDir ("" for none), then the
 // spawner's PATH, then the session's own; then cd to cwd, then the command
-// words w, each quoted, followed by the text of promptPath ("" for none) as
-// one argument that starts with a newline.
-func script(cwd, qmDir string, w []string, promptPath string) string {
+// words w, each quoted, followed by prompt ("" for none) as one argument that
+// starts with a newline.
+func script(cwd, qmDir string, w []string, prompt string) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\n")
 	var dirs []string
@@ -513,8 +541,8 @@ func script(cwd, qmDir string, w []string, promptPath string) string {
 		q[i] = launch.Quote(s)
 	}
 	b.WriteString(strings.Join(q, " "))
-	if promptPath != "" {
-		fmt.Fprintf(&b, " \"$(printf '\\n'; cat %s)\"", launch.Quote(promptPath))
+	if prompt != "" {
+		b.WriteString(" " + quotePrompt(prompt))
 	}
 	b.WriteString("\n")
 	return b.String()
@@ -522,8 +550,9 @@ func script(cwd, qmDir string, w []string, promptPath string) string {
 
 // settingsJSON is the --settings value: enabledPlugins with the profile's
 // marketplace plugins on and the rest of the user's plugins off, and
-// claude.ai plugin sync off unless the profile keeps it.
-func settingsJSON(p route.Profile) string {
+// claude.ai plugin sync off unless the profile keeps it, and the file brief
+// ("" for none) readable without asking.
+func settingsJSON(p route.Profile, brief string) string {
 	enabled := map[string]bool{}
 	for _, k := range p.PluginsOn {
 		if strings.Contains(k, "@") {
@@ -537,6 +566,9 @@ func settingsJSON(p route.Profile) string {
 	if !p.KeepClaudeAiPlugins {
 		s["syncClaudeAiPlugins"] = false
 	}
-	b, _ := json.Marshal(s) // maps of bools always encode
+	if rules := readRules(brief); len(rules) > 0 {
+		s["permissions"] = map[string]any{"allow": rules}
+	}
+	b, _ := json.Marshal(s) // maps of bools and strings always encode
 	return string(b)
 }

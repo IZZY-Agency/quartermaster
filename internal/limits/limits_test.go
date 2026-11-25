@@ -57,7 +57,7 @@ func addRolloutOn(t *testing.T, codexHome, day, fixture, name string, reset time
 
 func TestNoCodexOnPath(t *testing.T) {
 	setup(t)
-	st, err := Codex(missing)
+	st, err := Codex(missing, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestCodexUnderLimit(t *testing.T) {
 	home, _ := setup(t)
 	reset := time.Now().Add(48 * time.Hour).Truncate(time.Second)
 	addRollout(t, home, "rollout-under.jsonl", "rollout-b.jsonl", reset, time.Now())
-	st, err := Codex(installed)
+	st, err := Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestCreditsDoNotCount(t *testing.T) {
 	home, _ := setup(t)
 	reset := time.Now().Add(48 * time.Hour)
 	addRollout(t, home, "rollout-limited.jsonl", "rollout-a.jsonl", reset, time.Now())
-	st, err := Codex(installed)
+	st, err := Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestNewestRolloutWins(t *testing.T) {
 	now := time.Now()
 	addRollout(t, home, "rollout-limited.jsonl", "rollout-a.jsonl", reset, now.Add(-time.Hour))
 	addRollout(t, home, "rollout-under.jsonl", "rollout-b.jsonl", reset, now)
-	st, err := Codex(installed)
+	st, err := Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestRolloutWalkOrder(t *testing.T) {
 	addRolloutOn(t, home, "2026/09/30", "rollout-limited.jsonl", "rollout-a.jsonl", reset, now)
 	addRolloutOn(t, home, "2026/10/01", "rollout-under.jsonl", "rollout-b.jsonl", reset, now.Add(-time.Hour))
 	addRolloutOn(t, home, "2026/10/02", "rollout-no-usage.jsonl", "rollout-c.jsonl", reset, now.Add(-time.Hour))
-	st, err := Codex(installed)
+	st, err := Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestRolloutWalkOrder(t *testing.T) {
 func TestCodexWindowResetSinceLastEvent(t *testing.T) {
 	home, _ := setup(t)
 	addRollout(t, home, "rollout-limited.jsonl", "rollout-a.jsonl", time.Now().Add(-time.Minute), time.Now())
-	st, err := Codex(installed)
+	st, err := Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestCodexWindowResetSinceLastEvent(t *testing.T) {
 
 func TestCodexNoUsageData(t *testing.T) {
 	home, _ := setup(t)
-	st, err := Codex(installed)
+	st, err := Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func TestCodexNoUsageData(t *testing.T) {
 		t.Errorf("no rollouts: state = %+v", st)
 	}
 	addRollout(t, home, "rollout-no-usage.jsonl", "rollout-c.jsonl", time.Now(), time.Now())
-	st, err = Codex(installed)
+	st, err = Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,17 +168,17 @@ func TestCodexLimitedFile(t *testing.T) {
 	addRollout(t, home, "rollout-under.jsonl", "rollout-b.jsonl", time.Now().Add(48*time.Hour), time.Now())
 
 	future := time.Now().Add(3 * time.Hour).Truncate(time.Second)
-	if err := MarkCodexLimited(future); err != nil {
+	if err := markNow(t, future); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(filepath.Join(state, "limits", "codex-limited.json"))
+	info, err := os.Stat(filepath.Join(state, "limits", "codex-limited-unknown.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Errorf("mode = %v", info.Mode().Perm())
 	}
-	st, err := Codex(installed)
+	st, err := Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,10 +189,10 @@ func TestCodexLimitedFile(t *testing.T) {
 		t.Errorf("future reset: state = %+v, want the last known 42.5%%", st)
 	}
 
-	if err := MarkCodexLimited(time.Now().Add(-time.Minute)); err != nil {
+	if err := markNow(t, time.Now().Add(-time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	st, err = Codex(installed)
+	st, err = Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,10 +203,10 @@ func TestCodexLimitedFile(t *testing.T) {
 
 func TestCodexLimitedUsageUnknown(t *testing.T) {
 	setup(t)
-	if err := MarkCodexLimited(time.Now().Add(time.Hour)); err != nil {
+	if err := markNow(t, time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	st, err := Codex(installed)
+	st, err := Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestCodexLimitedFileCorrupt(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{torn"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	st, err := Codex(installed)
+	st, err := Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestCodexLimitedFileCorrupt(t *testing.T) {
 	if err := os.Chtimes(path, old, old); err != nil {
 		t.Fatal(err)
 	}
-	st, err = Codex(installed)
+	st, err = Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,10 +281,10 @@ func TestParseCodexLimitError(t *testing.T) {
 func TestCodexLimitedWithoutResetTime(t *testing.T) {
 	home, _ := setup(t)
 	before := time.Now()
-	if err := MarkCodexLimited(time.Time{}); err != nil {
+	if err := markNow(t, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
-	st, err := Codex(installed)
+	st, err := Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,10 +295,10 @@ func TestCodexLimitedWithoutResetTime(t *testing.T) {
 
 	reset := time.Now().Add(30 * time.Hour).Truncate(time.Second)
 	addRollout(t, home, "rollout-under.jsonl", "rollout-b.jsonl", reset, time.Now())
-	if err := MarkCodexLimited(time.Time{}); err != nil {
+	if err := markNow(t, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
-	st, err = Codex(installed)
+	st, err = Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,10 +308,10 @@ func TestCodexLimitedWithoutResetTime(t *testing.T) {
 
 	// A window reset already past is unknown too.
 	addRollout(t, home, "rollout-under.jsonl", "rollout-b.jsonl", time.Now().Add(-time.Hour), time.Now())
-	if err := MarkCodexLimited(time.Time{}); err != nil {
+	if err := markNow(t, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
-	if st, err = Codex(installed); err != nil || st.Available || st.ResetsAt.Before(time.Now().Add(policy.CodexLimitedFallback-time.Minute)) {
+	if st, err = Codex(installed, CodexSessions); err != nil || st.Available || st.ResetsAt.Before(time.Now().Add(policy.CodexLimitedFallback-time.Minute)) {
 		t.Errorf("past window reset: state = %+v, err %v", st, err)
 	}
 }
@@ -439,7 +439,7 @@ func TestCodexOtherAccountReadingIgnored(t *testing.T) {
 	reset := time.Now().Add(48 * time.Hour)
 	addAccountRollout(t, home, "rollout-limited.jsonl", "rollout-a.jsonl", "acct-old", reset, time.Now())
 	login(t, home, "acct-new")
-	st, err := Codex(installed)
+	st, err := Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +449,7 @@ func TestCodexOtherAccountReadingIgnored(t *testing.T) {
 
 	// The same account's reading still counts.
 	login(t, home, "acct-old")
-	st, err = Codex(installed)
+	st, err = Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +467,7 @@ func TestCodexCurrentAccountReadingWins(t *testing.T) {
 	addAccountRollout(t, home, "rollout-under.jsonl", "rollout-mine.jsonl", "acct-new", reset, now.Add(-time.Hour))
 	addAccountRollout(t, home, "rollout-limited.jsonl", "rollout-other.jsonl", "acct-old", reset, now)
 	login(t, home, "acct-new")
-	st, err := Codex(installed)
+	st, err := Codex(installed, CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,27 +482,7 @@ func TestCodexUnknownAccountCounts(t *testing.T) {
 	reset := time.Now().Add(48 * time.Hour)
 	addRollout(t, home, "rollout-limited.jsonl", "rollout-a.jsonl", reset, time.Now())
 	login(t, home, "acct-new")
-	if st, err := Codex(installed); err != nil || st.Available {
+	if st, err := Codex(installed, CodexSessions); err != nil || st.Available {
 		t.Errorf("rollout without an account: state = %+v, %v; want limited", st, err)
-	}
-}
-
-// A recorded usage-limit error holds for the account that hit it only.
-func TestCodexLimitedFileOtherAccount(t *testing.T) {
-	home, state := setup(t)
-	login(t, home, "acct-old")
-	if err := MarkCodexLimited(time.Now().Add(3 * time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(filepath.Join(state, "limits", "codex-limited.json"))
-	if err != nil || !strings.Contains(string(data), `"account":"acct-old"`) {
-		t.Fatalf("marker = %s, %v", data, err)
-	}
-	if st, err := Codex(installed); err != nil || st.Available {
-		t.Errorf("same account: state = %+v, %v; want limited", st, err)
-	}
-	login(t, home, "acct-new")
-	if st, err := Codex(installed); err != nil || !st.Available {
-		t.Errorf("other account: state = %+v, %v; want available", st, err)
 	}
 }

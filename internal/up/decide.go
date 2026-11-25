@@ -38,6 +38,9 @@ type Step struct {
 	Action Action
 	Why    string
 	Cold   bool
+	// MaybeLive: it was not seen running, but not all running sessions were
+	// known, so it may run (qm down does not record it as closed for that).
+	MaybeLive bool
 }
 
 // Decide applies the restore table of spec 6 to c: the first matching row

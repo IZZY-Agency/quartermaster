@@ -22,6 +22,11 @@ type Input struct {
 	// AgentID and AgentType are set when the hook fires inside a subagent.
 	AgentID   string `json:"agent_id"`
 	AgentType string `json:"agent_type"`
+	// BackgroundTasks and SessionCrons are a Stop input's in-flight tasks and
+	// scheduled wakeups, absent before the Claude Code that added them. They
+	// stay undecoded here, so a malformed one never fails a hook.
+	BackgroundTasks json.RawMessage `json:"background_tasks"`
+	SessionCrons    json.RawMessage `json:"session_crons"`
 }
 
 // Read decodes one hook input.

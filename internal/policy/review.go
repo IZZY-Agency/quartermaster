@@ -54,8 +54,8 @@ var (
 	CodexEfforts = []string{"low", "medium", "high", "xhigh"}
 )
 
-// CodexLimitPercent: Codex is unavailable once its primary limit's
-// used_percent reaches it. Paid credits do not count (design 5.4).
+// CodexLimitPercent: Codex is unavailable once the used percentage of any of
+// its limit windows reaches it. Paid credits do not count (design 5.4).
 const CodexLimitPercent = 95.0
 
 // CodexLimitedFallback is how long a Codex usage-limit error that states no
@@ -65,3 +65,17 @@ const CodexLimitedFallback = 5 * time.Hour
 // ClaudeLimitMaxAge: a Claude limit file older than this is stale (the
 // status-line wrapper is gone), so the Claude limit state is unknown.
 const ClaudeLimitMaxAge = time.Hour
+
+// CodexStaleAfter: a Codex usage reading older than this is shown as stale.
+// It is the Claude limit file's age limit: the shortest window, 5 hours, can
+// move by tens of points in an hour of work.
+const CodexStaleAfter = ClaudeLimitMaxAge
+
+// Asking Codex for its usage (codex app-server): an answer stands for
+// CodexUsageMaxAge and a failure for CodexUsageRetry, and Codex has
+// CodexUsageTimeout to answer, about four times what it was measured to take.
+const (
+	CodexUsageMaxAge  = 5 * time.Minute
+	CodexUsageRetry   = 2 * time.Minute
+	CodexUsageTimeout = 4 * time.Second
+)

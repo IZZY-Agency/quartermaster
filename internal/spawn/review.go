@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -48,8 +49,9 @@ const (
 	statusFile   = "status"
 	logFile      = "log"
 	findingsFile = "findings.json"
-	codexLast    = "last.txt"  // Codex's last message (-o)
-	claudeReply  = "reply.txt" // the Claude reviewer's raw reply
+	codexLast    = "last.txt"   // Codex's last message (-o)
+	codexLast2   = "last-2.txt" // that of the second try
+	claudeReply  = "reply.txt"  // the Claude reviewer's raw reply
 )
 
 // ReviewJob is one review: what route decided and the decision-log record to
@@ -179,12 +181,12 @@ func writeStatus(dir, status string) error {
 
 // CodexArgs is the codex command line for a review: explicit model and
 // effort, a read-only sandbox, no saved session, JSONL events, the last
-// message to <out>/last.txt, shaped by the findings schema, run in repo. The
+// message to the file last, shaped by the findings schema, run in repo. The
 // prompt argument is "-": codex exec reads the prompt from stdin, so a prompt
 // of any size, or one that starts with "-", passes intact.
-func CodexArgs(c route.CodexTier, repo, out, schema string) []string {
+func CodexArgs(c route.CodexTier, repo, last, schema string) []string {
 	return []string{"exec", "-m", c.Model, "-c", fmt.Sprintf("model_reasoning_effort=%q", c.Effort),
-		"-s", "read-only", "--ephemeral", "--json", "-o", filepath.Join(out, codexLast),
+		"-s", "read-only", "--ephemeral", "--json", "-o", last,
 		"--output-schema", schema, "-C", repo, "-"}
 }
 
@@ -217,15 +219,19 @@ func ClaudeArgs(t route.Tier) ([]string, error) {
 }
 
 // ReviewRunner runs review jobs. Codex and Claude are the commands to run;
-// Codex "" means it is not installed.
+// Codex "" means it is not installed. CodexRead says whether Codex may be
+// asked for its login (a keyring's) and, before a second try, its usage.
 type ReviewRunner struct {
-	Codex  string
-	Claude string
+	Codex     string
+	Claude    string
+	CodexRead limits.CodexRead
 }
 
 // Run runs the job in dir to its end: on Codex when the decision has a Codex
 // tier, else, or when the Codex review fails in any way, on Claude (a Codex
-// usage-limit error also marks Codex limited until the reset it states). When
+// usage-limit error also marks Codex limited until the reset it states, for the
+// login the run started under; a run whose login was switched is first tried
+// once more on Codex, see codexReview). When
 // ctx ends, the running reviewer's process group is killed and the job
 // fails, with no fallback. A valid reply is written to
 // findings.json, logged as a review record with the counts, and the status
@@ -254,7 +260,9 @@ func (r ReviewRunner) Run(ctx context.Context, dir string) error {
 	var f Findings
 	switch {
 	case d.Codex != nil && r.Codex != "":
-		f, err = r.runCodex(ctx, dir, job.Repo, *d.Codex, string(prompt), log)
+		var notes []string
+		f, notes, err = r.codexReview(ctx, dir, job.Repo, *d.Codex, string(prompt), log)
+		d.Reasons = append(slices.Clip(d.Reasons), notes...)
 		if err == nil || ctx.Err() != nil {
 			break
 		}
@@ -310,23 +318,81 @@ func (r ReviewRunner) fail(dir string, job ReviewJob, err error) error {
 // errCodexLimited is a Codex run that ended on Codex's usage-limit error.
 var errCodexLimited = errors.New("codex usage limit reached")
 
-// runCodex runs the Codex review, the prompt on stdin. A usage-limit error
-// marks Codex limited and returns errCodexLimited.
-func (r ReviewRunner) runCodex(ctx context.Context, dir, repo string, c route.CodexTier, prompt string, log io.Writer) (Findings, error) {
+// codexReview runs the Codex review. A run that failed while Codex was logged
+// in anew is tried once more under the new login, when that one is available:
+// that the login is another than the one the run started under decides, not
+// what Codex said. A run that ended with ctx, or on a signal, is not tried
+// again. notes says what was done, for the decision's reasons, and names no
+// account.
+func (r ReviewRunner) codexReview(ctx context.Context, dir, repo string, c route.CodexTier, prompt string, log io.Writer) (f Findings, notes []string, err error) {
+	note := func(format string, args ...any) {
+		n := fmt.Sprintf(format, args...)
+		_, _ = fmt.Fprintln(log, "qm: "+n)
+		notes = append(notes, n)
+	}
+	login := limits.CodexLogin(r.Codex, r.CodexRead)
+	f, err = r.runCodex(ctx, login, filepath.Join(dir, codexLast), repo, c, prompt, log)
+	if err == nil || ctx.Err() != nil || signaled(err) {
+		return f, nil, err
+	}
+	now := limits.CodexLogin(r.Codex, r.CodexRead)
+	if !now.Differs(login) {
+		return f, nil, err
+	}
+	const switched = "Codex failed (%v) and its login was switched while it ran: "
+	st, serr := limits.CodexFor(now, r.Codex, r.CodexRead)
+	switch {
+	case ctx.Err() != nil:
+		return f, nil, err
+	case serr != nil:
+		note(switched+"no second try, as the usage of the new login cannot be read (%v)", err, serr)
+		return f, notes, err
+	case !st.Available:
+		note(switched+"no second try, as the new login is not available (%s)", err, st.Reason)
+		return f, notes, err
+	case !now.Current():
+		note(switched+"no second try, as it was changed again since", err)
+		return f, notes, err
+	}
+	note(switched+"the review was tried once more on Codex", err)
+	f, err = r.runCodex(ctx, now, filepath.Join(dir, codexLast2), repo, c, prompt, log)
+	return f, notes, err
+}
+
+// signaled reports whether a command ended on a signal.
+func signaled(err error) bool {
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		return false
+	}
+	ws, ok := exit.Sys().(syscall.WaitStatus)
+	return ok && ws.Signaled()
+}
+
+// runCodex runs Codex once, the prompt on stdin and its last message to the
+// file last, which is removed first. A usage-limit error marks login, the one
+// Codex starts under, limited and returns errCodexLimited.
+func (r ReviewRunner) runCodex(ctx context.Context, login limits.Login, last, repo string, c route.CodexTier, prompt string, log io.Writer) (Findings, error) {
+	if err := os.Remove(last); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return Findings{}, err
+	}
 	var out bytes.Buffer
-	cmd := reviewerCmd(ctx, r.Codex, CodexArgs(c, repo, dir, filepath.Join(dir, schemaFile))...)
+	cmd := reviewerCmd(ctx, r.Codex, CodexArgs(c, repo, last, filepath.Join(filepath.Dir(last), schemaFile))...)
 	cmd.Dir = repo
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Stdout = io.MultiWriter(log, &out)
 	cmd.Stderr = cmd.Stdout
 	runErr := cmd.Run()
-	last, readErr := os.ReadFile(filepath.Join(dir, codexLast))
+	reply, readErr := os.ReadFile(last)
 	if runErr == nil && readErr == nil {
-		return ParseFindings(last)
+		return ParseFindings(reply)
 	}
 	if reset, ok := limits.ParseCodexLimitError(codexErrors(out.Bytes())); ok {
-		if err := limits.MarkCodexLimited(reset); err != nil {
+		if err := limits.MarkCodexLimited(login, reset); err != nil {
 			_, _ = fmt.Fprintf(log, "qm: marking Codex limited: %v\n", err)
+		}
+		if runErr != nil {
+			return Findings{}, fmt.Errorf("%w (%w)", errCodexLimited, runErr)
 		}
 		return Findings{}, errCodexLimited
 	}

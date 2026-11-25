@@ -97,7 +97,7 @@ func downFixture(t *testing.T) (*Project, []Step) {
 	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
 	at := time.Now().Add(-10 * time.Minute)
 	p := &Project{
-		ID: "proj-12345678", Root: "/work/proj", Workspace: "proj", Launcher: "agterm",
+		ID: "proj-277ae841", Root: "/work/proj", Workspace: "proj", Launcher: "agterm",
 		Sessions: map[string]launch.SessionRef{
 			"c1": {Launcher: "agterm", ID: "t-c"},
 			"w1": {Launcher: "agterm", ID: "t-w1"},
@@ -154,7 +154,7 @@ func downRecords(t *testing.T) map[string]string {
 	out := map[string]string{}
 	for _, r := range recs {
 		if r.Kind == "up" && r.Action == "down" {
-			if r.UpProject != "proj-12345678" {
+			if r.UpProject != "proj-277ae841" {
 				t.Errorf("record of %s: up_project %q", r.Name, r.UpProject)
 			}
 			out[r.Name] = r.Detail
@@ -418,7 +418,7 @@ func TestDroppedRefNotSeededAgain(t *testing.T) {
 func TestDownClosesAdoptedSessions(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
 	p := &Project{
-		ID: "proj-12345678", Root: "/work/proj", Workspace: "proj", Launcher: "agterm",
+		ID: "proj-277ae841", Root: "/work/proj", Workspace: "proj", Launcher: "agterm",
 		Coordinator: Session{ID: "c1", Name: "proj-coord", Adopted: true},
 		Adopted:     map[string]AdoptedSession{"w1": {Name: "w-hand", Cwd: "/work/proj-wt"}},
 		Sessions: map[string]launch.SessionRef{

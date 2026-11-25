@@ -46,7 +46,9 @@ func TestTranscriptPath(t *testing.T) {
 	if p, _ := c.TranscriptPath("new"); !strings.HasSuffix(p, filepath.Join("-repo", "new.jsonl")) {
 		t.Errorf("path = %q", p)
 	}
-	for _, id := range []string{"missing", "", "../x", "a/b"} {
+	// A glob pattern is not an id: it would find another session's
+	// transcript.
+	for _, id := range []string{"missing", "", "../x", "a/b", `a\b`, "*", "ne?", "[n]ew", "n*"} {
 		if p, _ := c.TranscriptPath(id); p != "" {
 			t.Errorf("TranscriptPath(%q) = %q, want none", id, p)
 		}
@@ -130,6 +132,12 @@ func TestWorkerFinder(t *testing.T) {
 	}
 	if tr, ok := f.Find("99999999-0000-4000-8000-000000000000", "old-worker"); !ok || tr.Cost != 4 {
 		t.Errorf("id missing, title fallback: %+v %v", tr, ok)
+	}
+	// The transcript belongs to another Record's session: not a launch's of
+	// the same name that never ran.
+	owned := &WorkerFinder{Claude: Claude{Dir: d}, Owned: map[string]bool{"aaaa": true}}
+	if tr, ok := owned.Find("99999999-0000-4000-8000-000000000000", "old-worker"); ok {
+		t.Errorf("found another session's transcript: %+v", tr)
 	}
 	if _, ok := f.Find("", "nobody"); ok {
 		t.Error("found a worker that has no transcript")

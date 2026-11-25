@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/IZZY-Agency/quartermaster/internal/launch"
+	"github.com/IZZY-Agency/quartermaster/internal/plain"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
 )
 
@@ -79,7 +80,7 @@ func Render(steps []Step, now time.Time) string {
 		case Skip:
 			skip++
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.Role, oneLine(s.Name), prefix(s.SessionID), orDash(s.Branch), last, ctxk, action, oneLine(s.Why))
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.Role, oneLine(s.Name), prefix(s.SessionID), orDash(oneLine(s.Branch)), last, ctxk, action, oneLine(s.Why))
 	}
 	_ = tw.Flush()
 	fmt.Fprintf(&b, "resume warm %d, resume cold %d (%s tokens written to cache), start fresh %d, leave %d, skip %d\n", warm, cold, kTokensUp(coldTokens), fresh, leave, skip)
@@ -87,6 +88,7 @@ func Render(steps []Step, now time.Time) string {
 }
 
 func prefix(id string) string {
+	id = plain.Line(id)
 	if len(id) > 8 {
 		return id[:8]
 	}

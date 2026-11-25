@@ -205,7 +205,7 @@ func TestUpAdoptLaterHeldSessionsAreNotCandidates(t *testing.T) {
 
 func TestUpAdoptLaterHeldElsewhereIsNotCandidate(t *testing.T) {
 	newLaterMachine(t)
-	other := up.Project{ID: "other-1a2b3c4d", Root: "/elsewhere", Workspace: "else", Launcher: "agterm", Coordinator: up.Session{ID: "00000000-0000-4000-8000-0000000000ff"}, Adopted: map[string]up.AdoptedSession{adoptHandID: {}}}
+	other := up.Project{ID: "elsewhere-b660bf8d", Root: "/elsewhere", Workspace: "else", Launcher: "agterm", Coordinator: up.Session{ID: "00000000-0000-4000-8000-0000000000ff"}, Adopted: map[string]up.AdoptedSession{adoptHandID: {}}}
 	if err := up.Save(other); err != nil {
 		t.Fatal(err)
 	}

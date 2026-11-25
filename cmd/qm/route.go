@@ -15,6 +15,7 @@ import (
 
 	"github.com/IZZY-Agency/quartermaster/internal/config"
 	"github.com/IZZY-Agency/quartermaster/internal/limits"
+	"github.com/IZZY-Agency/quartermaster/internal/plain"
 	"github.com/IZZY-Agency/quartermaster/internal/privacy"
 	"github.com/IZZY-Agency/quartermaster/internal/reviewin"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
@@ -29,7 +30,8 @@ const (
 	reasonFakeJev = "fake Jev in use (QM_FAKE_JEV)"
 )
 
-// codexLook finds the codex command for limits.Codex; tests replace it.
+// codexLook finds the codex command for limits.Codex. Tests replace it: in a
+// test binary it finds none (TestMain), so no test starts the real one.
 var codexLook = exec.LookPath
 
 const routeUsage = `usage:
@@ -140,13 +142,7 @@ func routeWorker(args []string, stdout, stderr io.Writer) error {
 func routeReviewSession(briefFile string, in route.WorkerInput, deps routingDeps, claude limits.ClaudeState, stdout io.Writer, asJSON bool) error {
 	sd := spawn.Deps{
 		Ask: deps.ask, Gate: deps.gate, Claude: claude, Mark: deps.mark,
-		Codex: func() limits.CodexState {
-			st, err := limits.Codex(codexLook)
-			if err != nil {
-				return limits.CodexState{Reason: "Codex usage unreadable: " + err.Error()}
-			}
-			return st
-		},
+		Codex: deps.cachedCodex,
 	}
 	req := spawn.WorkerRequest{Brief: briefFile, Type: in.Type, Size: in.Size, Cwd: in.Repo, Hint: in.Hint, Force: in.Force, ForceWhy: in.ForceWhy}
 	d, _, err := spawn.Route(context.Background(), req, in.Repo, sd)
@@ -182,11 +178,7 @@ func routeReview(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	codex, err := limits.Codex(codexLook)
-	if err != nil {
-		codex = limits.CodexState{Reason: "Codex usage unreadable: " + err.Error()}
-	}
-	d, err := route.DecideReview(context.Background(), in, deps.ask, deps.gate, codex, claudeState(stderr))
+	d, err := route.DecideReview(context.Background(), in, deps.ask, deps.gate, deps.codex(limits.CodexAsk), claudeState(stderr))
 	if err != nil {
 		return routeError(err)
 	}
@@ -245,7 +237,24 @@ type routingDeps struct {
 	ask  route.Asker
 	gate route.Gater
 	fake bool // ask answers from a QM_FAKE_JEV fixture
+	// codexUsageRead is codex.usage_read: whether Codex may be asked for its
+	// usage.
+	codexUsageRead bool
 }
+
+// codex is the Codex state a review is routed with; one that cannot be read
+// is Codex off.
+func (r routingDeps) codex(read limits.CodexRead) limits.CodexState {
+	st, err := limits.Codex(codexLook, read.If(r.codexUsageRead))
+	if err != nil {
+		return limits.CodexState{Reason: "Codex usage unreadable: " + err.Error()}
+	}
+	return st
+}
+
+// cachedCodex is codex for a review session (--type review): it runs on
+// Claude whatever the state says, so Codex is not asked for it.
+func (r routingDeps) cachedCodex() limits.CodexState { return r.codex(limits.CodexCached) }
 
 // mark adds reasonFakeJev to a decision made while QM_FAKE_JEV is set.
 func (r routingDeps) mark(d route.Decision) route.Decision {
@@ -272,12 +281,12 @@ func routeDeps() (routingDeps, error) {
 	})
 	if p := os.Getenv(fakeJevEnv); p != "" {
 		ask, err := loadFakeJev(p)
-		return routingDeps{ask: ask, gate: gate, fake: true}, err
+		return routingDeps{ask: ask, gate: gate, fake: true, codexUsageRead: cfg.CodexUsageRead()}, err
 	}
 	if c := typesafe.New(cfg.Key()); c != nil {
-		return routingDeps{ask: c, gate: gate}, nil
+		return routingDeps{ask: c, gate: gate, codexUsageRead: cfg.CodexUsageRead()}, nil
 	}
-	return routingDeps{gate: gate}, nil
+	return routingDeps{gate: gate, codexUsageRead: cfg.CodexUsageRead()}, nil
 }
 
 // claudeState is the Claude limit state; one that cannot be read is
@@ -293,15 +302,13 @@ func claudeState(stderr io.Writer) limits.ClaudeState {
 
 // printDecision prints d: indented JSON, or decisionLine.
 func printDecision(stdout io.Writer, d route.Decision, asJSON bool) error {
-	text := decisionLine(d)
 	if asJSON {
-		b, err := json.MarshalIndent(d, "", "  ")
-		if err != nil {
-			return err
+		if err := printJSON(stdout, d); err != nil {
+			return fmt.Errorf("writing the decision: %w", err)
 		}
-		text = string(b)
+		return nil
 	}
-	if _, err := fmt.Fprintln(stdout, text); err != nil {
+	if _, err := fmt.Fprintln(stdout, decisionLine(d)); err != nil {
 		return fmt.Errorf("writing the decision: %w", err)
 	}
 	return nil
@@ -314,7 +321,7 @@ func decisionLine(d route.Decision) string {
 	if d.Codex != nil {
 		tier += ", Codex " + d.Codex.Model + "/" + d.Codex.Effort
 	}
-	return fmt.Sprintf("%s (row %s): %s", tier, d.Row, strings.Join(d.Reasons, "; "))
+	return plain.Line(fmt.Sprintf("%s (row %s): %s", tier, d.Row, strings.Join(d.Reasons, "; ")))
 }
 
 // fakeJev answers every request from a fixture: question id to answer.

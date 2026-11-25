@@ -86,6 +86,7 @@ func TestHooksJSONCommands(t *testing.T) {
 			"PostToolUse Agent reviewer-model",
 			"PreToolUse Agent explorer-model",
 			"PreToolUse Agent reviewer-model",
+			"PreToolUse Bash pattern-kill",
 			"PreToolUse Bash raw-launch-gate",
 			"PreToolUse Grep|Bash lsp-note",
 			"PreToolUse Read|Grep|Bash|Write|Edit read-budget",

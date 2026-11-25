@@ -170,3 +170,49 @@ func TestLowerPermission(t *testing.T) {
 		}
 	}
 }
+
+// A coordinator that is a version file run directly gives its workers its
+// permission flag, as it did under the name claude: the executable decides,
+// and argv[0] is whatever the process was started with. The same executable
+// rule holds as before; node and the npm package's files pass none of it, by
+// whatever command line.
+func TestPermissionOfOtherClaudeInstalls(t *testing.T) {
+	root := t.TempDir()
+	file := func(parts ...string) string {
+		path := filepath.Join(append([]string{root}, parts...)...)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, nil, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	version := file("claude", "versions", "2.1.300")
+	cli := file("node_modules", "@anthropic-ai", "claude-code", "cli.js")
+	native := file("node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe")
+	for _, tc := range []struct {
+		name, cmd, exe string
+		want           bool
+	}{
+		{"version file", version + " --dangerously-skip-permissions", version, true},
+		{"version file as claude", "claude --dangerously-skip-permissions", version, true},
+		{"version command line, another executable", version + " --dangerously-skip-permissions", "/bin/sh", false},
+		{"version command line, node executable", version + " --dangerously-skip-permissions", "/usr/local/bin/node", false},
+		{"claude command line, node executable", "claude --dangerously-skip-permissions", "/usr/local/bin/node", false},
+		{"node command line, node executable", "node " + cli + " --dangerously-skip-permissions", "/usr/local/bin/node", false},
+		{"node command line, claude executable", "node " + cli + " --dangerously-skip-permissions", version, false},
+		{"npm native binary", "claude --dangerously-skip-permissions", native, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ps := psOf(map[int]proc{os.Getppid(): {cmd: tc.cmd, ppid: 1}})
+			got, why, err := ParentPermission(envMap(nil), ps, func(int) (string, error) { return tc.exe, nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if has := slices.Equal(got, []string{"--dangerously-skip-permissions"}); has != tc.want {
+				t.Errorf("flags = %q (%s), want the coordinator's flag: %v", got, why, tc.want)
+			}
+		})
+	}
+}

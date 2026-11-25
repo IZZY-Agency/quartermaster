@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.3.0
+
+- **Colours in agterm.** Coordinator tabs are purple and worker tabs teal,
+  in `qm up` (also `--here` and `--adopt`) and `qm spawn worker`. `qm watch`
+  turns a worker's tab orange when it stops, yellow when it goes silent and
+  red when it is gone, and gives its colour back when it works again. A tab
+  you tinted by hand is left alone; `qm up done` and `qm down` take qm's
+  colours off the tabs that stay open. `tint.*` changes or removes them.
+- **The coordinator's model.** A coordinator `qm up` starts from scratch runs
+  on `up.coordinator_model` (`fable`) and falls back to
+  `up.coordinator_fallback` (`opus`); `qm up` prints both. An explicit
+  `--model` or `--fallback-model` wins. One that started on the default gets
+  the fallback again when it is resumed. Needs Claude Code 2.1.170; an
+  earlier one starts without either.
+- **After agterm quits without `qm down`.** `qm up note` lists, from any
+  folder, the projects whose sessions ended that way and the line that
+  restores each. `qm init` offers an agterm launch hook that sends their names
+  as one notification, and `qm init --undo` removes it.
+- **Codex usage is read from Codex.** Before a review and in `qm status`, qm
+  asks Codex for its current usage (`codex app-server`, cached for 5 minutes;
+  `codex.usage_read: false` turns it off). Both limit windows count, and `qm
+  status` shows the window, where the figure is from and how old it is.
+- **Several Codex accounts.** A usage limit counts only for the account that
+  hit it, so switching accounts takes effect at once (within 5 minutes with a
+  login kept in a keyring). When you switch during a review and the run
+  fails, the review is tried once more on Codex under the new account. Two
+  members of one workspace count as two.
+- **`waiting` workers.** A worker that ended its turn while its own background
+  task runs, or a wakeup is scheduled, shows as `waiting` in `qm watch` and
+  `qm status`, and is no longer reported as stopped. `qm watch` keeps waiting
+  for a live worker it reported as silent.
+- **Briefs are off the command line.** qm keeps a copy of a worker's brief in
+  its state folder and the first prompt points to it; so do the note and the
+  summary `qm up` starts a fresh session with. A brief with a line longer than
+  one Read returns is refused; a large one is read in parts.
+- **Workers cannot end processes by a pattern.** A new worker rule,
+  `pattern-kill`, refuses `pkill`, `killall`, and `kill` fed by `pgrep` or
+  `ps`: they match other Claude sessions too.
+- **Starts that cannot be taken or repeated.** `qm up` and `qm spawn worker`
+  hold a session's id before it starts, so an adoption never claims it in
+  between, and a start that stopped in the middle is recovered by the next `qm
+  up`. A worker spawned again after a launch without an answer is restored
+  once, and `qm up done` ends both.
+- **Nothing starts on incomplete data.** While the session file of a running
+  claude process, or Claude Code's sessions folder, cannot be read, `qm up`
+  starts and adopts nothing, and names the file and how to recover. An
+  adoption records, moves and pins an agterm tab only when the session's own
+  process is in its foreground.
+- **tmux, tested against a real one** (in a container; still experimental). A
+  window is idle only when nothing but a waiting shell, or a finished command,
+  is in it. Workspace names and folders are never expanded or run by tmux, and
+  a name it cannot take is refused. A window moved, renamed, linked or changed
+  by hand is left open, and qm says so. A socket that may not be used is an
+  error.
+- The launch gate also finds a launch after a shift in arithmetic, or after a
+  here-document in a substitution that bash ends early.
+- A hook whose input never ends gives up at its time limit.
+- The release scripts check the version and submission name they are given and
+  check signatures before running a binary; CI actions are pinned by commit.
+- **A coordinator started by a version file** of Claude Code's installer
+  (`.../claude/versions/<version>`) is recognised, so its workers get its
+  permission flag. One run by `node`, or by the npm package's own binary, is
+  not: its workers prompt, as before.
+- **Inherited variables no longer steer git.** A `GIT_*` variable in qm's
+  environment does not decide which repository git answers for, or whether a
+  folder counts as trusted. `qm up` asks GitHub about a worker's branch only
+  in the worker's own repository, whatever `GH_REPO` says.
+- **Control characters and line breaks** in names, folders and titles no
+  longer reach the terminal or a notification.
+- A project state file whose folder does not match its id is refused as
+  unreadable, with the recovery; `qm up` refuses a project folder whose name
+  is not valid UTF-8; `qm report` refuses positional arguments.
+- Terminal ids are read only in their own shape and only from a process's
+  environment; a session id with glob characters finds no other session's
+  transcript; an over-long line in a Codex rollout is skipped, and a rollout
+  whose account cannot be told gives no usage reading.
+
 ## 0.2.2
 
 - **The coordinator in the tab `qm up` runs in.** `qm up --here` starts the

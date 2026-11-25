@@ -319,3 +319,29 @@ func TestRunGitMissingFolderIsOutsideGit(t *testing.T) {
 		t.Errorf("err = %v, want it read as outside git", err)
 	}
 }
+
+// An inherited GIT_CEILING_DIRECTORIES must not make git answer "not a
+// repository" for a folder of a repository nested in a trusted one: the
+// parents would then count, and the nested repository would read trusted.
+func TestTrustedIgnoresInheritedGitCeiling(t *testing.T) {
+	git := realGit(t)
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(root, ".claude.json")
+	fixture(t, "claude.json", root, f)
+	nested := filepath.Join(root, "trusted", "vendor", "lib")
+	sub := filepath.Join(nested, "pkg")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(nested, "init", "-q", "-b", "main")
+	if trusted(t, f, sub) {
+		t.Fatalf("a folder of a nested repository reads trusted without the variable")
+	}
+	t.Setenv("GIT_CEILING_DIRECTORIES", nested)
+	if trusted(t, f, sub) {
+		t.Errorf("with GIT_CEILING_DIRECTORIES inherited, a nested repository reads trusted")
+	}
+}

@@ -4,17 +4,16 @@ package declog
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
 	"time"
 
+	"github.com/IZZY-Agency/quartermaster/internal/lines"
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
 )
@@ -129,7 +128,7 @@ func Read(since time.Time) ([]route.Record, error) {
 	}
 	defer func() { _ = f.Close() }()
 	var out []route.Record
-	err = eachLine(bufio.NewReaderSize(f, 64*1024), func(line []byte) {
+	err = lines.Each(bufio.NewReaderSize(f, 64*1024), maxLine, func(_ int, line []byte) {
 		var r route.Record
 		if json.Unmarshal(line, &r) == nil && !r.Time.Before(since) {
 			out = append(out, r)
@@ -139,34 +138,4 @@ func Read(since time.Time) ([]route.Record, error) {
 		return out, fmt.Errorf("decision log: %w", err)
 	}
 	return out, nil
-}
-
-// eachLine calls fn with each line rd holds, its newline included, and
-// skips the lines longer than maxLine (the newline aside) without holding
-// them in memory.
-func eachLine(rd *bufio.Reader, fn func([]byte)) error {
-	var line []byte
-	long := false
-	for {
-		chunk, err := rd.ReadSlice('\n')
-		if !long && len(line)+len(chunk) > maxLine+1 {
-			long, line = true, nil
-		}
-		if !long {
-			line = append(line, chunk...)
-		}
-		switch {
-		case errors.Is(err, bufio.ErrBufferFull):
-			continue
-		case err != nil && !errors.Is(err, io.EOF):
-			return err
-		}
-		if !long && len(bytes.TrimSuffix(line, []byte("\n"))) <= maxLine && len(line) > 0 {
-			fn(line)
-		}
-		if err != nil {
-			return nil
-		}
-		line, long = line[:0], false
-	}
 }

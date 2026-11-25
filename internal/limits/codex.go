@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -15,43 +14,77 @@ import (
 	"strings"
 	"time"
 
-	"github.com/IZZY-Agency/quartermaster/internal/paths"
+	"github.com/IZZY-Agency/quartermaster/internal/lines"
 	"github.com/IZZY-Agency/quartermaster/internal/policy"
 )
 
 // Codex says whether Codex can take a review now (design 5.4). look finds a
-// command on PATH (exec.LookPath). Codex is available when it is installed,
-// the newest rollout's last primary limit is under policy.CodexLimitPercent
-// (or its window has reset since), and no usage-limit error with a future
-// reset was recorded by MarkCodexLimited. Paid credits are ignored. Installed
-// with no usage data at all counts as available.
+// command on PATH (exec.LookPath) and read says where its usage may be taken
+// from: the answer of Codex itself while it is fresh, else the newer of the
+// last one and the newest rollout. Codex is available when it is installed, no
+// limit window of that reading is at policy.CodexLimitPercent or over (a
+// window that has reset since does not count), a fresh answer does not say
+// that ordinary usage is not allowed, and no usage-limit error with a future
+// reset was recorded by MarkCodexLimited: no answer lifts that one early.
+// Paid credits are ignored. Installed with no usage data at all counts as
+// available, and a failure to ask Codex changes nothing but ReadFailure.
 //
-// Limits belong to an account: a rollout, or a recorded usage-limit error,
-// of another account than the one Codex is logged in to now (auth.json) is
-// not this account's reading and is left out. One that names no account, or
-// a login that names none, counts as before.
-func Codex(look func(string) (string, error)) (CodexState, error) {
-	if _, err := look("codex"); err != nil {
+// Limits belong to a login (CodexLogin): a rollout, or a recorded usage-limit
+// error, of another login than the one Codex has now is left out. One that
+// names no account, or a login that names none, counts as before. An answer of
+// Codex counts only for the login it was given under.
+func Codex(look func(string) (string, error), read CodexRead) (CodexState, error) {
+	path, err := look("codex")
+	if err != nil {
 		return CodexState{Reason: "codex not installed"}, nil
 	}
-	now := time.Now()
-	p, err := latestPrimary()
+	return CodexFor(CodexLogin(path, CodexSessions), path, read)
+}
+
+// CodexFor is Codex for this login of the codex at path, as CodexLogin told it.
+func CodexFor(login Login, path string, read CodexRead) (CodexState, error) {
+	home, err := codexHome()
 	if err != nil {
 		return CodexState{}, err
 	}
-	var st CodexState
-	if p != nil {
-		st.UsedPercent, st.UsageKnown = p.UsedPercent, true
-		if p.ResetsAt != nil {
-			st.ResetsAt = time.Unix(*p.ResetsAt, 0)
+	var r *reading
+	var fresh, left bool
+	var fail usageFailure
+	if read != CodexSessions {
+		var f usageFile
+		f, fresh, fail = currentUsage(path, home, login, read == CodexAsk, time.Time{})
+		r, left = f.reading(), f.other
+		if fresh && !login.Known() {
+			login = f.owner() // the login it was given under
 		}
 	}
-	until, why, err := codexLimitedUntil()
+	now := time.Now()
+	if !fresh {
+		rollout, skipped, err := latestRollout(login, now)
+		if err != nil {
+			return CodexState{}, err
+		}
+		left = left || skipped
+		if r == nil || (rollout != nil && rollout.At.After(r.At)) {
+			r = rollout
+		}
+	}
+	st, full := r.state(now)
+	st.ReadFailure = fail.text()
+	switch {
+	case !login.Known():
+		st.AccountNote = "the login cannot be told, so a figure or a limit may be another account's"
+	case r == nil && left:
+		st.AccountNote = "the last figure read is another account's and is not used"
+	case r != nil && r.Unowned:
+		st.AccountNote = "the session files do not say which account the figure is of"
+	}
+	until, why, err := codexLimitedUntil(login, now)
 	if err != nil {
 		return CodexState{}, err
 	}
 	if until.After(now) {
-		st.ResetsAt = until
+		st.ResetsAt, st.Limited = until, true
 		st.Reason = why + "; resets " + until.Format(time.DateTime)
 		if !st.UsageKnown {
 			st.Reason += " (usage unknown)"
@@ -59,15 +92,21 @@ func Codex(look func(string) (string, error)) (CodexState, error) {
 		return st, nil
 	}
 	switch {
-	case p == nil:
+	case fresh && r.Allowed != nil && !*r.Allowed:
+		st.Reason = "Codex says ordinary usage is not allowed now"
+	case r == nil:
 		st.Available, st.Reason = true, "no usage data yet (read from your own Codex sessions; qm reviews save none)"
-	case p.UsedPercent < policy.CodexLimitPercent:
-		st.Available = true
-	case !st.ResetsAt.IsZero() && !st.ResetsAt.After(now):
-		st.Available = true
-		st.Reason = "limit window has reset since the last Codex session"
+	case len(r.Windows) == 0:
+		st.Available, st.Reason = true, "Codex states no usage limit"
+	case !st.UsageKnown:
+		st.Available, st.Reason = true, "limit window has reset since the last Codex reading"
+	case full:
+		st.Reason = fmt.Sprintf("Codex limit at %g%%", st.UsedPercent)
+		if st.Window != "" {
+			st.Reason += " (" + st.Window + ")"
+		}
 	default:
-		st.Reason = fmt.Sprintf("Codex limit at %g%%", p.UsedPercent)
+		st.Available = true
 	}
 	return st, nil
 }
@@ -83,64 +122,42 @@ func codexHome() (string, error) {
 	return filepath.Join(home, ".codex"), nil
 }
 
-// maxRollouts bounds how many rollouts latestPrimary reads looking for
+// maxRollouts bounds how many rollouts latestRollout reads looking for
 // rate-limit data, so a history with none is not read whole on every call.
 const maxRollouts = 50
 
-// latestPrimary is the last primary limit in the newest rollout under
-// $CODEX_HOME/sessions that has one and belongs to the account Codex is
-// logged in to, or nil. Folders are visited newest name first
+// latestRollout is the last reading in the newest rollout under
+// $CODEX_HOME/sessions that has one and is not of another account than
+// login's, or nil; left says whether one was left out for that. A rollout
+// names its account, not the member. Folders are visited newest name first
 // (sessions/YYYY/MM/DD), and the rollouts in a folder newest mtime first; the
 // walk stops at the first such rollout with rate-limit data.
-func latestPrimary() (*primaryLimit, error) {
+func latestRollout(login Login, now time.Time) (found *reading, left bool, err error) {
 	home, err := codexHome()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	account := currentAccount(home)
-	var found *primaryLimit
 	read := 0
 	err = visitRollouts(filepath.Join(home, "sessions"), func(path string) (bool, error) {
 		read++
-		p, owner, err := lastPrimary(path)
+		r, account, err := lastReading(path, now)
 		if errors.Is(err, fs.ErrNotExist) {
 			return false, nil // removed while walking
 		}
 		if err != nil {
 			return true, err
 		}
-		if p != nil && otherAccount(owner, account) {
-			p = nil
+		if r != nil {
+			if newLogin(account, "").Differs(login) {
+				r, left = nil, true
+			} else {
+				r.Unowned = account == ""
+			}
 		}
-		found = p
-		return p != nil || read >= maxRollouts, nil
+		found = r
+		return r != nil || read >= maxRollouts, nil
 	})
-	return found, err
-}
-
-// currentAccount is the account id Codex is logged in to: tokens.account_id
-// of $CODEX_HOME/auth.json, or "" when the file is missing, unreadable or
-// names none (an API-key login). Nothing else of the file is used.
-func currentAccount(home string) string {
-	data, err := os.ReadFile(filepath.Join(home, "auth.json"))
-	if err != nil {
-		return ""
-	}
-	var a struct {
-		Tokens struct {
-			AccountID string `json:"account_id"`
-		} `json:"tokens"`
-	}
-	if json.Unmarshal(data, &a) != nil {
-		return ""
-	}
-	return a.Tokens.AccountID
-}
-
-// otherAccount reports whether a reading made under account owner is not
-// the current account's: both are known and they differ.
-func otherAccount(owner, current string) bool {
-	return owner != "" && current != "" && owner != current
+	return found, left, err
 }
 
 // visitRollouts calls fn on the rollout-*.jsonl files under dir: the files of
@@ -193,140 +210,128 @@ func visitDir(dir string, fn func(path string) (bool, error)) (bool, error) {
 	return false, nil
 }
 
-type primaryLimit struct {
-	UsedPercent float64 `json:"used_percent"`
-	ResetsAt    *int64  `json:"resets_at"`
+// rolloutWindow is a limit window as a rollout line has it.
+type rolloutWindow struct {
+	UsedPercent   float64 `json:"used_percent"`
+	WindowMinutes *int64  `json:"window_minutes"`
+	ResetsAt      *int64  `json:"resets_at"`
 }
 
 type rolloutLine struct {
-	Type    string `json:"type"`
-	Payload struct {
+	Timestamp string `json:"timestamp"`
+	Type      string `json:"type"`
+	Payload   struct {
 		Type string `json:"type"`
 		// CreatorAccountID is on the session_meta line: the account the
 		// session ran under.
 		CreatorAccountID string `json:"creator_account_id"`
 		RateLimits       *struct {
-			Primary *primaryLimit `json:"primary"`
+			// LimitID names the metered bucket. Codex versions that wrote
+			// none had only the one, so none counts as codexBucket.
+			LimitID   string         `json:"limit_id"`
+			Primary   *rolloutWindow `json:"primary"`
+			Secondary *rolloutWindow `json:"secondary"`
 		} `json:"rate_limits"`
 	} `json:"payload"`
 }
 
-// lastPrimary is the primary limit of the last token_count event that has
-// one, or nil, and the account the rollout's session_meta line names ("" when
-// it names none). Lines are read whole, however long; torn lines are skipped.
-func lastPrimary(path string) (last *primaryLimit, account string, err error) {
+// reading is the limit reading of a token_count line; nil for any other line,
+// one of another bucket, or one with no window.
+func (l rolloutLine) reading() *reading {
+	rl := l.Payload.RateLimits
+	if l.Type != "event_msg" || l.Payload.Type != "token_count" || rl == nil || (rl.LimitID != "" && rl.LimitID != codexBucket) {
+		return nil
+	}
+	r := &reading{Source: SourceSessions}
+	for _, w := range []*rolloutWindow{rl.Primary, rl.Secondary} {
+		if w != nil {
+			r.Windows = append(r.Windows, newWindow(w.UsedPercent, w.WindowMinutes, w.ResetsAt))
+		}
+	}
+	if len(r.Windows) == 0 {
+		return nil
+	}
+	if at, err := time.Parse(time.RFC3339, l.Timestamp); err == nil {
+		r.At = at
+	}
+	return r
+}
+
+// maxRolloutLine is the longest line of a rollout lastReading reads; a
+// longer one is skipped, so one line cannot take all of memory. The lines it
+// looks for, session_meta and token_count, are far shorter.
+const maxRolloutLine = 16 << 20
+
+// lastReading is the reading of the last token_count event that has one, or
+// nil, and the account the rollout's session_meta line names ("" when it names
+// none). A reading whose line states no time, or one after now, has the
+// file's. Lines longer than maxRolloutLine and torn lines are skipped. The
+// session_meta is the first line, as Codex writes it. A rollout whose first
+// line was not read as one has no reading, whatever a later line says: whose
+// it is cannot be told, and it must not pass as one that names no account.
+func lastReading(path string, now time.Time) (last *reading, account string, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, "", err
 	}
 	defer func() { _ = f.Close() }()
-	r := bufio.NewReader(f)
-	for {
-		line, err := r.ReadBytes('\n')
-		if account == "" && bytes.Contains(line, []byte(`"session_meta"`)) {
+	metaRead := false
+	err = lines.Each(bufio.NewReaderSize(f, 64*1024), maxRolloutLine, func(n int, line []byte) {
+		if n == 1 && bytes.Contains(line, []byte(`"session_meta"`)) {
 			var l rolloutLine
 			if json.Unmarshal(line, &l) == nil && l.Type == "session_meta" {
-				account = l.Payload.CreatorAccountID
+				account, metaRead = l.Payload.CreatorAccountID, true
 			}
 		}
 		if bytes.Contains(line, []byte(`"token_count"`)) {
 			var l rolloutLine
-			if json.Unmarshal(line, &l) == nil && l.Type == "event_msg" && l.Payload.Type == "token_count" &&
-				l.Payload.RateLimits != nil && l.Payload.RateLimits.Primary != nil {
-				last = l.Payload.RateLimits.Primary
+			if json.Unmarshal(line, &l) == nil {
+				if got := l.reading(); got != nil {
+					last = got
+				}
 			}
 		}
-		if errors.Is(err, io.EOF) {
-			return last, account, nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	if !metaRead {
+		return nil, "", nil
+	}
+	if last != nil && (last.At.IsZero() || last.At.After(now)) {
+		last.At = time.Time{}
+		if info, err := f.Stat(); err == nil && !info.ModTime().After(now) {
+			last.At = info.ModTime()
 		}
-		if err != nil {
-			return nil, "", err
-		}
 	}
+	return last, account, nil
 }
 
-type codexLimited struct {
-	ResetsAt time.Time `json:"resets_at"`
-	// Account is the Codex account that hit the limit, when known.
-	Account string `json:"account,omitempty"`
-}
-
-func codexLimitedPath() (string, error) {
-	dir, err := paths.StateDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "limits", "codex-limited.json"), nil
-}
-
-// MarkCodexLimited records a Codex usage-limit error: Codex is unavailable
-// until resetsAt. A zero resetsAt (the error stated no reset time) means until
-// the newest rollout's limit window resets, or for policy.CodexLimitedFallback
-// when that is unknown or past. It writes limits/codex-limited.json (mode
-// 0600).
-func MarkCodexLimited(resetsAt time.Time) error {
-	path, err := codexLimitedPath()
-	if err != nil {
-		return err
-	}
-	if resetsAt.IsZero() {
-		resetsAt = windowResetOrFallback(time.Now())
-	}
-	account := ""
-	if home, err := codexHome(); err == nil {
-		account = currentAccount(home)
-	}
-	data, err := json.Marshal(codexLimited{ResetsAt: resetsAt, Account: account})
-	if err != nil {
-		return err
-	}
-	return writeAtomic(path, append(data, '\n'))
-}
-
-// windowResetOrFallback is the newest rollout's primary limit reset when it
-// is after now, else now plus policy.CodexLimitedFallback. A rollout that
-// cannot be read counts as unknown.
-func windowResetOrFallback(now time.Time) time.Time {
+// windowResetOrFallback is when the limit that a usage-limit error without a
+// reset time hit should be over, by login's newest rollout: the reset of its
+// highest window when that one is full, else the soonest reset (the cost of
+// too early is one more refused run, of too late a week without Codex), else
+// now plus policy.CodexLimitedFallback. Only resets the rollout states, and
+// only future ones, count; a rollout that cannot be read counts as unknown.
+func windowResetOrFallback(login Login, now time.Time) time.Time {
 	fallback := now.Add(policy.CodexLimitedFallback)
-	p, err := latestPrimary()
-	if err != nil || p == nil || p.ResetsAt == nil {
+	r, _, err := latestRollout(login, now)
+	if err != nil || r == nil {
 		return fallback
 	}
-	if reset := time.Unix(*p.ResetsAt, 0); reset.After(now) {
-		return reset
+	if top, live := r.top(now); live && top.UsedPercent >= policy.CodexLimitPercent && top.ResetsAt.After(now) {
+		return top.ResetsAt
 	}
-	return fallback
-}
-
-// codexLimitedUntil is the reset time MarkCodexLimited recorded, or zero
-// (also when it was recorded for another account than the current one),
-// and the reason to give while it holds. A file that cannot be parsed counts
-// as limited for policy.CodexLimitedFallback from its mtime, so a corrupt
-// file neither fails every call nor keeps Codex off for good.
-func codexLimitedUntil() (time.Time, string, error) {
-	path, err := codexLimitedPath()
-	if err != nil {
-		return time.Time{}, "", err
-	}
-	data, err := os.ReadFile(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return time.Time{}, "", nil
-	}
-	if err != nil {
-		return time.Time{}, "", err
-	}
-	var l codexLimited
-	if json.Unmarshal(data, &l) == nil {
-		if home, err := codexHome(); err == nil && otherAccount(l.Account, currentAccount(home)) {
-			return time.Time{}, "", nil // another account's limit
+	var soonest time.Time
+	for _, w := range r.Windows {
+		if w.ResetsAt.After(now) && (soonest.IsZero() || w.ResetsAt.Before(soonest)) {
+			soonest = w.ResetsAt
 		}
-		return l.ResetsAt, "Codex usage limit reached", nil
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return time.Time{}, "", err
+	if soonest.IsZero() {
+		return fallback
 	}
-	return info.ModTime().Add(policy.CodexLimitedFallback), "Codex usage limit reached (" + path + " is unreadable)", nil
+	return soonest
 }
 
 // limitErrRe matches the Codex CLI's usage-limit message; resetRe its reset

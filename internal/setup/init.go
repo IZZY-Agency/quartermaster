@@ -64,6 +64,14 @@ type Record struct {
 	StatusLineBefore *string   `json:"statusline_before"`
 	StatusLineAfter  string    `json:"statusline_after"`
 	Time             time.Time `json:"time"`
+	// HookLine is the line init added to agterm's hooks file HooksPath (""
+	// when it added none); HookBefore: the hash of the file before, when its
+	// last line had no line break and init put one; HookCreated: init
+	// created the file.
+	HooksPath   string `json:"hooks_path,omitempty"`
+	HookLine    string `json:"hook_line,omitempty"`
+	HookBefore  string `json:"hook_before,omitempty"`
+	HookCreated bool   `json:"hook_created,omitempty"`
 }
 
 // superpowers is the plugin init offers to keep on in workers.
@@ -192,6 +200,10 @@ func Init(ctx context.Context, s Streams, o Options) error {
 	}
 
 	if err := offerStatusLine(p, settingsPath, settings, settingsExisted, &rec); err != nil {
+		return err
+	}
+
+	if err := offerHook(ctx, p, cfg.Launcher, &rec); err != nil {
 		return err
 	}
 

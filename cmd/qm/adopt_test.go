@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -36,6 +37,9 @@ type adoptAgterm struct {
 func (f *adoptAgterm) run(_ context.Context, _ string, args ...string) ([]byte, error) {
 	f.calls = append(f.calls, strings.Join(args, " "))
 	var result any = map[string]any{}
+	if args[0] == "window" {
+		result = map[string]any{"windows": []any{map[string]any{"id": "win", "open": true}}}
+	}
 	if args[0] == "tree" {
 		ws := f.workspace
 		if ws == "" {
@@ -55,11 +59,22 @@ func (f *adoptAgterm) run(_ context.Context, _ string, args ...string) ([]byte, 
 	return json.Marshal(map[string]any{"ok": true, "result": result})
 }
 
-// acted are the calls other than tree.
+// acted are the calls other than the listings and the tints.
 func (f *adoptAgterm) acted() []string {
 	var out []string
 	for _, c := range f.calls {
-		if c != "tree --json" {
+		if !strings.HasPrefix(c, "tree --json") && c != "window list --json" && !strings.HasPrefix(c, "session tint ") {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// tints are the session tint calls.
+func (f *adoptAgterm) tints() []string {
+	var out []string
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "session tint ") {
 			out = append(out, c)
 		}
 	}
@@ -89,6 +104,10 @@ func newAdoptMachine(t *testing.T) *adoptMachine {
 	terms := map[int]string{411: "s-c", 413: "s-h", 414: "s-x"}
 	swap(t, &upTermOf, func(_ context.Context, pid int) (claudecode.TermEnv, error) {
 		return claudecode.TermEnv{AgtermSession: terms[pid]}, nil
+	})
+	// Each process is in the foreground of a terminal of its own.
+	swap(t, &upForegroundOf, func(_ context.Context, pid int) (string, bool, error) {
+		return fmt.Sprintf("ttys%03d", pid), true, nil
 	})
 	swap(t, &upSelfPID, func([]claudecode.Proc) int { return m.self })
 	return m
@@ -309,7 +328,8 @@ func TestUpNoCandidatesFirstRunUnchanged(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "started coordinator") {
 		t.Fatalf("exit %d, out %q, err %q", code, out, errs)
 	}
-	if len(m.agterm.calls) != 0 {
+	// The tint pass reads each window's tabs; adoption reads the front one's.
+	if slices.Contains(m.agterm.calls, "tree --json") || len(m.agterm.acted()) != 0 {
 		t.Fatalf("adoption read agterm: %q", m.agterm.calls)
 	}
 }

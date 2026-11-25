@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/IZZY-Agency/quartermaster/internal/buildinfo"
+	"github.com/IZZY-Agency/quartermaster/internal/plain"
 )
 
 // command is one qm subcommand.
@@ -43,8 +44,17 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-// run dispatches a subcommand and returns the exit code.
+// rawOutput are the commands whose output is not shown as it is written, so
+// run leaves it alone: Claude Code reads a hook's JSON, and statusline
+// passes on the colours of the user's own status line command.
+var rawOutput = map[string]bool{"hook": true, "statusline": true}
+
+// run dispatches a subcommand and returns the exit code. What a command
+// writes passes through plain.Writer, but for rawOutput's.
 func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || !rawOutput[args[0]] {
+		stdout, stderr = plain.Writer(stdout), plain.Writer(stderr)
+	}
 	if len(args) == 0 {
 		_, _ = fmt.Fprint(stderr, usage())
 		return 2

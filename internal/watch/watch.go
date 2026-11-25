@@ -8,6 +8,8 @@ import (
 	"maps"
 	"slices"
 	"time"
+
+	"github.com/IZZY-Agency/quartermaster/internal/plain"
 )
 
 // ErrUnknownName marks a watched name the project has no worker of.
@@ -31,6 +33,9 @@ type Mark struct {
 	// GoneAt is when the disappearance was claimed (Unix nanoseconds); a
 	// mark without one is older than any snapshot.
 	GoneAt int64 `json:"gone_at,omitempty"`
+	// Tint is the tint a watch last gave the worker's tab, in the store of the
+	// tints (Deps.Tints) only.
+	Tint TintMark `json:"tint,omitzero"`
 }
 
 // Marks holds the marks by worker session id (Row.SessionID).
@@ -44,8 +49,8 @@ func (m Marks) clone() Marks {
 }
 
 // event is r's state as something to report, keyed so that one stop, one
-// silence or one disappearance is reported once: ok is false for working
-// and unknown.
+// silence or one disappearance is reported once: ok is false for working,
+// waiting and unknown.
 func event(r Row) (Mark, bool) {
 	switch r.State {
 	case Stopped:
@@ -89,8 +94,8 @@ func (m Marks) set(r Row, now time.Time) {
 	m[r.SessionID] = got
 }
 
-// supersede drops from r's marks what r, seen working in a snapshot taken at
-// observed, proves is over: a stop or a silence that activity newer than it
+// supersede drops from r's marks what r, seen live in a
+// snapshot taken at observed, proves is over: a stop or a silence that activity newer than it
 // followed, a disappearance claimed before the snapshot. A mark newer than
 // what the snapshot saw (another watch claimed it since) stays, and so does
 // one the same activity still stands behind. It says whether it changed m.
@@ -149,6 +154,14 @@ type Deps struct {
 	Now      func() time.Time
 	Sleep    func(ctx context.Context, d time.Duration) error
 	Marks    MarkStore
+	// Tint gives a worker's tab the tint of the worker's state, as read at
+	// observed; nil tints nothing. A tab that is closed or the owner's is no
+	// error; one that must not be tinted now (another session in front, a newer
+	// word by another qm) is ErrNotNow.
+	Tint func(ctx context.Context, r Row, observed time.Time) error
+	// Tints keeps what was tinted (Mark.Tint), apart from Marks: its lock is
+	// held while a watch tints, and a report must not wait for that.
+	Tints MarkStore
 	// Notify sends an event line through the user's notifier.
 	Notify func(ctx context.Context, text string) error
 	Home   string
@@ -200,7 +213,7 @@ func Run(ctx context.Context, o Options, d Deps) error {
 			if first || ctx.Err() != nil || errors.Is(err, errTimeout) {
 				return w.end(ctx, err)
 			}
-			_, _ = fmt.Fprintf(d.Err, "qm watch: %v\n", err)
+			_, _ = fmt.Fprintf(d.Err, "qm watch: %s\n", plain.Text(err.Error()))
 			continue
 		}
 		rows := s.Rows
@@ -229,6 +242,9 @@ func Run(ctx context.Context, o Options, d Deps) error {
 		lctx, cancel := w.bound(ctx, start)
 		done, err := w.step(lctx, rows, observed, first)
 		cancel()
+		if err == nil {
+			w.tint(ctx, rows, observed) // after the report, so it delays none
+		}
 		if err != nil {
 			return w.end(ctx, err)
 		}
@@ -238,17 +254,17 @@ func Run(ctx context.Context, o Options, d Deps) error {
 	}
 }
 
-// step is one check's work on rows: it clears the marks of workers at work
-// again, and reports the events it claims. done says the watch is over
+// step is one check's work on rows: it clears the marks live workers
+// supersede, and reports the events it claims. done says the watch is over
 // (something was reported, or nothing is left to wait for). An error is ctx's
 // (an interrupt, or the timeout as errTimeout).
 func (w *watcher) step(ctx context.Context, rows []Row, observed time.Time, first bool) (done bool, err error) {
 	marks, err := w.d.Marks.Load()
 	if err != nil {
-		_, _ = fmt.Fprintf(w.d.Err, "qm watch: marks not read: %v\n", err)
+		_, _ = fmt.Fprintf(w.d.Err, "qm watch: marks not read: %s\n", plain.Text(err.Error()))
 		marks = Marks{}
 	}
-	if err := w.clearWorking(ctx, rows, marks, observed); err != nil {
+	if err := w.clearLive(ctx, rows, marks, observed); err != nil {
 		return false, err
 	}
 	if marks, err = w.d.Marks.Load(); err != nil {
@@ -256,11 +272,17 @@ func (w *watcher) step(ctx context.Context, rows []Row, observed time.Time, firs
 	}
 	labels := map[string]string{}
 	var events []Row
-	waiting := 0
+	left := 0 // the workers to wait for
 	for _, r := range rows {
+		switch r.State {
+		case Working, Waiting, Silent, Unknown:
+			// A silent worker lives, so it can still stop, go silent again or
+			// go away after its silence was reported.
+			left++
+		}
+		_, isEvent := event(r)
 		switch {
-		case r.State == Working || r.State == Unknown:
-			waiting++
+		case !isEvent:
 		case marks.reported(r):
 			labels[r.SessionID] = "reported"
 		default:
@@ -286,7 +308,7 @@ func (w *watcher) step(ctx context.Context, rows []Row, observed time.Time, firs
 		}
 		// Every event was claimed by another watch: keep waiting for the rest.
 	}
-	if waiting == 0 {
+	if left == 0 {
 		if first {
 			w.print("qm watch: no worker to wait for\n")
 		} else {
@@ -311,6 +333,7 @@ type watcher struct {
 	d     Deps
 	start time.Time
 	noted bool
+	tints tinter
 }
 
 // left is the time to the timeout; ok is false without one.
@@ -398,15 +421,15 @@ func (w *watcher) note(s string) {
 	}
 }
 
-// clearWorking drops, from the marks of the workers at work again, what
-// their newer activity supersedes (Marks.supersede). The comparison is made
+// clearLive drops, from the marks of the live workers (working, waiting,
+// silent), what their newer activity, or being alive, supersedes (Marks.supersede). The comparison is made
 // on the marks as they are under the lock, not on the ones loaded earlier. A
 // store failure is printed; only the end of ctx is returned, as errTimeout
 // (the deadline) or ctx's error.
-func (w *watcher) clearWorking(ctx context.Context, rows []Row, marks Marks, observed time.Time) error {
+func (w *watcher) clearLive(ctx context.Context, rows []Row, marks Marks, observed time.Time) error {
 	var back []Row
 	for _, r := range rows {
-		if _, ok := marks[r.SessionID]; ok && r.State == Working {
+		if _, ok := marks[r.SessionID]; ok && (r.State == Working || r.State == Waiting || r.State == Silent) {
 			back = append(back, r)
 		}
 	}
@@ -434,7 +457,7 @@ func (w *watcher) stored(ctx context.Context, err error) error {
 	case ctx.Err() != nil:
 		return ctxEnd(ctx)
 	}
-	_, _ = fmt.Fprintf(w.d.Err, "qm watch: marks not saved: %v\n", err)
+	_, _ = fmt.Fprintf(w.d.Err, "qm watch: marks not saved: %s\n", plain.Text(err.Error()))
 	return nil
 }
 
@@ -476,7 +499,7 @@ func (w *watcher) report(ctx context.Context, events []Row) (int, error) {
 			}
 			// Unsaved, the marks cannot stop a second report: better twice
 			// than never.
-			_, _ = fmt.Fprintf(w.d.Err, "qm watch: marks not saved: %v\n", err)
+			_, _ = fmt.Fprintf(w.d.Err, "qm watch: marks not saved: %s\n", plain.Text(err.Error()))
 			claimed = true
 		}
 		if !claimed {
@@ -485,7 +508,7 @@ func (w *watcher) report(ctx context.Context, events []Row) (int, error) {
 		n++
 		w.print(w.line(r) + "\n")
 		if err := w.d.Notify(ctx, notice(r)); err != nil && ctx.Err() == nil {
-			_, _ = fmt.Fprintf(w.d.Err, "qm watch: %v\n", err)
+			_, _ = fmt.Fprintf(w.d.Err, "qm watch: %s\n", plain.Text(err.Error()))
 		}
 	}
 	if ctx.Err() != nil {
@@ -496,6 +519,7 @@ func (w *watcher) report(ctx context.Context, events []Row) (int, error) {
 
 // line is an event's local line, with the handoff note's path.
 func (w *watcher) line(r Row) string {
+	r.Name, r.Handoff = plain.Line(r.Name), plain.Line(r.Handoff)
 	var s string
 	switch r.State {
 	case Stopped:
@@ -514,6 +538,7 @@ func (w *watcher) line(r Row) string {
 // notice is an event as the notifier gets it: the worker's name and state,
 // never a path or the project.
 func notice(r Row) string {
+	r.Name = plain.Line(r.Name)
 	var s string
 	switch r.State {
 	case Stopped:

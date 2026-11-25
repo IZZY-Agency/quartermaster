@@ -10,6 +10,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/IZZY-Agency/quartermaster/internal/plain"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
 )
 
@@ -426,7 +427,7 @@ func (rep Report) Write(w io.Writer) {
 			if x.FindingsUnread {
 				findings = "-"
 			}
-			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s/%s\t$%.2f\t%d\t%d\t%d\t%d\t%d\t%d\t%s\n", x.Name, x.Type, x.Tier.Model, x.Tier.Effort, x.Cost, x.PeakContext, x.Compactions, x.PRs, x.Files, x.Lines, x.Rounds, findings)
+			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s/%s\t$%.2f\t%d\t%d\t%d\t%d\t%d\t%d\t%s\n", plain.Line(x.Name), plain.Line(x.Type), x.Tier.Model, x.Tier.Effort, x.Cost, x.PeakContext, x.Compactions, x.PRs, x.Files, x.Lines, x.Rounds, findings)
 		}
 		_ = tw.Flush()
 	}
@@ -435,14 +436,14 @@ func (rep Report) Write(w io.Writer) {
 		tw = tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 		_, _ = fmt.Fprintln(tw, "SESSION\tCOST\tCOMPACTIONS\tPEAK CONTEXT")
 		for _, c := range rep.Coordinators {
-			_, _ = fmt.Fprintf(tw, "%s\t$%.2f\t%d\t%d\n", c.Session, c.Cost, c.Compactions, c.PeakContext)
+			_, _ = fmt.Fprintf(tw, "%s\t$%.2f\t%d\t%d\n", plain.Line(c.Session), c.Cost, c.Compactions, c.PeakContext)
 		}
 		_ = tw.Flush()
 	}
 	if len(rep.Softened) > 0 {
 		_, _ = fmt.Fprintln(w, "\nGUARD SOFTENINGS")
 		for _, r := range rep.Softened {
-			_, _ = fmt.Fprintf(w, "%s  %s  %s\n", r.Time.Format(time.RFC3339), r.Rule, strings.TrimSpace(r.Detail))
+			_, _ = fmt.Fprintf(w, "%s  %s  %s\n", r.Time.Format(time.RFC3339), plain.Line(r.Rule), strings.TrimSpace(plain.Line(r.Detail)))
 		}
 	}
 	if rep.UnresolvedWorkers+rep.UnresolvedPRs+rep.UnknownModels > 0 {

@@ -394,7 +394,7 @@ func TestAdoptWorkersTabClaimedMeanwhile(t *testing.T) {
 		t.Fatalf("planned ref %+v", ap.Project.Sessions)
 	}
 	o := Project{
-		ID: "other-1", Root: w.wtQM, Workspace: "elsewhere", Launcher: "agterm",
+		ID: ProjectID(w.wtQM), Root: w.wtQM, Workspace: "elsewhere", Launcher: "agterm",
 		Coordinator: Session{ID: "00000000-0000-4000-8000-0000000000c8", Name: "o-coord"},
 		Sessions:    map[string]launch.SessionRef{"00000000-0000-4000-8000-0000000000c8": {Launcher: "agterm", ID: "s-h"}},
 	}
@@ -411,7 +411,7 @@ func TestAdoptWorkersTabClaimedMeanwhile(t *testing.T) {
 	if _, ok := cur.Sessions[adHand]; ok || slices.Contains(ap.Pins, "s-h") {
 		t.Fatalf("tab recorded twice: %v pins %v", cur.Sessions, ap.Pins)
 	}
-	if !notesHold(ap.Notes, "now recorded by project other-1") {
+	if !notesHold(ap.Notes, "now recorded by project "+o.ID) {
 		t.Fatalf("notes %q", ap.Notes)
 	}
 }

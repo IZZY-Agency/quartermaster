@@ -7,15 +7,18 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
 	"regexp"
 	"regexp/syntax"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
+	"github.com/IZZY-Agency/quartermaster/internal/policy"
 )
 
 // KeyEnv is the environment variable that holds the TypeSafe API key.
@@ -116,9 +119,14 @@ type Config struct {
 	// arguments when qm up is given none after "--" (its permission flag,
 	// say). CoordinatorTab is where qm up starts a coordinator: "new" (a new
 	// tab, the default) or "here" (the tab qm up runs in); see CoordinatorTab.
+	// CoordinatorModel and CoordinatorFallback are the model, and the model to
+	// fall back to, of a coordinator that starts from scratch; nil (left out)
+	// means the default; see the methods of those names.
 	Up struct {
-		ClaudeArgs     []string `json:"claude_args"`
-		CoordinatorTab string   `json:"coordinator_tab"`
+		ClaudeArgs          []string `json:"claude_args"`
+		CoordinatorTab      string   `json:"coordinator_tab"`
+		CoordinatorModel    *string  `json:"coordinator_model,omitempty"`
+		CoordinatorFallback *string  `json:"coordinator_fallback,omitempty"`
 	} `json:"up"`
 	// Watch configures qm watch. SilentMinutes is how long a worker's
 	// transcript goes unwritten before it counts as silent; nil (left out)
@@ -126,7 +134,26 @@ type Config struct {
 	Watch struct {
 		SilentMinutes *int64 `json:"silent_minutes,omitempty"`
 	} `json:"watch"`
+	// Codex configures the use of Codex. UsageRead is whether qm asks it for
+	// its usage (codex app-server); nil (left out) means yes.
+	Codex struct {
+		UsageRead *bool `json:"usage_read,omitempty"`
+	} `json:"codex"`
+	// Tint holds the sidebar colours of agterm tabs, by role (coordinator,
+	// worker) and by what a worker needs (stopped, silent, gone). A key left
+	// out (nil) means the default; an empty string means no colour. Read it
+	// with Tints.
+	Tint struct {
+		Coordinator *string `json:"coordinator,omitempty"`
+		Worker      *string `json:"worker,omitempty"`
+		Stopped     *string `json:"stopped,omitempty"`
+		Silent      *string `json:"silent,omitempty"`
+		Gone        *string `json:"gone,omitempty"`
+	} `json:"tint"`
 }
+
+// CodexUsageRead is codex.usage_read: on unless it is false.
+func (c Config) CodexUsageRead() bool { return c.Codex.UsageRead == nil || *c.Codex.UsageRead }
 
 // Defaults is the config used when there is no file; a file overrides only
 // the fields it sets.
@@ -323,6 +350,93 @@ func (c Config) CoordinatorTab() (string, error) {
 		return "here", nil
 	}
 	return "", fmt.Errorf("up.coordinator_tab is %q; it must be %q or %q", c.Up.CoordinatorTab, "new", "here")
+}
+
+// CoordinatorModel is the model a coordinator started from scratch gets:
+// up.coordinator_model, "fable" when unset, "" for none. A value that is not
+// a name routing uses is an error, returned with the default, so qm up goes
+// on with it.
+func (c Config) CoordinatorModel() (string, error) {
+	return modelName("up.coordinator_model", c.Up.CoordinatorModel, "fable")
+}
+
+// CoordinatorFallback is the model that coordinator falls back to:
+// up.coordinator_fallback, "opus" when unset, read as CoordinatorModel is.
+func (c Config) CoordinatorFallback() (string, error) {
+	return modelName("up.coordinator_fallback", c.Up.CoordinatorFallback, "opus")
+}
+
+func modelName(key string, set *string, def string) (string, error) {
+	if set == nil {
+		return def, nil
+	}
+	value := *set
+	if _, ok := policy.ModelIDs[value]; ok || value == "" {
+		return value, nil
+	}
+	return def, fmt.Errorf("%s is %q; it must be one of %s, or \"\"; it is read as the default, %q", key, value,
+		strings.Join(slices.Sorted(maps.Keys(policy.ModelIDs)), ", "), def)
+}
+
+// Tints are the colours qm gives agterm tabs: a colour name agterm accepts, or
+// "#rrggbb", in lower case; "" is no colour. Where the colour shows (icon,
+// name) is not configurable: see launch.CoordinatorTint, launch.WorkerTint
+// and launch.AttentionTint.
+type Tints struct {
+	Coordinator, Worker, Stopped, Silent, Gone string
+}
+
+// DefaultTints is the palette used when tint.* is unset: the coordinator
+// purple, workers teal; a worker that stopped orange, one that went silent
+// yellow, one that is gone red.
+var DefaultTints = Tints{Coordinator: "purple", Worker: "teal", Stopped: "orange", Silent: "yellow", Gone: "red"}
+
+// tintNames are the colour names agtermctl session tint accepts.
+var tintNames = []string{"red", "orange", "yellow", "green", "blue", "purple", "gray", "teal", "pink", "brown", "indigo", "mint"}
+
+var tintHex = regexp.MustCompile(`^#[0-9a-f]{6}$`)
+
+// NormTint checks a colour and returns it in lower case without spaces:
+// "" (no colour), a name agterm accepts, or #rrggbb. agterm folds case and
+// reports a colour back in lower case, so the lower-case form is the one qm
+// compares and remembers.
+func NormTint(color string) (string, error) {
+	c := strings.ToLower(strings.TrimSpace(color))
+	if c == "" || tintHex.MatchString(c) || slices.Contains(tintNames, c) {
+		return c, nil
+	}
+	return "", fmt.Errorf("%q is not a colour: use %s, a #rrggbb colour, or %q for none", color, strings.Join(tintNames, ", "), "")
+}
+
+// Tints is the configured palette. A colour that is not valid falls back to
+// its default and is named in the error, which joins one error per bad key,
+// so the launch goes on with the rest; a key left out is its default and ""
+// is no colour.
+func (c Config) Tints() (Tints, error) {
+	out := DefaultTints
+	var bad []error
+	for _, k := range []struct {
+		key string
+		set *string
+		dst *string
+	}{
+		{"tint.coordinator", c.Tint.Coordinator, &out.Coordinator},
+		{"tint.worker", c.Tint.Worker, &out.Worker},
+		{"tint.stopped", c.Tint.Stopped, &out.Stopped},
+		{"tint.silent", c.Tint.Silent, &out.Silent},
+		{"tint.gone", c.Tint.Gone, &out.Gone},
+	} {
+		if k.set == nil {
+			continue
+		}
+		v, err := NormTint(*k.set)
+		if err != nil {
+			bad = append(bad, fmt.Errorf("%s: %w", k.key, err))
+			continue
+		}
+		*k.dst = v
+	}
+	return out, errors.Join(bad...)
 }
 
 // Rule is a rule's switch: on, note or off. A rule not in the file is on.

@@ -290,7 +290,7 @@ func TestRouteBadInput(t *testing.T) {
 
 func TestRouteReviewCodexOn(t *testing.T) {
 	routeHermetic(t)
-	codexLook = func(string) (string, error) { return "/bin/codex", nil }
+	stubCodex(t, "exit 1\n") // a failure to ask it changes nothing
 	repo := routeRepo(t)
 	prompt := routeFile(t, t.TempDir(), "prompt.md", "Check that the notes file reads well.\n")
 	var out, errOut bytes.Buffer

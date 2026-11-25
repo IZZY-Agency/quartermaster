@@ -43,7 +43,7 @@ func TestDetectHeldCoversTheCoordinatorAfterClear(t *testing.T) {
 func TestDetectHeldElsewhereCoversBothIDs(t *testing.T) {
 	w := newAdoptWorld(t)
 	w.cleared(t)
-	o := Project{ID: "other-1", Root: w.wtQM, Coordinator: Session{ID: adCoord, Name: "o-coord"}}
+	o := Project{ID: ProjectID(w.wtQM), Root: w.wtQM, Coordinator: Session{ID: adCoord, Name: "o-coord"}}
 	got := candIDs(Detect(w.repo, []Project{o}, w.recs, DetectEnv{
 		Procs: w.procs, Live: w.live(t), Worktrees: []string{w.repo, w.wtQM, w.wtHand},
 		TranscriptPath: w.transcriptPath, SelfPID: w.selfPID,
@@ -105,7 +105,7 @@ func TestAdoptWorkersOtherProjectAliasDroppedUnderTheLock(t *testing.T) {
 func (w *adoptWorld) otherWithRecordedTab(t *testing.T) (Project, []route.Record) {
 	t.Helper()
 	o := Project{
-		ID: "other-1", Root: w.wtQM, Workspace: "elsewhere", Launcher: "agterm",
+		ID: ProjectID(w.wtQM), Root: w.wtQM, Workspace: "elsewhere", Launcher: "agterm",
 		Coordinator: Session{ID: "00000000-0000-4000-8000-0000000000c8", Name: "o-coord"},
 		Created:     now,
 	}
@@ -153,7 +153,7 @@ func TestAdoptWorkersTabRecordedMeanwhileInARecord(t *testing.T) {
 	if _, ok := cur.Sessions[adHand]; ok || slices.Contains(ap.Pins, "s-h") {
 		t.Fatalf("tab recorded twice: %v pins %v", cur.Sessions, ap.Pins)
 	}
-	if !notesHold(ap.Notes, "now recorded by project other-1") {
+	if !notesHold(ap.Notes, "now recorded by project "+ProjectID(w.wtQM)) {
 		t.Fatalf("notes %q", ap.Notes)
 	}
 }

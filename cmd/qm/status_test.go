@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -19,6 +20,7 @@ func statusHermetic(t *testing.T) string {
 	home := os.Getenv("HOME")
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, "claude"))
 	t.Setenv("PATH", filepath.Join(home, "bin"))
+	codexLook = exec.LookPath // on that PATH; routeHermetic restores it
 	t.Setenv("AGTERM_SESSION_ID", "")
 	t.Setenv("TMUX", "")
 	t.Setenv("CLAUDE_PID", "")

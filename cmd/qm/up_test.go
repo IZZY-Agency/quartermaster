@@ -38,6 +38,39 @@ type upAgterm struct {
 	idle map[string]bool
 	// fg are the foreground argv of the sessions, by id.
 	fg map[string][]string
+	// showNew lists the sessions session new opens, as agterm does.
+	showNew bool
+	// tint is the tint of each tab, "COLOR ON" as session tint was told;
+	// failTint fails every session tint.
+	tint     map[string]string
+	failTint string
+	// onTint runs before a session tint changes a tab.
+	onTint func(id string)
+}
+
+// tab shows session id as a tab whose foreground is argv, tinted ("" for
+// untinted, else "COLOR ON").
+func (f *upAgterm) tab(id, tint string, argv ...string) {
+	f.show(id)
+	if f.fg == nil {
+		f.fg = map[string][]string{}
+	}
+	if len(argv) > 0 {
+		f.fg[id] = argv
+	}
+	f.setTint(id, tint)
+}
+
+func (f *upAgterm) setTint(id, tint string) {
+	if f.tint == nil {
+		f.tint = map[string]string{}
+	}
+	f.tint[id] = tint
+}
+
+// tintCalls is every session tint call.
+func (f *upAgterm) tintCalls() []string {
+	return slices.DeleteFunc(slices.Clone(f.calls), func(c string) bool { return !strings.HasPrefix(c, "session tint ") })
 }
 
 // show lists the sessions ids (named like their id) in the workspace "proj".
@@ -62,9 +95,11 @@ func (f *upAgterm) showIdle(ids ...string) {
 	}
 }
 
-// acted is every call but the read-only tree listing.
+// acted is every call but the read-only listings and the tints.
 func (f *upAgterm) acted() []string {
-	return slices.DeleteFunc(slices.Clone(f.calls), func(c string) bool { return c == "tree --json" })
+	return slices.DeleteFunc(slices.Clone(f.calls), func(c string) bool {
+		return strings.HasPrefix(c, "tree --json") || c == "window list --json" || strings.HasPrefix(c, "session tint ")
+	})
 }
 
 func (f *upAgterm) run(_ context.Context, _ string, args ...string) ([]byte, error) {
@@ -77,10 +112,28 @@ func (f *upAgterm) run(_ context.Context, _ string, args ...string) ([]byte, err
 		}
 		f.n++
 		result = map[string]string{"id": fmt.Sprintf("s-%d", f.n)}
+		if f.showNew {
+			f.show(fmt.Sprintf("s-%d", f.n))
+		}
 	case len(args) >= 2 && args[0] == "session" && args[1] == "type":
 		// typed into a session: answered ok.
 	case len(args) >= 2 && args[0] == "workspace" && args[1] == "new":
 		result = map[string]string{"id": "w-new"}
+	case len(args) >= 2 && args[0] == "window" && args[1] == "list":
+		result = map[string]any{"windows": []any{map[string]any{"id": "win", "open": true}}}
+	case len(args) >= 3 && args[0] == "session" && args[1] == "tint":
+		id := args[slices.Index(args, "--target")+1]
+		if f.failTint != "" {
+			return nil, errors.New("agtermctl: " + f.failTint)
+		}
+		if f.onTint != nil {
+			f.onTint(id)
+		}
+		if args[2] == "clear" {
+			f.setTint(id, "")
+		} else {
+			f.setTint(id, args[2]+" "+args[slices.Index(args, "--on")+1])
+		}
 	case args[0] == "tree":
 		var sessions []any
 		for id, name := range f.open {
@@ -94,6 +147,9 @@ func (f *upAgterm) run(_ context.Context, _ string, args ...string) ([]byte, err
 			}
 			if fg, ok := f.fg[id]; ok {
 				entry["foreground"] = fg
+			}
+			if color, on, ok := strings.Cut(f.tint[id], " "); ok {
+				entry["tint"], entry["tintOn"] = color, strings.Split(on, ",")
 			}
 			sessions = append(sessions, entry)
 		}
@@ -136,6 +192,7 @@ func newUpMachine(t *testing.T) *upMachine {
 	swap(t, &upPick, func(string) (launch.Launcher, error) {
 		return launch.Agterm{Bin: "agtermctl", Run: m.term.run}, nil
 	})
+	swap(t, &upAgtermCtl, launch.Agterm{Bin: "agtermctl", Run: m.term.run})
 	swapProcs(t, func() ([]claudecode.Proc, error) { return nil, nil })
 	swap(t, &upRun, func(context.Context, string, string, ...string) ([]byte, error) {
 		return nil, errors.New("not here")
@@ -148,6 +205,7 @@ func newUpMachine(t *testing.T) *upMachine {
 		return nil
 	})
 	swap(t, &upTmuxWindow, func(string) (string, error) { return "", errors.New("no tmux") })
+	swap(t, &upClaudeVersion, func() (string, error) { return "2.1.332 (Claude Code)", nil })
 	return m
 }
 

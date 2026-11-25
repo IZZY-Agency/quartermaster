@@ -75,12 +75,13 @@ done
 # clean_make runs make for the release with nothing from the environment that
 # could change what it builds or checks: no development switch, no make
 # flags or extra makefiles (they act as command-line assignments), no Go
-# flags, workspace, toolchain switch or user go env file. The release's own
+# flags, workspace, toolchain switch or user go env file, and no Swift compiler
+# or SDK switch (DEVELOPER_DIR stays: it selects the Xcode). The release's own
 # settings are passed as make arguments.
 clean_make() {
   env -u PACKAGE_DEV -u PACKAGE_ALLOW_DIRTY -u COMMIT -u SOURCE_DATE_EPOCH -u VERIFY_FLAGS -u REQUIRE_SIGNATURE \
       -u MAKEFLAGS -u MAKEFILES -u MFLAGS -u GNUMAKEFLAGS -u MAKELEVEL \
-      -u GOFLAGS -u GOWORK -u GOTOOLCHAIN -u GOPATH -u GOPROXY -u GONOSUMDB -u GONOSUMCHECK -u GOFIPS140 \
+      -u GOFLAGS -u GOWORK -u GOTOOLCHAIN -u GOPATH -u GOPROXY -u GONOSUMDB -u GONOSUMCHECK -u GOFIPS140 -u SWIFTC -u SDKROOT -u TOOLCHAINS \
       GOENV=off make "$@"
 }
 

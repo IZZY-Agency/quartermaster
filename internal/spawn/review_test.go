@@ -102,7 +102,7 @@ func loggedReviews(t *testing.T) []route.Record {
 }
 
 func TestCodexArgs(t *testing.T) {
-	got := CodexArgs(route.CodexTier{Model: "gpt-6.2-sol", Effort: "medium"}, "/repo", "/jobs/1", "/jobs/1/findings.schema.json")
+	got := CodexArgs(route.CodexTier{Model: "gpt-6.2-sol", Effort: "medium"}, "/repo", "/jobs/1/last.txt", "/jobs/1/findings.schema.json")
 	want := []string{"exec", "-m", "gpt-6.2-sol", "-c", `model_reasoning_effort="medium"`, "-s", "read-only", "--ephemeral", "--json",
 		"-o", "/jobs/1/last.txt", "--output-schema", "/jobs/1/findings.schema.json", "-C", "/repo", "-"}
 	if !slices.Equal(got, want) {
@@ -124,7 +124,7 @@ func TestLimitErrorFallsBackToClaude(t *testing.T) {
 	if err := (ReviewRunner{Codex: codex, Claude: claude}).Run(context.Background(), dir); err != nil {
 		t.Fatal(err)
 	}
-	st, err := limits.Codex(func(string) (string, error) { return codex, nil })
+	st, err := limits.Codex(func(string) (string, error) { return codex, nil }, limits.CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestLimitErrorFallsBackToClaude(t *testing.T) {
 
 func TestNoCodexRunsClaude(t *testing.T) {
 	reviewHermetic(t)
-	st, err := limits.Codex(func(string) (string, error) { return "", os.ErrNotExist })
+	st, err := limits.Codex(func(string) (string, error) { return "", os.ErrNotExist }, limits.CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +341,7 @@ func TestCodexFailureFallsBackToClaude(t *testing.T) {
 	if s, _ := ReviewStatus(dir); s != StatusDone {
 		t.Errorf("status %q, want %q", s, StatusDone)
 	}
-	if st, err := limits.Codex(func(string) (string, error) { return codex, nil }); err != nil || !st.Available {
+	if st, err := limits.Codex(func(string) (string, error) { return codex, nil }, limits.CodexSessions); err != nil || !st.Available {
 		t.Errorf("a Codex failure that is not the limit error marked Codex limited: %+v, %v", st, err)
 	}
 	recs := loggedReviews(t)

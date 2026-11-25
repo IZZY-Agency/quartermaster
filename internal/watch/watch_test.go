@@ -46,6 +46,8 @@ type fake struct {
 	calls    int
 	now      time.Time
 	store    memStore
+	tints    memStore
+	tinting  bool
 	notified []string
 	notifyFn func(string) error
 	snapFn   func(context.Context) error
@@ -70,6 +72,7 @@ func (f *fake) deps() Deps {
 			return nil
 		},
 		Marks: &f.store,
+		Tints: &f.tints,
 		Notify: func(_ context.Context, s string) error {
 			f.notified = append(f.notified, s)
 			if f.notifyFn != nil {

@@ -54,6 +54,7 @@ func one(t *testing.T, c up.Candidate, m Machine) Row {
 func TestStates(t *testing.T) {
 	open := Turn{Known: true, Open: true, At: t0.Add(-time.Hour), PID: pid}
 	ended := Turn{Known: true, At: t0.Add(-12 * time.Minute), PID: pid}
+	paused := Turn{Known: true, At: t0.Add(-12 * time.Minute), PID: pid, Pending: true}
 	gone := machine(open, t0)
 	gone.Live = nil
 	goneEnded := machine(ended, t0)
@@ -71,6 +72,10 @@ func TestStates(t *testing.T) {
 		// The order: gone before stopped, stopped before silent.
 		{"gone wins over stopped", goneEnded, Gone, ""},
 		{"stopped wins over silent", machine(ended, t0.Add(-3*time.Hour)), Stopped, "12m"},
+		// The turn ended with something of its own still to wake it up.
+		{"waiting", machine(paused, t0.Add(-9*time.Minute)), Waiting, "9m"},
+		{"waiting goes silent", machine(paused, t0.Add(-10*time.Minute)), Silent, "10m"},
+		{"gone wins over waiting", func() Machine { m := machine(paused, t0); m.Live = nil; return m }(), Gone, ""},
 		// No turn record (adopted, older plugin): never stopped.
 		{"no turn working", machine(Turn{}, t0.Add(-time.Minute)), Working, "1m"},
 		{"no turn silent", machine(Turn{}, t0.Add(-3*time.Hour)), Silent, "1h"}, // never before its start
@@ -82,6 +87,19 @@ func TestStates(t *testing.T) {
 				t.Fatalf("got %s %q, want %s %q", r.State, r.SinceText(), tc.state, tc.since)
 			}
 		})
+	}
+}
+
+func TestWaitingOfAnotherProcessIsUnknown(t *testing.T) {
+	// The tasks of an earlier process ended with it.
+	other := Turn{Known: true, At: t0.Add(-time.Minute), PID: pid + 1, Pending: true}
+	if r := one(t, cand("w"), machine(other, t0)); r.State != Working {
+		t.Fatalf("other pid: %s, want working", r.State)
+	}
+	m := machine(Turn{Known: true, At: t0, PID: pid, Pending: true}, t0)
+	m.Detect = errors.New("ps")
+	if r := one(t, cand("w"), m); r.State != Unknown {
+		t.Fatalf("detection failed: %s, want unknown", r.State)
 	}
 }
 

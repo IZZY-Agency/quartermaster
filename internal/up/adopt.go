@@ -23,6 +23,7 @@ import (
 
 	"github.com/IZZY-Agency/quartermaster/internal/claudecode"
 	"github.com/IZZY-Agency/quartermaster/internal/launch"
+	"github.com/IZZY-Agency/quartermaster/internal/plain"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
 	"github.com/IZZY-Agency/quartermaster/internal/spawn"
 	"github.com/IZZY-Agency/quartermaster/internal/transcript"
@@ -211,12 +212,17 @@ func Detect(root string, all []Project, recs []route.Record, env DetectEnv) Dete
 				continue
 			}
 		}
-		args, _ := claudecode.IsClaude(byPID[l.PID].Cmd)
+		args, _ := claudecode.ClaudeArgs(byPID[l.PID].Cmd)
 		if printMode(args) {
 			continue
 		}
 		c := AdoptCandidate{SessionID: id, Name: l.Name, Cwd: cwd, PID: l.PID, Worker: worker[id], Self: self != 0 && l.PID == self, Subfolder: sub}
 		c.Kept, c.Dropped = claudecode.KeptFlags(args)
+		var left bool
+		named, _ := claudecode.SessionOfArgs(args)
+		if c.Kept, left = withoutDefaultModel(c.Kept, []string{id, named}, recs); left {
+			c.Dropped = append(c.Dropped, modelArg)
+		}
 		if !env.Quick {
 			if path != "" {
 				c.Started, _ = transcript.FirstAt(path)
@@ -473,7 +479,7 @@ func RenderCandidates(cands []AdoptCandidate, now time.Time) string {
 		if tabs {
 			tab = orDash(oneLine(c.Tab)) + "\t"
 		}
-		_, _ = fmt.Fprintf(tw, "%d\t%s%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", i+1, tab, oneLine(c.Name), prefix(c.SessionID), c.Cwd, orDash(c.Branch), last, ctxk, known, self)
+		_, _ = fmt.Fprintf(tw, "%d\t%s%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", i+1, tab, oneLine(c.Name), prefix(c.SessionID), plain.Line(c.Cwd), orDash(oneLine(c.Branch)), last, ctxk, known, self)
 	}
 	_ = tw.Flush()
 	return b.String()
@@ -600,8 +606,16 @@ type AdoptDeps struct {
 	// window.
 	PaneRuns func(ctx context.Context, windowID string, pid int) (bool, error)
 	TermOf   func(pid int) (claudecode.TermEnv, error)
-	Live     func() (map[string]claudecode.LiveSession, error)
-	Trusted  func(dir string) (bool, error)
+	// Live reads the running sessions: an error when it cannot tell them all
+	// (claudecode.LiveComplete), which adopts nothing.
+	Live func() (map[string]claudecode.LiveSession, error)
+	// Procs lists the running processes, and Foreground reads a process's
+	// terminal and whether the process is in its foreground
+	// (claudecode.ForegroundOf): an agterm tab is recorded for a session only
+	// when the session's own process is the tab's foreground (tabProcs). nil for either records no agterm tab.
+	Procs      func() ([]claudecode.Proc, error)
+	Foreground func(ctx context.Context, pid int) (tty string, foreground bool, err error)
+	Trusted    func(dir string) (bool, error)
 	// Running says whether process pid still runs, after its environment
 	// could not be read (nil: it does).
 	Running func(pid int) bool
@@ -643,6 +657,9 @@ func PlanAdopt(ctx context.Context, root string, all []Project, cands []AdoptCan
 	if ch.New || ch.Coordinator == "" {
 		return ap, fmt.Errorf("%w: no coordinator chosen", ErrInput)
 	}
+	if err := checkRoot(root); err != nil {
+		return ap, err
+	}
 	coord, ok := candidateByID(cands, ch.Coordinator)
 	if !ok {
 		return ap, fmt.Errorf("%w: coordinator %s is not a candidate", ErrInput, ch.Coordinator)
@@ -673,6 +690,9 @@ func PlanAdopt(ctx context.Context, root string, all []Project, cands []AdoptCan
 		return ap, err
 	}
 	t := newAdoptTerminal(d, all, recs, cands)
+	if t.incomplete != nil {
+		return ap, t.incomplete
+	}
 	if err := t.coordinator(ctx, root, all, coord); err != nil {
 		return ap, err
 	}
@@ -814,6 +834,9 @@ func PlanAdoptWorkers(ctx context.Context, p Project, all []Project, cands []Ado
 		return ap, err
 	}
 	t := newAdoptTerminal(d, all, recs, cands)
+	if t.incomplete != nil {
+		return ap, t.incomplete
+	}
 	t.workspace, t.launcher = p.Workspace, p.Launcher
 	if p.Launcher == "agterm" {
 		// The workspace the project's tabs are in, found by name: a worker in
@@ -890,6 +913,11 @@ type adoptTerminal struct {
 	// owned are the terminal sessions a project records, by refKey, with
 	// the Claude session they are recorded for: never another's to take.
 	owned map[string]string
+	// incomplete says the running sessions are not all known: nothing is
+	// adopted then (claim would refuse), so nothing is planned.
+	incomplete error
+	// tabs ties a tab to the process of the session it is planned for.
+	tabs tabProcs
 	// unverified says why the running sessions could not be read at all,
 	// "" when they were; unread are the running sessions (candidates or
 	// not) whose environment could not be read while they still ran. A tab
@@ -926,7 +954,7 @@ func refKey(ref launch.SessionRef) string { return ref.Launcher + "\x00" + ref.I
 // sessions all recorded projects already hold, as Gather reads them (their
 // state, and their worker Records in recs: effectiveSessions).
 func newAdoptTerminal(d AdoptDeps, all []Project, recs []route.Record, cands []AdoptCandidate) adoptTerminal {
-	t := adoptTerminal{d: d, agtermOf: map[string]string{}, cands: cands, owned: map[string]string{}}
+	t := adoptTerminal{d: d, agtermOf: map[string]string{}, cands: cands, owned: map[string]string{}, tabs: tabProcs{d: d}}
 	for i := range all {
 		for id, ref := range effectiveSessions(all[i], recs) {
 			if ref.ID != "" {
@@ -965,9 +993,14 @@ func newAdoptTerminal(d AdoptDeps, all []Project, recs []route.Record, cands []A
 	}
 	live, err := d.Live()
 	if err != nil {
+		var inc *claudecode.IncompleteError
+		if errors.As(err, &inc) {
+			t.incomplete = fmt.Errorf("%w; nothing adopted", err)
+		}
 		t.unverified = "the running sessions not read: " + err.Error()
 		return t
 	}
+	t.tabs.live = live
 	for id, l := range live {
 		if _, ok := candidateByID(cands, id); ok {
 			continue
@@ -1033,7 +1066,9 @@ func (t *adoptTerminal) coordinator(ctx context.Context, root string, all []Proj
 	te := t.termOf(c)
 	if te.TmuxPane != "" && t.d.PaneOf != nil {
 		sess, wid, wname, err := t.d.PaneOf(ctx, te.TmuxPane)
-		if err == nil {
+		// A TMUX_PANE inherited, or of another tmux server, names a pane that
+		// does not run the coordinator: its session is not the project's.
+		if err == nil && t.paneIs(ctx, te.TmuxPane, c) {
 			t.workspace, t.launcher = sess, "tmux"
 			ref := launch.SessionRef{Launcher: "tmux", ID: wid, Name: wname, Adopted: true}
 			if why := t.ownedElsewhere(ref, c); why != "" {
@@ -1041,23 +1076,23 @@ func (t *adoptTerminal) coordinator(ctx context.Context, root string, all []Proj
 			} else if t.alonePane(ctx, wid, c.Name) && t.paneRuns(ctx, wid, c, c.Name) {
 				t.coordRef = ref
 			}
-		} else {
-			t.notes = append(t.notes, fmt.Sprintf("%s's tmux pane %s not found: %v", c.Name, te.TmuxPane, err))
+		} else if err != nil {
+			t.notes = append(t.notes, fmt.Sprintf("%s's tmux pane %s not used: %v: no terminal session recorded; qm down leaves it open", c.Name, te.TmuxPane, err))
 		}
 	}
 	if t.launcher == "" && te.TmuxPane == "" && te.AgtermSession != "" {
 		wss := t.workspaces(ctx)
 		if w, ok := launch.FindSession(wss, te.AgtermSession); ok {
-			n := 0
-			for _, o := range wss {
-				if o.Name == w.Name {
-					n++
+			if ref, ok := t.agtermRef(ctx, w, te.AgtermSession, c, c.Name); ok {
+				n := 0
+				for _, o := range wss {
+					if o.Name == w.Name {
+						n++
+					}
 				}
-			}
-			if n > 1 {
-				return fmt.Errorf("%w: agterm has %d workspaces named %s: rename the workspace %s, then run qm up again", ErrWorkspaceName, n, w.Name, w.Name)
-			}
-			if ref, ok := t.agtermRef(w, te.AgtermSession, c, c.Name); ok {
+				if n > 1 {
+					return fmt.Errorf("%w: agterm has %d workspaces named %s: rename the workspace %s, then run qm up again", ErrWorkspaceName, n, w.Name, w.Name)
+				}
 				t.workspace, t.workspaceID, t.launcher = w.Name, w.ID, "agterm"
 				t.coordRef = ref
 			}
@@ -1080,11 +1115,12 @@ func (t *adoptTerminal) coordinator(ctx context.Context, root string, all []Proj
 // candidate c (named name), on a positive match only (adopt design 4.4):
 // the tab's foreground is a claude command that names c's session id, or
 // names none while the tab's folder is c's and no other running session
-// (candidate or not) whose environment names the tab matches it too, and no
+// (candidate or not) whose environment names the tab matches it too, c's own
+// process is the tab's foreground (tabProcs), and no
 // project records the tab for another session. Otherwise (an idle shell,
 // another program, another session, or an AGTERM_SESSION_ID inherited, say,
 // by an editor started in that tab) it is false, with a note.
-func (t *adoptTerminal) agtermRef(w launch.Workspace, id string, c AdoptCandidate, name string) (launch.SessionRef, bool) {
+func (t *adoptTerminal) agtermRef(ctx context.Context, w launch.Workspace, id string, c AdoptCandidate, name string) (launch.SessionRef, bool) {
 	i := slices.IndexFunc(w.Sessions, func(s launch.SessionRef) bool { return s.ID == id })
 	if i < 0 {
 		return launch.SessionRef{}, false
@@ -1114,6 +1150,9 @@ func (t *adoptTerminal) agtermRef(w launch.Workspace, id string, c AdoptCandidat
 			}
 		}
 	}
+	if why := t.tabs.unbound(ctx, tab, c); why != "" {
+		return refuse(why)
+	}
 	return launch.SessionRef{Launcher: "agterm", ID: tab.ID, Name: tab.Name, Adopted: true}, true
 }
 
@@ -1129,6 +1168,145 @@ func tabRuns(tab launch.SessionRef, c AdoptCandidate) (byID, ok bool) {
 		return true, sid == c.SessionID
 	}
 	return false, tab.Cwd != "" && realPath(tab.Cwd) == c.Cwd
+}
+
+// tabProcs ties an agterm tab to a process. agterm lists a tab's foreground
+// as its arguments only, no pid or terminal, so the tab's foreground is found
+// among the processes that can be it: those that run the same command, in the
+// foreground of a terminal, and whose environment names the tab, or no tab at
+// all (a process may have lost the variable). The tab is a session's own only
+// when the session's process is the one such process. The process list, and
+// each process's environment and terminal, are read once.
+type tabProcs struct {
+	d     AdoptDeps
+	live  map[string]claudecode.LiveSession
+	procs []claudecode.Proc
+	read  bool
+	terms map[int]readTerm
+	front map[int]readFront
+}
+
+// readTerm is a process's terminal session, read from its environment.
+type readTerm struct {
+	env claudecode.TermEnv
+	err error
+}
+
+// readFront says whether a process is in the foreground of a terminal.
+type readFront struct {
+	is  bool
+	err error
+}
+
+// unbound says why candidate c's process is not known to be the foreground
+// of agterm tab, "" when it is.
+func (t *tabProcs) unbound(ctx context.Context, tab launch.SessionRef, c AdoptCandidate) string {
+	if t.d.Procs == nil || t.d.Foreground == nil || t.d.TermOf == nil || c.PID <= 0 {
+		return "cannot be checked against its process"
+	}
+	if !t.read {
+		procs, err := t.d.Procs()
+		if err != nil {
+			return fmt.Sprintf("cannot be checked against its process (%v)", err)
+		}
+		t.procs, t.read = procs, true
+		t.terms, t.front = map[int]readTerm{}, map[int]readFront{}
+	}
+	own := false
+	for _, p := range t.procs {
+		if _, ok := claudecode.IsClaude(p.Cmd); !ok || otherCommand(tab.Foreground, p.Cmd) {
+			continue
+		}
+		term := t.termOf(p.PID)
+		if p.PID == c.PID {
+			if term.err != nil {
+				return fmt.Sprintf("cannot be checked against its process (environment not read: %v)", term.err)
+			}
+			if term.env.TmuxPane != "" || term.env.AgtermSession != tab.ID {
+				break
+			}
+			fg := t.inFront(ctx, p.PID)
+			if fg.err != nil {
+				return fmt.Sprintf("cannot be checked against its process (terminal not read: %v)", fg.err)
+			}
+			own = fg.is
+			continue
+		}
+		// Another claude with the tab's command: is it certainly not in it?
+		named := term.env.AgtermSession
+		if term.env.TmuxPane != "" || named != "" && named != tab.ID || named == "" && t.elsewhere(p.PID, c.Cwd) {
+			continue
+		}
+		fg := t.inFront(ctx, p.PID)
+		if fg.err != nil && t.d.Running != nil && !t.d.Running(p.PID) || fg.err == nil && !fg.is {
+			continue // it exited, or is in no terminal's foreground
+		}
+		return fmt.Sprintf("may run another claude, process %d, so its foreground is not known to be this session's process", p.PID)
+	}
+	if !own {
+		return "does not run its process in the foreground"
+	}
+	return ""
+}
+
+func (t *tabProcs) termOf(pid int) readTerm {
+	r, ok := t.terms[pid]
+	if !ok {
+		r.env, r.err = t.d.TermOf(pid)
+		if r.err != nil {
+			r.env = claudecode.TermEnv{}
+		}
+		t.terms[pid] = r
+	}
+	return r
+}
+
+func (t *tabProcs) inFront(ctx context.Context, pid int) readFront {
+	r, ok := t.front[pid]
+	if !ok {
+		var tty string
+		tty, r.is, r.err = t.d.Foreground(ctx, pid)
+		r.is = r.is && tty != ""
+		t.front[pid] = r
+	}
+	return r
+}
+
+// otherCommand says whether a tab's foreground, as agterm lists it, and a
+// process's command line, as ps prints it, are certainly two commands. ps
+// escapes what is not printable ASCII (a newline is \012), so both are
+// compared up to the first such character or backslash.
+func otherCommand(foreground, cmd string) bool {
+	a, b := strings.Join(strings.Fields(plainPrefix(foreground)), " "), strings.Join(strings.Fields(plainPrefix(cmd)), " ")
+	if plainPrefix(foreground) == foreground && plainPrefix(cmd) == cmd {
+		return a != b
+	}
+	return !strings.HasPrefix(a, b) && !strings.HasPrefix(b, a)
+}
+
+// plainPrefix is s up to its first character that is not printable ASCII, or
+// a backslash.
+func plainPrefix(s string) string {
+	if i := strings.IndexFunc(s, func(r rune) bool { return r < ' ' || r > '~' || r == '\\' }); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// elsewhere says whether process pid holds running sessions, all of them in
+// other folders than cwd.
+func (t *tabProcs) elsewhere(pid int, cwd string) bool {
+	known := false
+	for _, l := range t.live {
+		if l.PID != pid || l.Cwd == "" {
+			continue
+		}
+		if realPath(l.Cwd) == cwd {
+			return false
+		}
+		known = true
+	}
+	return known
 }
 
 // paneRuns says whether the pane of tmux window wid runs candidate c's
@@ -1152,6 +1330,22 @@ func (t *adoptTerminal) paneRuns(ctx context.Context, wid string, c AdoptCandida
 	return true
 }
 
+// paneIs says whether tmux pane (%3) is candidate c's own: it is not when it
+// runs another process in its foreground, or cannot be read (with a note).
+func (t *adoptTerminal) paneIs(ctx context.Context, pane string, c AdoptCandidate) bool {
+	if t.d.PaneRuns == nil || c.PID <= 0 {
+		return true // the window's own check refuses it
+	}
+	runs, err := t.d.PaneRuns(ctx, pane, c.PID)
+	switch {
+	case err != nil:
+		t.notes = append(t.notes, fmt.Sprintf("%s's tmux pane %s not read: %v: its tmux session not used", c.Name, pane, err))
+	case !runs:
+		t.notes = append(t.notes, fmt.Sprintf("%s's tmux pane %s does not run it in its foreground: its tmux session not used", c.Name, pane))
+	}
+	return err == nil && runs
+}
+
 // alonePane says whether tmux window wid holds one pane only, so closing it
 // closes session name's pane alone; else (or unread) a note says why no
 // terminal session is recorded.
@@ -1173,6 +1367,26 @@ func (t *adoptTerminal) alonePane(ctx context.Context, wid, name string) bool {
 	return true
 }
 
+// sameTmux says whether candidate c's pane is still in tmux window ref of
+// tmux session ws, as planned: not moved, linked or renamed since; else (or
+// unread) a note says why no terminal session is recorded for session name.
+func (t *adoptTerminal) sameTmux(ctx context.Context, c AdoptCandidate, ref launch.SessionRef, ws, name string) bool {
+	if t.d.PaneOf == nil || t.d.TermOf == nil {
+		return true
+	}
+	sess, wid, wname, err := t.d.PaneOf(ctx, t.termOf(c).TmuxPane)
+	switch {
+	case err != nil:
+		t.failed = !errors.Is(err, launch.ErrLinked)
+		t.notes = append(t.notes, fmt.Sprintf("%s: its tmux window %s not read again (%v): no terminal session recorded; qm down leaves it open", name, ref.ID, err))
+		return false
+	case sess != ws || wid != ref.ID || wname != ref.Name:
+		t.notes = append(t.notes, fmt.Sprintf("%s: its tmux window %s was moved or renamed meanwhile: no terminal session recorded; qm down leaves it open", name, ref.ID))
+		return false
+	}
+	return true
+}
+
 // worker is the recorded ref of worker c (named name), and its move into
 // the project's agterm workspace when it is in another one.
 func (t *adoptTerminal) worker(ctx context.Context, c AdoptCandidate, name string) (launch.SessionRef, *AdoptMove) {
@@ -1189,7 +1403,7 @@ func (t *adoptTerminal) worker(ctx context.Context, c AdoptCandidate, name strin
 		if !ok {
 			return launch.SessionRef{}, nil
 		}
-		ref, ok := t.agtermRef(w, te.AgtermSession, c, name)
+		ref, ok := t.agtermRef(ctx, w, te.AgtermSession, c, name)
 		if !ok {
 			return launch.SessionRef{}, nil
 		}
@@ -1202,7 +1416,12 @@ func (t *adoptTerminal) worker(ctx context.Context, c AdoptCandidate, name strin
 			return launch.SessionRef{}, nil
 		}
 		sess, wid, wname, err := t.d.PaneOf(ctx, te.TmuxPane)
-		if err != nil || sess != t.workspace {
+		switch {
+		case err != nil:
+			t.notes = append(t.notes, fmt.Sprintf("%s's tmux pane %s not used: %v: no terminal session recorded; qm down leaves it open", name, te.TmuxPane, err))
+			return launch.SessionRef{}, nil
+		case sess != t.workspace:
+			t.notes = append(t.notes, fmt.Sprintf("%s: its tmux window %s is in tmux session %s, not the project's %s: no terminal session recorded; qm down leaves it open", name, wid, oneLine(sess), oneLine(t.workspace)))
 			return launch.SessionRef{}, nil
 		}
 		ref := launch.SessionRef{Launcher: "tmux", ID: wid, Name: wname, Adopted: true}
@@ -1222,14 +1441,19 @@ func (t *adoptTerminal) worker(ctx context.Context, c AdoptCandidate, name strin
 // per move and per session left alone, then the notes.
 func RenderAdopt(ap AdoptPlan) string {
 	var b strings.Builder
+	// say writes one line: nothing in it, of the names, folders and flags it
+	// shows, can start another.
+	say := func(format string, args ...any) {
+		b.WriteString(plain.Line(fmt.Sprintf(format, args...)) + "\n")
+	}
 	p := ap.Project
 	launcher := p.Launcher
 	if launcher == "" {
 		launcher = "none (no terminal session recorded)"
 	}
-	fmt.Fprintf(&b, "project %s (%s), workspace %s, launcher %s\n", p.ID, p.Root, p.Workspace, launcher)
+	say("project %s (%s), workspace %s, launcher %s", p.ID, p.Root, p.Workspace, launcher)
 	if c := ap.Coordinator; c.SessionID != "" {
-		fmt.Fprintf(&b, "adopt coordinator %s (%s) in %s, %s, resumes with: %s%s\n",
+		say("adopt coordinator %s (%s) in %s, %s, resumes with: %s%s",
 			p.Coordinator.Name, prefix(c.SessionID), c.Cwd, modelEffort(c.Kept), flagsText(p.ClaudeArgs), droppedText(c.Dropped))
 	}
 	for _, w := range ap.Workers {
@@ -1238,25 +1462,25 @@ func RenderAdopt(ap AdoptPlan) string {
 			continue
 		}
 		if w.Worker {
-			fmt.Fprintf(&b, "adopt worker %s (%s) in %s, qm worker, %s, resumes with: its launch profile\n",
+			say("adopt worker %s (%s) in %s, qm worker, %s, resumes with: its launch profile",
 				w.Name, prefix(w.SessionID), w.Cwd, modelEffort(w.Kept))
 			continue
 		}
-		fmt.Fprintf(&b, "adopt worker %s (%s) in %s, hand-started, %s, resumes with: %s%s\n",
+		say("adopt worker %s (%s) in %s, hand-started, %s, resumes with: %s%s",
 			a.Name, prefix(w.SessionID), w.Cwd, modelEffort(w.Kept), flagsText(w.Kept), droppedText(w.Dropped))
 	}
 	for _, m := range ap.Moves {
-		fmt.Fprintf(&b, "move %s (agterm %s) from workspace %s to %s\n", m.Name, m.SessionID, m.From, m.To)
+		say("move %s (agterm %s) from workspace %s to %s", m.Name, m.SessionID, m.From, m.To)
 	}
 	for _, l := range ap.Left {
 		if l.Subfolder {
-			fmt.Fprintf(&b, "not adopted: %s (%s), %s in %s\n", oneLine(l.Name), prefix(l.SessionID), subfolderNote, l.Cwd)
+			say("not adopted: %s (%s), %s in %s", oneLine(l.Name), prefix(l.SessionID), subfolderNote, l.Cwd)
 			continue
 		}
-		fmt.Fprintf(&b, "not adopted: %s (%s)\n", oneLine(l.Name), prefix(l.SessionID))
+		say("not adopted: %s (%s)", oneLine(l.Name), prefix(l.SessionID))
 	}
 	for _, n := range ap.Notes {
-		fmt.Fprintf(&b, "note: %s\n", n)
+		say("note: %s", n)
 	}
 	return b.String()
 }
@@ -1359,7 +1583,7 @@ func (ap *AdoptPlan) claim(ctx context.Context, d AdoptDeps) (saved bool, err er
 		}
 		ap.Workers = kept
 	}
-	ap.recheckTabs(ctx, d)
+	ap.recheckTabs(ctx, d, live)
 	if err := ap.recheckHeld(d, live); err != nil {
 		return false, err
 	}
@@ -1415,7 +1639,14 @@ func (ap *AdoptPlan) recheckHeld(d AdoptDeps, live map[string]claudecode.LiveSes
 		}
 		return ""
 	}
+	starting, err := startingNow(live)
+	if err != nil {
+		return err
+	}
 	if !ap.Later {
+		if starting[ap.Coordinator.SessionID] {
+			return fmt.Errorf("coordinator %s not adopted: qm spawn worker is starting that session; nothing adopted", ap.Project.Coordinator.Name)
+		}
 		if h := holder(ap.Coordinator.SessionID); h != "" {
 			return fmt.Errorf("coordinator %s not adopted: now held by project %s; nothing adopted", ap.Project.Coordinator.Name, h)
 		}
@@ -1450,6 +1681,10 @@ func (ap *AdoptPlan) recheckHeld(d AdoptDeps, live map[string]claudecode.LiveSes
 			ap.forget(w, "not adopted: now held by project "+h)
 			continue
 		}
+		if starting[w.SessionID] {
+			ap.forget(w, "not adopted: qm spawn worker is still starting it")
+			continue
+		}
 		if ap.Later && heldBy[ap.Project.ID][w.SessionID] {
 			ap.forget(w, "not adopted: its process holds a session the project already has (its coordinator after /clear, say)")
 			continue
@@ -1463,13 +1698,14 @@ func (ap *AdoptPlan) recheckHeld(d AdoptDeps, live map[string]claudecode.LiveSes
 // recheckTabs repeats, after the confirmation, the checks that gave each
 // planned terminal session to its session. An agterm tab: still listed in
 // the workspace it was planned in (a planned move's source, else the
-// project's workspace), its foreground still that session (tabRuns), and a
+// project's workspace), its foreground still that session (tabRuns) and the
+// process the session was planned with (tabProcs), and a
 // planned move's destination still the one workspace of that name and id. A tmux
 // window: still one pane, which runs the session's process in its
 // foreground. A terminal session that fails, or every agterm tab when
 // agterm cannot be read again, is not recorded: its session is adopted with
 // no terminal session, and a tab is neither moved nor pinned.
-func (ap *AdoptPlan) recheckTabs(ctx context.Context, d AdoptDeps) {
+func (ap *AdoptPlan) recheckTabs(ctx context.Context, d AdoptDeps, live map[string]claudecode.LiveSession) {
 	var ids, panes []string
 	for id, ref := range ap.Project.Sessions {
 		switch {
@@ -1485,7 +1721,7 @@ func (ap *AdoptPlan) recheckTabs(ctx context.Context, d AdoptDeps) {
 		ref := ap.Project.Sessions[id]
 		c, _ := ap.candidate(id)
 		t := adoptTerminal{d: d}
-		if !t.alonePane(ctx, ref.ID, ap.sessionName(id)) || !t.paneRuns(ctx, ref.ID, c, ap.sessionName(id)) {
+		if !t.sameTmux(ctx, c, ref, ap.Project.Workspace, ap.sessionName(id)) || !t.alonePane(ctx, ref.ID, ap.sessionName(id)) || !t.paneRuns(ctx, ref.ID, c, ap.sessionName(id)) {
 			// A probe that failed (ps or tmux) says nothing about the window:
 			// no ref is recorded, but the session is not marked Dropped, so
 			// a later run may take the window again.
@@ -1502,6 +1738,8 @@ func (ap *AdoptPlan) recheckTabs(ctx context.Context, d AdoptDeps) {
 	if d.Workspaces != nil {
 		wss, err = d.Workspaces(ctx)
 	}
+	// The processes are read after agterm's tree, as they then are.
+	tabs := tabProcs{d: d, live: live}
 	for _, id := range ids {
 		ref := ap.Project.Sessions[id]
 		c, known := ap.candidate(id)
@@ -1528,9 +1766,13 @@ func (ap *AdoptPlan) recheckTabs(ctx context.Context, d AdoptDeps) {
 			tab := w.Sessions[slices.IndexFunc(w.Sessions, func(s launch.SessionRef) bool { return s.ID == ref.ID })]
 			if _, runs := tabRuns(tab, c); tab.Idle || !runs {
 				why = "no longer runs it (its foreground changed since the plan)"
+			} else {
+				why = tabs.unbound(ctx, tab, c)
 			}
 		}
 		if why != "" {
+			// Dropped whatever the reason: a worker Record must not give back
+			// a tab that was not established.
 			ap.unref(id)
 			ap.Notes = append(ap.Notes, fmt.Sprintf("%s: its agterm tab %s %s: no terminal session recorded; qm down leaves it open", ap.sessionName(id), ref.ID, why))
 		}

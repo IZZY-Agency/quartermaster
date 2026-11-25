@@ -50,7 +50,8 @@ func TestAdoptTabRunsSomethingElse(t *testing.T) {
 func TestAdoptTabMatchesBySessionID(t *testing.T) {
 	w := newAdoptWorld(t)
 	w.inOther()
-	w.agterm.fg["s-h"] = []string{"claude", "--resume", adHand}
+	w.procs[2].Cmd = "claude --resume " + adHand
+	w.agterm.fg["s-h"] = strings.Fields(w.procs[2].Cmd)
 	w.agterm.cwd["s-h"] = filepath.Join(w.root, "elsewhere")
 	ap := w.adopt(t, allThree)
 	if got := ap.Project.Sessions[adHand]; got.ID != "s-h" || len(ap.Moves) != 1 {

@@ -19,7 +19,8 @@ telemetry. These are the only places where anything leaves it.
 |---|---|---|
 | Redacted worker briefs, redacted review prompts, the redacted recent conversation and question of the ask gate, and redacted user messages and written rules of the feedback hook | TypeSafe (`api.typesafe.ai`), to be judged by the Jev model | Only when a TypeSafe key is set, and only after the privacy gate has redacted the text and found nothing private left. Text the gate keeps local is never sent. |
 | A review prompt | The `codex` CLI on your machine, which talks to OpenAI under your own Codex login | `qm spawn review`, when Codex is installed and its limit has room. It runs read-only (`-s read-only`, `--ephemeral`). |
-| A review prompt | The `claude` CLI on your machine, which talks to Anthropic under your own Claude Code login. It runs with reading tools only (`Read`, `Grep`, `Glob`, and Bash for `git diff`, `git log`, `gh pr view` and `gh pr diff`) and no MCP servers; edits, writes and MCP tools are denied, and so is any other call that would ask for permission. Your own Claude Code allow rules and hooks still apply in it. | `qm spawn review`, when Codex is not available, or when a Codex run fails (the same prompt then goes to both). |
+| A request for the usage of your Codex account: qm's name and version, and nothing about you, your project or the review | A `codex app-server` process on your machine, which asks OpenAI under your own Codex login. Of that login qm reads the account id and, from the payload of the ID token, the user id (it opens Codex's `auth.json` for them), to tell logins apart: two members of one workspace have the same account id. It keeps only SHA-256 hashes of them, and keeps and sends none of its tokens. Codex may renew the login, and may start its plugin update, as at any start | Before a review is routed (`qm spawn review`, `qm route review`), before a review is tried again on Codex because its login was switched, and in `qm status`, when Codex is installed; when there is no `auth.json` (a login in a keyring), also before every Codex run of a review and after one that failed; not with `codex.usage_read: false`. Not again for 5 minutes after an answer and 2 after a failure, or sooner when a limit window has reset or Codex is logged in to another account; with no `auth.json`, a review's runner asks however recent the last answer or failure is; when the answer cannot be stored, at each command. It runs in the root folder, outside your projects, and what is left of its process group is ended with it, after 4 seconds at most. |
+| A review prompt | The `claude` CLI on your machine, which talks to Anthropic under your own Claude Code login. It runs with reading tools only (`Read`, `Grep`, `Glob`, and Bash for `git diff`, `git log`, `gh pr view` and `gh pr diff`) and no MCP servers; edits, writes and MCP tools are denied, and so is any other call that would ask for permission. Your own Claude Code allow rules and hooks still apply in it. | `qm spawn review`, when Codex is not available, or when a Codex run fails (the same prompt then goes to both, and to Codex a second time first when its login was switched during the run). |
 | Requests to GitHub, through your own `gh` login | GitHub | When `gh` is installed. `qm up` runs `gh auth status`, `gh pr list --head <branch>` to see whether a worker's branch was merged or closed, and `gh pr list --author @me`, which reads the numbers, titles and branches of your open pull requests for the coordinator's summary. `qm report` runs `gh pr view` on each pull request URL found in your transcripts, to read its size and state. A Claude review may itself run `gh pr view` and `gh pr diff`. |
 | The worker name and the rule name, in a message such as `<worker>: read-budget softened after 3 denials` | Your `notify` command, which may send it off the machine | Only when you set `notify` in the config, when a rule softens. |
 | A worker's name and state, in a message such as `qm watch: <worker> stopped; handoff note written` or `qm watch: <worker> silent for 10 min`; never a path or the project id | Your `notify` command, which may send it off the machine | Only when you set `notify` in the config, when `qm watch` reports a worker that stopped, went silent or went away. |
@@ -60,11 +61,21 @@ clients and suppliers in `privacy.clients`.
   - the feedback hook's copy of your message (`sessions/<session>-fb-N.txt`),
     unredacted, until the background check has read it;
   - workers' handoff notes, the summaries `qm up` writes for a fresh
-    coordinator (`up/`), the project state, launch scripts, the list of
-    pending reviews, the Claude limit file and the Codex limit file
-    (`limits/codex-limited.json`).
+    coordinator (`up/`), the project state, launch scripts and a copy of each
+    worker's brief (`launch/<session id>.md`, removed after 30 days), the workers
+    being started (`spawning/`), the list of
+    pending reviews, the Claude limit file, the Codex limit files
+    (`limits/codex-limited-<hash>.json`, one for each Codex login that hit its
+    limit; the name holds a SHA-256 hash of the account id and, when it is
+    known, one of the account and user ids; `codex-limited-unknown.json` for a
+    login that could not be told; an earlier version's `codex-limited.json`
+    holds the account id itself, and is removed after its reset) and the last Codex usage
+    (`limits/codex-usage.json`): for each limit window the percentage used, its
+    length and its reset, whether ordinary usage is allowed, when that was
+    read, the same hashes (to tell whether Codex still has that login), and the time and kind of the last failure. Its plan,
+    credits, tokens and error messages are not kept.
 - qm reads these files back as its own. A worker's handoff note, written by
-  that worker, becomes part of the first prompt of the session `qm up` starts
+  that worker, is what the first prompt points to in the session `qm up` starts
   in its place: that is how work is carried over, and it means the note's
   text steers the next session. Names, ids, branches and folders read from
   the state and the decision log are checked before they become file names or
@@ -82,5 +93,6 @@ clients and suppliers in `privacy.clients`.
   coordinator's flag, the worker gets no permission flag and follows your
   Claude Code settings.
 - The two Claude Code plugins add hooks that can deny a tool call (a raw
-  launch of a worker or a Codex review, reads past a budget) or rewrite a
+  launch of a worker or a Codex review, reads past a budget, processes ended
+  by a pattern in a worker) or rewrite a
   model or effort. Each rule has an off switch in the config.

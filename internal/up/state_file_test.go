@@ -1,6 +1,7 @@
 package up
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,42 @@ func TestSaveNeedsAFileNameID(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(filepath.Dir(dir)); len(entries) > 1 {
 		t.Errorf("state folder holds %d entries after refused saves", len(entries))
+	}
+}
+
+// A state file that LoadID would refuse is not written either.
+func TestSaveNeedsTheRootsID(t *testing.T) {
+	dir := setState(t)
+	if err := Save(Project{ID: ProjectID("/work/shop"), Root: "/work/other"}); err == nil {
+		t.Error("Save(another folder's id) succeeded, want an error")
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) > 0 {
+		t.Errorf("projects folder holds %d entries after a refused save", len(entries))
+	}
+	if err := Save(Project{ID: ProjectID("/work/shop"), Root: "/work/shop"}); err != nil {
+		t.Errorf("Save: %v", err)
+	}
+}
+
+// A state file holds text: a folder whose name is not UTF-8 would be read back
+// as another folder, so it is refused before anything is written or started.
+func TestProjectFolderNeedsUTF8(t *testing.T) {
+	dir := setState(t)
+	root := "/work/caf\xe9"
+	if err := Save(Project{ID: ProjectID(root), Root: root}); err == nil || !strings.Contains(err.Error(), "UTF-8") {
+		t.Errorf("Save: %v, want an error that says UTF-8", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) > 0 {
+		t.Errorf("projects folder holds %d entries after a refused save", len(entries))
+	}
+	asked := false
+	d := Deps{Trusted: func(string) (bool, error) { asked = true; return false, nil }}
+	if _, _, err := Start(context.Background(), root, nil, d); err == nil || !strings.Contains(err.Error(), "UTF-8") || asked {
+		t.Errorf("Start: %v, went on: %v, want an error that says UTF-8 first", err, asked)
+	}
+	coord := AdoptCandidate{SessionID: "c1", Name: "w", Cwd: realPath(root)}
+	if _, err := PlanAdopt(context.Background(), root, nil, []AdoptCandidate{coord}, Choice{Coordinator: "c1"}, nil, false, AdoptDeps{}); err == nil || !strings.Contains(err.Error(), "UTF-8") {
+		t.Errorf("PlanAdopt: %v, want an error that says UTF-8", err)
 	}
 }
 
@@ -56,6 +93,7 @@ func TestUnreadableStateFileNamesRecovery(t *testing.T) {
 		"mismatched id": `{"version": 1, "id": "other-12345678", "root": "/work/other"}`,
 		"no id":         `{"version": 1, "root": "/work/shop"}`,
 		"relative root": `{"version": 1, "id": "shop-0a1b2c3d", "root": "work/shop"}`,
+		"another root":  `{"version": 1, "id": "shop-0a1b2c3d", "root": "/work/shop"}`,
 		"no root":       `{"version": 1, "id": "shop-0a1b2c3d"}`,
 	}
 	for name, text := range cases {

@@ -127,19 +127,22 @@ var tmuxValueFlags = map[string]bool{
 // variable or a substitution ($cmd -p x, $(which claude) -p x), and a launch
 // inside another interpreter's code (python3 -c, perl -e, node -e,
 // osascript -e). Those are the known limit of this gate.
+//
+// Shells end a substitution that holds a here-document at different places, so
+// a launch that any of the readings finds is one.
 func rawLaunch(cmd string) bool {
-	segs, subs := parse(cmd)
+	return slices.ContainsFunc([]reading{readParens, readDocs, readDocsInParens}, func(r reading) bool { return r.rawLaunch(cmd) })
+}
+
+// rawLaunch is rawLaunch as one reading finds it.
+func (r reading) rawLaunch(cmd string) bool {
+	segs, subs := r.parse(cmd)
 	for _, seg := range segs {
-		if launches(launchWords(seg)) {
+		if r.launches(launchWords(seg)) {
 			return true
 		}
 	}
-	for _, s := range subs {
-		if rawLaunch(s) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(subs, r.rawLaunch)
 }
 
 // commandName is the program a command word names: its base name, with the
@@ -150,7 +153,7 @@ func commandName(word string) string {
 	var b strings.Builder
 	for i := 0; i < len(word); i++ {
 		c := word[i]
-		if end, _, ok := substitution(word, i); ok && (c == '`' || c == '$') {
+		if end, _, ok := readParens.substitution(word, i); ok && (c == '`' || c == '$') {
 			i = end
 			continue
 		}
@@ -175,35 +178,36 @@ func commandName(word string) string {
 	return filepath.Base(b.String())
 }
 
-func launches(w []string) bool {
+func (r reading) launches(w []string) bool {
 	if len(w) == 0 {
 		return false
 	}
 	args := w[1:]
 	switch name := commandName(w[0]); name {
 	case "codex":
-		return codexLaunch(args)
+		return r.codexLaunch(args)
 	case "eval":
 		if len(args) > 0 && args[0] == "--" {
 			args = args[1:]
 		}
-		return rawLaunch(strings.Join(args, " "))
+		return r.rawLaunch(strings.Join(args, " "))
 	case "find":
-		return findLaunch(args)
+		return slices.ContainsFunc(findActions(args), func(a []string) bool { return r.launches(launchWords(a)) })
 	case "agtermctl":
 		for i := 0; i+1 < len(args); i++ {
 			if args[i] == "session" && args[i+1] == "new" {
-				return agtermLaunch(args[i+2:])
+				return slices.ContainsFunc(agtermCommands(args[i+2:]), r.startsClaude)
 			}
 		}
 	case "tmux":
-		return tmuxLaunch(args)
+		return slices.ContainsFunc(tmuxCommands(args), r.startsClaude)
 	case "claude":
 		return claudeLaunch(args)
 	case "fish":
-		return fishLaunch(args)
+		return slices.ContainsFunc(fishCommands(args), r.rawLaunch)
 	case "sh", "bash", "zsh", "dash", "ksh":
-		return shellLaunch(args)
+		c, ok := shellCommand(args)
+		return ok && r.rawLaunch(c)
 	}
 	return false
 }
@@ -228,18 +232,20 @@ func dropRedirects(w []string) []string {
 	return out
 }
 
-// shellLaunch tells whether a POSIX shell's arguments (sh, bash, zsh, dash,
-// ksh) run a command string that is a raw launch. The string is the first
-// operand after a -c flag (alone or in a cluster such as -lc), wherever the
-// other options sit. A first operand with no -c before it is a script,
-// which runs nothing this gate can read.
-func shellLaunch(args []string) bool {
+// shellCommand is the command string a POSIX shell's arguments (sh, bash,
+// zsh, dash, ksh) run: the first operand after a -c flag (alone or in a
+// cluster such as -lc), wherever the other options sit. A first operand with
+// no -c before it is a script, which runs nothing the guards can read.
+func shellCommand(args []string) (cmd string, ok bool) {
 	cmdNext := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case a == "--":
-			return cmdNext && i+1 < len(args) && rawLaunch(args[i+1])
+			if cmdNext && i+1 < len(args) {
+				return args[i+1], true
+			}
+			return "", false
 		case a == "--rcfile" || a == "--init-file":
 			i++
 		case strings.HasPrefix(a, "--"):
@@ -253,32 +259,29 @@ func shellLaunch(args []string) bool {
 				i++
 			}
 		default:
-			return cmdNext && rawLaunch(a)
+			return a, cmdNext
 		}
 	}
-	return false
+	return "", false
 }
 
-// fishLaunch tells whether fish's arguments run a command that is a raw
-// launch. fish runs every -c/--command and -C/--init-command value, given as
+// fishCommands are the command strings fish's arguments run: every -c/--command and -C/--init-command value, given as
 // the next word or merged with the flag (-c"cmd", --command=cmd); its
 // operands are a script and its arguments, never code.
-func fishLaunch(args []string) bool {
+func fishCommands(args []string) (cmds []string) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "--" {
-			return false
+			return cmds
 		}
 		if name, value, ok := strings.Cut(a, "="); ok && (name == "--command" || name == "--init-command") {
-			if rawLaunch(value) {
-				return true
-			}
+			cmds = append(cmds, value)
 			continue
 		}
 		switch {
 		case a == "--command" || a == "--init-command":
-			if i+1 < len(args) && rawLaunch(args[i+1]) {
-				return true
+			if i+1 < len(args) {
+				cmds = append(cmds, args[i+1])
 			}
 			i++
 		case a == "--debug" || a == "--debug-output" || a == "--features" || a == "--profile" || a == "--profile-startup":
@@ -295,22 +298,22 @@ func fishLaunch(args []string) bool {
 					i++
 					value = args[i]
 				}
-				if (c == 'c' || c == 'C') && rawLaunch(value) {
-					return true
+				if c == 'c' || c == 'C' {
+					cmds = append(cmds, value)
 				}
 				break
 			}
 		default:
-			return false
+			return cmds
 		}
 	}
-	return false
+	return cmds
 }
 
-// findLaunch tells whether one of find's -exec, -execdir, -ok or -okdir
-// actions runs a raw launch. An action's command runs to a ";" word, or to a
-// "+" right after "{}"; scanning goes on after it.
-func findLaunch(args []string) bool {
+// findActions are the commands of find's -exec, -execdir, -ok and -okdir
+// actions. An action's command runs to a ";" word, or to a "+" right after
+// "{}"; scanning goes on after it.
+func findActions(args []string) (actions [][]string) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if n, ok := findOperands[a]; ok || strings.HasPrefix(a, "-newer") {
@@ -325,12 +328,10 @@ func findLaunch(args []string) bool {
 		for j < len(args) && args[j] != ";" && (args[j] != "+" || args[j-1] != "{}") {
 			j++
 		}
-		if launches(launchWords(args[i+1 : j])) {
-			return true
-		}
+		actions = append(actions, args[i+1:j])
 		i = j
 	}
-	return false
+	return actions
 }
 
 // findOperands are find's primaries and options that take operands, with
@@ -400,7 +401,7 @@ func codexOperands(args []string) (ops []int, end int) {
 // a first operand that is a prompt rather than a subcommand (any operand
 // after "--" is one), resume or fork with a prompt after the session (or
 // after --last), cloud exec, or a sandbox whose command is a raw launch.
-func codexLaunch(args []string) bool {
+func (r reading) codexLaunch(args []string) bool {
 	ops, end := codexOperands(args)
 	if len(ops) == 0 {
 		return false
@@ -417,7 +418,7 @@ func codexLaunch(args []string) bool {
 	case first == "cloud":
 		return len(ops) > 1 && args[ops[1]] == "exec"
 	case first == "sandbox":
-		return sandboxLaunch(args[ops[0]+1:])
+		return r.sandboxLaunch(args[ops[0]+1:])
 	default:
 		return !codexCommands[first]
 	}
@@ -426,17 +427,17 @@ func codexLaunch(args []string) bool {
 // sandboxLaunch tells whether codex sandbox's arguments run a raw launch:
 // the command after its options, or, in the older form, after a platform
 // name.
-func sandboxLaunch(args []string) bool {
+func (r reading) sandboxLaunch(args []string) bool {
 	rest := sandboxCommand(args)
 	if len(rest) == 0 || rest[0] == "help" || rest[0] == "uninstall" {
 		return false
 	}
-	if launches(launchWords(rest)) {
+	if r.launches(launchWords(rest)) {
 		return true
 	}
 	switch rest[0] {
 	case "macos", "linux", "windows", "seatbelt", "landlock":
-		return launches(launchWords(sandboxCommand(rest[1:])))
+		return r.launches(launchWords(sandboxCommand(rest[1:])))
 	}
 	return false
 }
@@ -455,30 +456,27 @@ func sandboxCommand(args []string) []string {
 	return args
 }
 
-// agtermLaunch tells whether agtermctl session new's arguments start claude
-// or codex. Every --command (or --command=) anywhere is checked first, so
-// neither a value flag this list does not know nor a second --command can
-// hide one; only without any is an operand after the options read as a
-// command (agtermctl takes none today). A session without a command runs
-// the login shell, which is no launch.
-func agtermLaunch(args []string) bool {
+// agtermCommands are the commands agtermctl session new's arguments may run.
+// Every --command (or --command=) anywhere counts, so neither a value flag
+// this list does not know nor a second --command can hide one; only without
+// any is an operand after the options read as a command (agtermctl takes none
+// today). A session without a command runs the login shell.
+func agtermCommands(args []string) (cmds []string) {
 	found := false
 	for i, a := range args {
 		if v, ok := strings.CutPrefix(a, "--command="); ok {
 			found = true
-			if startsClaude(v) {
-				return true
-			}
+			cmds = append(cmds, v)
 		}
 		if a == "--command" {
 			found = true
-			if i+1 < len(args) && startsClaude(args[i+1]) {
-				return true
+			if i+1 < len(args) {
+				cmds = append(cmds, args[i+1])
 			}
 		}
 	}
 	if found {
-		return false
+		return cmds
 	}
 	for i := 0; i < len(args); i++ {
 		name, _, hasValue := strings.Cut(args[i], "=")
@@ -488,10 +486,10 @@ func agtermLaunch(args []string) bool {
 				i++
 			}
 		default:
-			return startsClaude(strings.Join(args[i:], " "))
+			return []string{strings.Join(args[i:], " ")}
 		}
 	}
-	return false
+	return nil
 }
 
 // agtermValueFlags take a value in agtermctl session new.
@@ -502,25 +500,21 @@ var agtermValueFlags = map[string]bool{
 	"--epoch": true, "--expect-panes": true,
 }
 
-// tmuxLaunch tells whether tmux new-window, new-session or send-keys starts
-// claude or codex (with any arguments) or another raw launch. Option values (the
-// window name, the target) are skipped.
-func tmuxLaunch(args []string) bool {
+// tmuxCommands are the commands tmux new-window, new-session or send-keys
+// may run. Option values (the window name, the target) are skipped.
+func tmuxCommands(args []string) []string {
 	for i, a := range args {
 		switch a {
 		case "new-window", "neww", "new-session", "new":
-			rest := tmuxOperands(args[i+1:])
-			return len(rest) > 0 && startsClaude(strings.Join(rest, " "))
-		case "send-keys", "send":
-			for _, k := range tmuxOperands(args[i+1:]) {
-				if startsClaude(k) {
-					return true
-				}
+			if rest := tmuxOperands(args[i+1:]); len(rest) > 0 {
+				return []string{strings.Join(rest, " ")}
 			}
-			return false
+			return nil
+		case "send-keys", "send":
+			return tmuxOperands(args[i+1:])
 		}
 	}
-	return false
+	return nil
 }
 
 // tmuxOperands drops a tmux subcommand's options and their values.
@@ -536,14 +530,15 @@ func tmuxOperands(args []string) []string {
 
 // startsClaude tells whether a shell command runs claude or codex in any
 // form, or another raw launch.
-func startsClaude(cmd string) bool {
-	for _, seg := range segments(cmd) {
+func (r reading) startsClaude(cmd string) bool {
+	segs, _ := r.parse(cmd)
+	for _, seg := range segs {
 		w := launchWords(seg)
 		if len(w) > 0 && (commandName(w[0]) == "claude" || commandName(w[0]) == "codex") {
 			return true
 		}
 	}
-	return rawLaunch(cmd)
+	return r.rawLaunch(cmd)
 }
 
 // claudeLaunch tells whether claude's arguments start a session with a
@@ -844,9 +839,25 @@ func envSplit(s string) []string {
 // segments splits a shell command into simple commands, each a list of
 // words. See parse.
 func segments(cmd string) [][]string {
-	segs, _ := parse(cmd)
+	segs, _ := readParens.parse(cmd)
 	return segs
 }
+
+// reading is how a here-document's body in a substitution is read, where
+// shells differ.
+type reading int
+
+const (
+	// readParens counts the parentheses and quotes in the body as everywhere
+	// else, as bash 3.2 does.
+	readParens reading = iota
+	// readDocs skips the body to the line that is its delimiter, as zsh and
+	// dash do.
+	readDocs
+	// readDocsInParens also ends the body, inside parentheses, at a line that
+	// starts with its delimiter and has a ")" after it, as bash 5.2 does.
+	readDocsInParens
+)
 
 // parse splits a shell command into simple commands, each a list of words.
 // It splits on ; & && || | newlines and parentheses; removes quotes, keeping
@@ -858,18 +869,36 @@ func segments(cmd string) [][]string {
 // command too; so are the substitutions in the body of a here-document whose
 // delimiter is not quoted, which the shell expands. It is a reader for the
 // guards, not a shell: it errs towards splitting.
-func parse(cmd string) (segs [][]string, subs []string) {
-	type heredoc struct {
-		delim  string
-		tabs   bool
-		quoted bool
-	}
+func (r reading) parse(cmd string) (segs [][]string, subs []string) {
+	segs, subs, _ = r.parseJoined(cmd)
+	return segs, subs
+}
+
+// join is how a simple command stands to the ones before it.
+type join struct {
+	// from is the first command whose output is this one's input, up to this
+	// one: the one before, or the start of the group before (( ), { }, a loop);
+	// -1 when its input is no pipe.
+	from int
+	// array: these words are the values of the array assignment that ends the
+	// last command that is none (NAME=(...)), not a command.
+	array bool
+}
+
+// parseJoined is parse with how each simple command stands to the ones before
+// it.
+func (r reading) parseJoined(cmd string) (segs [][]string, subs []string, joins []join) {
 	var (
 		seg     []string
 		word    strings.Builder
 		inWord  bool
 		quoted  bool // the word has quoting, so it is no operator
-		pending []heredoc
+		pending []hereDoc
+		shifts  = -1 // the end of the arithmetic or expansion read now, where << is a shift
+		next    = join{from: -1}
+		opens   []int // the first command in each open parenthesis
+		arrays  []bool
+		closed  = [2]int{-1, -1} // the commands of the last closed parenthesis
 	)
 	endWord := func() {
 		if inWord {
@@ -887,53 +916,37 @@ func parse(cmd string) (segs [][]string, subs []string) {
 	endSeg := func() {
 		endWord()
 		if len(seg) > 0 {
-			segs = append(segs, seg)
-			seg = nil
+			segs, joins = append(segs, seg), append(joins, next)
+			seg, next = nil, join{from: -1, array: next.array}
 		}
+	}
+	// pipedFrom is the first command whose output a "|" here takes.
+	pipedFrom := func() int {
+		last := len(segs) - 1
+		if closed[0] >= 0 && (closed[1] == last || closed[1] == last-1 && len(dropRedirects(segs[last])) == 0) {
+			return closed[0]
+		}
+		return groupStart(segs)
 	}
 	n := len(cmd)
 	for i := 0; i < n; i++ {
 		ch := cmd[i]
+		shifts = max(shifts, r.expansionEnd(cmd, i))
 		switch {
 		case ch == ' ' || ch == '\t':
 			endWord()
 		case ch == '\n':
 			endSeg()
-			// Skip the bodies of here-documents opened on this line. i
-			// stays on the newline that ends the last line read, or on the
-			// last byte when the input ends first.
-			lineAt := func(p int) (string, int) {
-				if j := strings.IndexByte(cmd[p:], '\n'); j >= 0 {
-					return cmd[p : p+j], p + j
-				}
-				return cmd[p:], n
-			}
+			// Skip the bodies of here-documents opened on this line.
 			for _, h := range pending {
 				if i+1 >= n {
 					break
 				}
-				var body strings.Builder
-				for i+1 < n {
-					line, e := lineAt(i + 1)
-					// In an unquoted body a backslash-newline joins lines,
-					// for the delimiter and for what the body expands.
-					for !h.quoted && e < n && oddBackslashes(line) {
-						var more string
-						more, e = lineAt(e + 1)
-						line = line[:len(line)-1] + more
-					}
-					i = min(e, n-1)
-					if h.tabs {
-						line = strings.TrimLeft(line, "\t")
-					}
-					if line == h.delim {
-						break
-					}
-					body.WriteString(line)
-					body.WriteByte('\n')
-				}
+				inParens := r == readDocsInParens && len(opens) > 0
+				body, end, _ := h.body(cmd, i+1, inParens)
+				i = end
 				if !h.quoted {
-					subs = append(subs, bodySubs(body.String())...)
+					subs = append(subs, r.bodySubs(body)...)
 				}
 			}
 			pending = nil
@@ -980,7 +993,7 @@ func parse(cmd string) (segs [][]string, subs []string) {
 					word.WriteByte('\\')
 					continue
 				}
-				if end, inner, ok := substitution(cmd, i); ok {
+				if end, inner, ok := r.substitution(cmd, i); ok {
 					subs = append(subs, inner)
 					word.WriteString(cmd[i : end+1])
 					i = end
@@ -989,7 +1002,7 @@ func parse(cmd string) (segs [][]string, subs []string) {
 				word.WriteByte(cmd[i])
 			}
 		case ch == '$' && i+1 < n && cmd[i+1] == '(' || ch == '`':
-			end, inner, ok := substitution(cmd, i)
+			end, inner, ok := r.substitution(cmd, i)
 			if !ok {
 				// Unclosed: split here and read on.
 				endSeg()
@@ -1013,7 +1026,24 @@ func parse(cmd string) (segs [][]string, subs []string) {
 				}
 			}
 		case ch == ';' || ch == '&' || ch == '|' || ch == '(' || ch == ')':
+			array := ch == '(' && inWord && !quoted && arrayAssign.MatchString(word.String())
 			endSeg()
+			after := i > 0 && cmd[i-1] == '|' // || and |&
+			switch {
+			case ch == '(':
+				shifts = max(shifts, r.arithmeticEnd(cmd, i))
+				opens, arrays = append(opens, len(segs)), append(arrays, next.array)
+				next.array = array
+			case ch == ')' && len(opens) > 0:
+				k := len(opens) - 1
+				closed = [2]int{opens[k], len(segs) - 1}
+				next = join{from: -1, array: arrays[k]}
+				opens, arrays = opens[:k], arrays[:k]
+			case ch == '|' && !after && len(segs) > 0:
+				next.from = pipedFrom()
+			case ch == '|' || ch == ';' || ch == '&' && !after:
+				next.from = -1
+			}
 		case ch == '>':
 			fd := ""
 			if inWord && !quoted && isDigits(word.String()) {
@@ -1045,69 +1075,12 @@ func parse(cmd string) (segs [][]string, subs []string) {
 				i += 2
 			case strings.HasPrefix(cmd[i:], "<<"):
 				seg = append(seg, "<<")
-				i += 2
-				h := heredoc{}
-				if i < n && cmd[i] == '-' {
-					h.tabs = true
-					i++
+				if i < shifts {
+					i++ // a shift
+					break
 				}
-				for i < n && (cmd[i] == ' ' || cmd[i] == '\t') {
-					i++
-				}
-				// The delimiter is one shell word; any quoting in it
-				// (which may hold blanks) leaves the body unexpanded.
-				var d strings.Builder
-			delim:
-				for ; i < n && !strings.ContainsRune(" \t\n;&|<>()", rune(cmd[i])); i++ {
-					switch {
-					case cmd[i] == '$' && i+1 < n && cmd[i+1] == '\'':
-						h.quoted = true
-						s, end := ansiC(cmd, i+2)
-						d.WriteString(s)
-						i = end
-					case cmd[i] == '$' && i+1 < n && cmd[i+1] == '"':
-						// $"..." reads as "...".
-					case cmd[i] == '\'':
-						h.quoted = true
-						j := strings.IndexByte(cmd[i+1:], '\'')
-						if j < 0 {
-							d.WriteString(cmd[i+1:])
-							i = n
-							break delim
-						}
-						d.WriteString(cmd[i+1 : i+1+j])
-						i += j + 1
-					case cmd[i] == '"':
-						h.quoted = true
-						for i++; i < n && cmd[i] != '"'; i++ {
-							if cmd[i] == '\\' && i+1 < n && strings.IndexByte("\"\\$`\n", cmd[i+1]) >= 0 {
-								i++
-								if cmd[i] == '\n' {
-									continue
-								}
-							}
-							d.WriteByte(cmd[i])
-						}
-						if i >= n {
-							break delim
-						}
-					case cmd[i] == '\\':
-						if i+1 < n && cmd[i+1] == '\n' {
-							i++ // a continued line: no quoting
-							continue
-						}
-						h.quoted = true
-						if i+1 < n {
-							i++
-							d.WriteByte(cmd[i])
-						}
-					default:
-						d.WriteByte(cmd[i])
-					}
-				}
-				i--
-				if d.Len() > 0 || h.quoted {
-					h.delim = d.String()
+				h, end, ok := readHereDoc(cmd, i)
+				if i = end - 1; ok {
 					pending = append(pending, h)
 				}
 			default:
@@ -1119,7 +1092,38 @@ func parse(cmd string) (segs [][]string, subs []string) {
 		}
 	}
 	endSeg()
-	return segs, subs
+	return segs, subs, joins
+}
+
+// arrayAssign is a word that opens an array assignment before its "(".
+var arrayAssign = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*\+?=$`)
+
+// groupWords open (1) and close (-1) a group of commands.
+var groupWords = map[string]int{
+	"{": 1, "if": 1, "while": 1, "until": 1, "for": 1, "case": 1, "select": 1,
+	"}": -1, "fi": -1, "done": -1, "esac": -1,
+}
+
+// groupStart is the first command of the group the last command of segs
+// closes, or that last command itself.
+func groupStart(segs [][]string) int {
+	last := len(segs) - 1
+	if groupWords[segs[last][0]] != -1 {
+		return last
+	}
+	depth := 0
+	for i := last; i >= 0; i-- {
+		for _, w := range segs[i] {
+			depth += groupWords[w]
+			if !reservedWords[w] {
+				break
+			}
+		}
+		if depth >= 0 {
+			return i
+		}
+	}
+	return 0
 }
 
 // operatorWord is a word shaped like a redirection operator parse emits.
@@ -1138,10 +1142,15 @@ func oddBackslashes(line string) bool {
 // substitution reads a command substitution starting at s[i], "$(" or a
 // backquote: end is the index of its closing ")" or backquote and inner the
 // command in it. ok is false when there is none or it is not closed.
-func substitution(s string, i int) (end int, inner string, ok bool) {
+func (r reading) substitution(s string, i int) (end int, inner string, ok bool) {
 	switch {
 	case strings.HasPrefix(s[i:], "$("):
-		if end = closingParen(s, i+2); end > 0 {
+		if end = r.closingParen(s, i+2); end > 0 {
+			if r == readDocsInParens || r.arithmeticEnd(s, i+1) == end {
+				// With its parentheses: they tell arithmetic, and where a
+				// here-document's body may end.
+				return end, s[i+1 : end+1], true
+			}
 			return end, s[i+2 : end], true
 		}
 	case s[i] == '`':
@@ -1157,13 +1166,220 @@ func substitution(s string, i int) (end int, inner string, ok bool) {
 	return 0, "", false
 }
 
+// hereDoc is a here-document: its delimiter, whether tabs at the start of its
+// lines are dropped (<<-), and whether the delimiter has quoting, which leaves
+// the body unexpanded.
+type hereDoc struct {
+	delim  string
+	tabs   bool
+	quoted bool
+}
+
+// readHereDoc reads the operator and the delimiter of the here-document that
+// opens at s[i:] ("<<"); end is the index after them. ok is false when there is
+// no delimiter.
+func readHereDoc(s string, i int) (h hereDoc, end int, ok bool) {
+	n := len(s)
+	i += 2
+	if i < n && s[i] == '-' {
+		h.tabs = true
+		i++
+	}
+	for i < n && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	// The delimiter is one shell word; any quoting in it (which may hold
+	// blanks) leaves the body unexpanded.
+	var d strings.Builder
+delim:
+	for ; i < n && !strings.ContainsRune(" \t\n;&|<>()", rune(s[i])); i++ {
+		switch {
+		case s[i] == '$' && i+1 < n && s[i+1] == '\'':
+			h.quoted = true
+			text, e := ansiC(s, i+2)
+			d.WriteString(text)
+			i = e
+		case s[i] == '$' && i+1 < n && s[i+1] == '"':
+			// $"..." reads as "...".
+		case s[i] == '\'':
+			h.quoted = true
+			j := strings.IndexByte(s[i+1:], '\'')
+			if j < 0 {
+				d.WriteString(s[i+1:])
+				i = n
+				break delim
+			}
+			d.WriteString(s[i+1 : i+1+j])
+			i += j + 1
+		case s[i] == '"':
+			h.quoted = true
+			for i++; i < n && s[i] != '"'; i++ {
+				if s[i] == '\\' && i+1 < n && strings.IndexByte("\"\\$`\n", s[i+1]) >= 0 {
+					i++
+					if s[i] == '\n' {
+						continue
+					}
+				}
+				d.WriteByte(s[i])
+			}
+			if i >= n {
+				break delim
+			}
+		case s[i] == '\\':
+			if i+1 < n && s[i+1] == '\n' {
+				i++ // a continued line: no quoting
+				continue
+			}
+			h.quoted = true
+			if i+1 < n {
+				i++
+				d.WriteByte(s[i])
+			}
+		default:
+			d.WriteByte(s[i])
+		}
+	}
+	h.delim = d.String()
+	return h, i, d.Len() > 0 || h.quoted
+}
+
+// body reads the here-document's body, which starts at s[from:]. end is the
+// index of the last byte read: the newline after the line of the delimiter,
+// the last byte of s when the input ends first (closed is false when it does so
+// without the delimiter), or, inParens, the byte before what follows the
+// delimiter on a line with a ")" after it (see readDocsInParens).
+func (h hereDoc) body(s string, from int, inParens bool) (body string, end int, closed bool) {
+	n := len(s)
+	lineAt := func(p int) (string, int) {
+		if j := strings.IndexByte(s[p:], '\n'); j >= 0 {
+			return s[p : p+j], p + j
+		}
+		return s[p:], n
+	}
+	var b strings.Builder
+	end = from - 1
+	for end+1 < n {
+		line, e := lineAt(end + 1)
+		pieces := []int{len(line)} // of a joined line, and where they start
+		starts := []int{end + 1}
+		// In an unquoted body a backslash-newline joins lines, for the
+		// delimiter and for what the body expands.
+		for !h.quoted && e < n && oddBackslashes(line) {
+			var more string
+			starts = append(starts, e+1)
+			more, e = lineAt(e + 1)
+			line = line[:len(line)-1] + more
+			pieces[len(pieces)-1]--
+			pieces = append(pieces, len(more))
+		}
+		end = min(e, n-1)
+		if h.tabs {
+			line = strings.TrimLeft(line, "\t")
+		}
+		if line == h.delim {
+			return b.String(), end, true
+		}
+		if rest, ok := strings.CutPrefix(line, h.delim); ok && inParens && strings.Contains(rest, ")") {
+			// Back over the pieces rest is in.
+			k, left := len(pieces)-1, len(rest)
+			for ; left > pieces[k]; k-- {
+				left -= pieces[k]
+			}
+			return b.String(), starts[k] + pieces[k] - left - 1, true
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String(), end, false
+}
+
+// arithmeticEnd is the index of the last ")" of the arithmetic ("((...))")
+// that opens at s[i], or -1 when none does: parentheses that do not close
+// together are a group in a group, and after "<" or ">" the first one opens a
+// process substitution. readParens reads no arithmetic.
+func (r reading) arithmeticEnd(s string, i int) int {
+	if r == readParens || !strings.HasPrefix(s[i:], "((") || i > 0 && (s[i-1] == '<' || s[i-1] == '>') {
+		return -1
+	}
+	if e := readParens.closingParen(s, i+2); e > 0 && e+1 < len(s) && s[e+1] == ')' {
+		return e + 1
+	}
+	return -1
+}
+
+// expansionEnd is the index of the bracket that closes the expansion ("${" or
+// "$[") that opens at s[i], or -1 when none does: << is a shift in it.
+// readParens reads none.
+func (r reading) expansionEnd(s string, i int) int {
+	if r == readParens || s[i] != '$' || i+1 >= len(s) || s[i+1] != '{' && s[i+1] != '[' {
+		return -1
+	}
+	open, closing := s[i+1], byte('}')
+	if open == '[' {
+		closing = ']'
+	}
+	depth := 0
+	for i++; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++
+		case '\'':
+			j := strings.IndexByte(s[i+1:], '\'')
+			if j < 0 {
+				return -1
+			}
+			i += j + 1
+		case '(':
+			if s[i-1] == '$' {
+				e := readParens.closingParen(s, i+1)
+				if e < 0 {
+					return -1
+				}
+				i = e
+			}
+		case open:
+			depth++
+		case closing:
+			if depth--; depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 // closingParen is the index of the ")" that closes a "(" just before from,
 // or -1. Parentheses inside quotes, after a backslash or in a nested
 // substitution's quotes do not count.
-func closingParen(s string, from int) int {
+func (r reading) closingParen(s string, from int) int {
+	if e := r.arithmeticEnd(s, from-1); e > 0 {
+		return e
+	}
 	depth := 1
+	var docs []hereDoc // the here-documents opened on this line
+	shifts := -1       // the end of the expansion read now, where << is a shift
 	for i := from; i < len(s); i++ {
+		shifts = max(shifts, r.expansionEnd(s, i))
 		switch s[i] {
+		case '<':
+			switch {
+			case strings.HasPrefix(s[i:], "<<<"):
+				i += 2
+			case i < shifts:
+			case r != readParens && strings.HasPrefix(s[i:], "<<"):
+				h, end, ok := readHereDoc(s, i)
+				if i = end - 1; ok {
+					docs = append(docs, h)
+				}
+			}
+		case '\n':
+			for _, h := range docs {
+				// One that is not closed is none: what follows is read on.
+				if _, end, closed := h.body(s, i+1, r == readDocsInParens); closed {
+					i = end
+				}
+			}
+			docs = nil
 		case '#':
 			// A comment at a word's start runs to the end of its line.
 			if i == from || strings.IndexByte(" \t\n;&|()", s[i-1]) >= 0 {
@@ -1171,7 +1387,7 @@ func closingParen(s string, from int) int {
 				if j < 0 {
 					return -1
 				}
-				i += j
+				i += j - 1 // the newline is read next
 			}
 		case '\\':
 			i++
@@ -1195,7 +1411,7 @@ func closingParen(s string, from int) int {
 				case s[i] == '\\':
 					i++
 				case strings.HasPrefix(s[i:], "$("):
-					e := closingParen(s, i+2)
+					e := r.closingParen(s, i+2)
 					if e < 0 {
 						return -1
 					}
@@ -1206,6 +1422,10 @@ func closingParen(s string, from int) int {
 				return -1
 			}
 		case '(':
+			if e := r.arithmeticEnd(s, i); e > 0 {
+				i = e
+				continue
+			}
 			depth++
 		case ')':
 			depth--
@@ -1219,14 +1439,14 @@ func closingParen(s string, from int) int {
 
 // bodySubs returns the command substitutions in an unquoted here-document's
 // body, where quotes are plain characters.
-func bodySubs(body string) []string {
+func (r reading) bodySubs(body string) []string {
 	var out []string
 	for i := 0; i < len(body); i++ {
 		switch {
 		case body[i] == '\\':
 			i++
 		case body[i] == '$' && i+1 < len(body) && body[i+1] == '(' || body[i] == '`':
-			if end, inner, ok := substitution(body, i); ok {
+			if end, inner, ok := r.substitution(body, i); ok {
 				out = append(out, inner)
 				i = end
 			}

@@ -5,6 +5,7 @@ package reviewin
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/IZZY-Agency/quartermaster/internal/declog"
+	"github.com/IZZY-Agency/quartermaster/internal/gitcmd"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
 )
 
@@ -150,7 +152,7 @@ func Round(project, branch, base string) (int, error) {
 		}
 		if fromWorker {
 			// A --type review session writes its review record just before
-			// its worker record (spawn.logWorker); that round counts.
+			// its worker record (spawn.workerRecords); that round counts.
 			since = since.Add(-workerSlack)
 		}
 	}
@@ -247,7 +249,7 @@ func diffStat(top, base string) (lines int, paths []string, err error) {
 // git runs git in dir and returns its stdout. A failure carries git's stderr
 // and wraps the *exec.ExitError, so callers can read the exit code.
 func git(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd := gitcmd.Command(context.Background(), dir, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {

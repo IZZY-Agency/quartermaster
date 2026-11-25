@@ -46,7 +46,7 @@ const helperTimeout = 10 * time.Second
 // QM_GITLEAKS), the status line, LSP and Codex rows read Claude Code's and
 // Codex's folders through CLAUDE_CONFIG_DIR, CODEX_HOME and HOME.
 func Detect(ctx context.Context, cfg config.Config, env func(string) string, look func(string) (string, error)) []Status {
-	codex, err := limits.Codex(look)
+	codex, err := limits.Codex(look, limits.CodexCached.If(cfg.CodexUsageRead()))
 	return DetectWithCodex(ctx, cfg, env, look, codex, err)
 }
 

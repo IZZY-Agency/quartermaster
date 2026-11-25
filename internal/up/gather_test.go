@@ -77,7 +77,7 @@ func newWorld(t *testing.T) *world {
 	fixture(t, filepath.Join("sessions", "301.json"), root, filepath.Join(w.claude, "sessions", "301.json"))
 	fixture(t, "claude.json", root, filepath.Join(w.claude, ".claude.json"))
 	w.project = Project{
-		ID: "repo-1a2b3c4d", Root: filepath.Join(root, "repo"), Workspace: "repo",
+		ID: ProjectID(filepath.Join(root, "repo")), Root: filepath.Join(root, "repo"), Workspace: "repo",
 		Coordinator: Session{ID: coordID, Name: "repo-coord", Started: now.Add(-5 * time.Hour)},
 	}
 	return w
@@ -505,5 +505,54 @@ func TestGatherHandStarted(t *testing.T) {
 	}
 	if !c.Started.Equal(started) || !c.LineStarted.Equal(started) || !c.Live {
 		t.Errorf("Started %v, LineStarted %v, Live %v: want the entry's start and live", c.Started, c.LineStarted, c.Live)
+	}
+}
+
+// A session whose launch was not confirmed and that never ran is given no
+// handoff note that another session of its name, one that ran or a later
+// one, may have written. Its own, with no other of the name, it keeps.
+func TestGatherUnconfirmedLaunchHandoff(t *testing.T) {
+	const firstID, otherID = "00000000-0000-4000-8000-0000000000e1", "00000000-0000-4000-8000-0000000000e2"
+	for _, c := range []struct {
+		name   string
+		detail string
+		other  string    // the other session of the name ("" for none)
+		at     time.Time // and its start
+		note   bool
+	}{
+		{"alone", "launch failed, may have started: w.sh", "", time.Time{}, true},
+		{"a retry that never ran", "launch failed, may have started: w.sh", otherID, now.Add(-time.Hour), false},
+		{"a retry, after a stopped spawn", "launch not confirmed: w.sh", otherID, now.Add(-time.Hour), false},
+		{"a retry that ran", "launch failed, may have started: w.sh", smallID, now.Add(-time.Hour), false},
+		{"an earlier one that ran", "launch failed, may have started: w.sh", smallID, now.Add(-3 * time.Hour), false},
+		{"an earlier one that never ran", "launch failed, may have started: w.sh", otherID, now.Add(-3 * time.Hour), true},
+		{"a confirmed launch", "agterm s-1", smallID, now.Add(-3 * time.Hour), true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w := newWorld(t)
+			note := w.note(t, "w", now.Add(-time.Minute))
+			r := rec(w.project.ID, firstID, "w", now.Add(-2*time.Hour))
+			r.Detail = c.detail
+			recs := []route.Record{r, rec(w.project.ID, warmID, "elsewhere", now)}
+			if c.other != "" {
+				recs = append(recs, rec(w.project.ID, c.other, "w", c.at))
+			}
+			cands, err := Gather(&w.project, recs, w.env(t, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, got := range cands {
+				want := ""
+				if c.note {
+					want = note
+				}
+				if got.SessionID == firstID && got.Handoff != want {
+					t.Errorf("handoff %q, want %q", got.Handoff, want)
+				}
+				if got.SessionID == c.other && got.Handoff != note {
+					t.Errorf("the other's handoff %q, want %q", got.Handoff, note)
+				}
+			}
+		})
 	}
 }

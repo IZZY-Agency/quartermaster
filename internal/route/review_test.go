@@ -151,7 +151,7 @@ func TestReviewSplitsLongPrompt(t *testing.T) {
 }
 
 func TestNoCodexReviewsGoToClaude(t *testing.T) {
-	st, err := limits.Codex(func(string) (string, error) { return "", errors.New("not found") })
+	st, err := limits.Codex(func(string) (string, error) { return "", errors.New("not found") }, limits.CodexSessions)
 	if err != nil {
 		t.Fatal(err)
 	}

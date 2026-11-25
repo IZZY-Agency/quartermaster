@@ -19,6 +19,7 @@ import (
 	"github.com/IZZY-Agency/quartermaster/internal/hooks"
 	"github.com/IZZY-Agency/quartermaster/internal/limits"
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
+	"github.com/IZZY-Agency/quartermaster/internal/plain"
 	"github.com/IZZY-Agency/quartermaster/internal/providers"
 	"github.com/IZZY-Agency/quartermaster/internal/setup"
 	"github.com/IZZY-Agency/quartermaster/internal/watch"
@@ -85,9 +86,7 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	}
 	r := buildStatus(context.Background(), cfg)
 	if *asJSON {
-		enc := json.NewEncoder(stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(r); err != nil {
+		if err := printJSON(stdout, r); err != nil {
 			_, _ = fmt.Fprintf(stderr, "qm status: %v\n", err)
 			return 1
 		}
@@ -98,7 +97,10 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 }
 
 func buildStatus(ctx context.Context, cfg config.Config) statusReport {
-	codex, codexErr := limits.Codex(exec.LookPath)
+	// Codex is asked here, not only shown as last read: the figure is what
+	// the command is for, the answer takes about a second, and it is asked
+	// for at most every few minutes.
+	codex, codexErr := limits.Codex(codexLook, limits.CodexAsk.If(cfg.CodexUsageRead()))
 	r := statusReport{
 		Providers:    providers.DetectWithCodex(ctx, cfg, os.Getenv, exec.LookPath, codex, codexErr),
 		Rules:        map[string]string{},
@@ -211,20 +213,8 @@ func writeStatus(w io.Writer, r statusReport) {
 	switch {
 	case r.CodexError != "":
 		p("Codex: %s\n", r.CodexError)
-	case r.Codex.Available:
-		usage := "usage unknown"
-		if r.Codex.UsageKnown {
-			usage = fmt.Sprintf("%g%% used", r.Codex.UsedPercent)
-			if !r.Codex.ResetsAt.IsZero() {
-				usage += ", resets " + r.Codex.ResetsAt.Local().Format(time.DateTime)
-			}
-		}
-		if r.Codex.Reason != "" {
-			usage += " (" + r.Codex.Reason + ")"
-		}
-		p("Codex: available, %s\n", usage)
 	default:
-		p("Codex: off: %s\n", r.Codex.Reason)
+		p("Codex: %s\n", codexLine(r.Codex, time.Now()))
 	}
 
 	if len(r.Hints) > 0 {
@@ -237,11 +227,11 @@ func writeStatus(w io.Writer, r statusReport) {
 	switch wr := r.Workers; {
 	case wr == nil:
 	case wr.Error != "":
-		p("Workers: %s\n", wr.Error)
+		p("Workers: %s\n", plain.Text(wr.Error))
 	default:
 		p("Workers (%s):\n", wr.Project)
 		if wr.Note != "" {
-			p("  note: worker states unknown: %s\n", wr.Note)
+			p("  note: worker states unknown: %s\n", plain.Line(wr.Note))
 		}
 		home, _ := os.UserHomeDir()
 		p("%s", watch.Table(wr.Rows, nil, home))

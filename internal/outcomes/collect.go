@@ -360,9 +360,11 @@ func (c Claude) NamesByID() map[string]string {
 	return out
 }
 
-// TranscriptPath finds the transcript of a Claude session id, or "".
+// TranscriptPath finds the transcript of a Claude session id, or "". An id
+// that holds a path separator or a glob character is not one: as a pattern
+// it would find another session's transcript.
 func (c Claude) TranscriptPath(sessionID string) (string, error) {
-	if sessionID == "" || strings.ContainsAny(sessionID, "/\\") {
+	if sessionID == "" || strings.ContainsAny(sessionID, `/\*?[]`) {
 		return "", nil
 	}
 	m, err := filepath.Glob(filepath.Join(c.Dir, "projects", "*", sessionID+".jsonl"))
@@ -446,6 +448,9 @@ func (c Claude) SessionTranscript(name string) (t Transcript, ok bool, err error
 // custom-title entry. The title index is built once, on first need.
 type WorkerFinder struct {
 	Claude Claude
+	// Owned are the session ids Records name: the transcript of one is never
+	// found by name for another worker, whose own launch never ran.
+	Owned  map[string]bool
 	titles map[string]string
 }
 
@@ -460,13 +465,15 @@ func (w *WorkerFinder) Find(id, name string) (Transcript, bool) {
 	if name == "" {
 		return Transcript{}, false
 	}
-	if t, ok, err := w.Claude.SessionTranscript(name); ok && err == nil {
-		return t, true
+	if s, ok, err := w.Claude.SessionByName(name); ok && err == nil && !w.Owned[s.SessionID] {
+		if t, ok, err := w.Claude.byID(s.SessionID); ok && err == nil {
+			return t, true
+		}
 	}
 	if w.titles == nil {
 		w.titles = w.Claude.TitleIndex()
 	}
-	if tid := w.titles[name]; tid != "" {
+	if tid := w.titles[name]; tid != "" && !w.Owned[tid] {
 		if t, ok, err := w.Claude.byID(tid); ok && err == nil {
 			return t, true
 		}

@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -332,5 +333,189 @@ func TestConfigBadPseudonym(t *testing.T) {
 				t.Errorf("config = %+v, want it as read", got.Privacy)
 			}
 		})
+	}
+}
+
+func TestUpCoordinatorModel(t *testing.T) {
+	names := `it must be one of fable, haiku, opus, sonnet, or ""`
+	for _, tc := range []struct {
+		json, model, fallback string
+		wantErr               []string
+	}{
+		{`{}`, "fable", "opus", nil},
+		{`{"up":{"coordinator_model":null,"coordinator_fallback":null}}`, "fable", "opus", nil},
+		{`{"up":{"coordinator_model":"opus","coordinator_fallback":"sonnet"}}`, "opus", "sonnet", nil},
+		{`{"up":{"coordinator_model":""}}`, "", "opus", nil},
+		{`{"up":{"coordinator_fallback":""}}`, "fable", "", nil},
+		{`{"up":{"coordinator_model":"gpt"}}`, "fable", "opus", []string{`up.coordinator_model is "gpt"`, names, `it is read as the default, "fable"`}},
+		{`{"up":{"coordinator_fallback":"Opus"}}`, "fable", "opus", []string{`up.coordinator_fallback is "Opus"`, names, `it is read as the default, "opus"`}},
+		{`{"up":{"coordinator_model":"a","coordinator_fallback":"b"}}`, "fable", "opus", []string{"up.coordinator_model", "up.coordinator_fallback"}},
+	} {
+		dir := isolate(t)
+		p := filepath.Join(dir, "quartermaster", "config.json")
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(tc.json), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load()
+		if err != nil {
+			t.Fatalf("%s: load: %v", tc.json, err)
+		}
+		model, modelErr := c.CoordinatorModel()
+		fallback, fallbackErr := c.CoordinatorFallback()
+		err = errors.Join(modelErr, fallbackErr)
+		if model != tc.model || fallback != tc.fallback {
+			t.Errorf("%s: model %q fallback %q; want %q, %q", tc.json, model, fallback, tc.model, tc.fallback)
+		}
+		if (err != nil) != (len(tc.wantErr) > 0) {
+			t.Errorf("%s: err = %v", tc.json, err)
+		}
+		for _, w := range tc.wantErr {
+			if err == nil || !strings.Contains(err.Error(), w) {
+				t.Errorf("%s: err %v lacks %q", tc.json, err, w)
+			}
+		}
+	}
+}
+
+func TestTintsDefaults(t *testing.T) {
+	got, err := Defaults().Tints()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Tints{Coordinator: "purple", Worker: "teal", Stopped: "orange", Silent: "yellow", Gone: "red"}
+	if got != want {
+		t.Errorf("Tints() = %+v, want %+v", got, want)
+	}
+}
+
+func TestTintsFromFile(t *testing.T) {
+	for _, tc := range []struct {
+		name, json string
+		want       Tints
+	}{
+		{"one key set, the rest default", `{"tint":{"worker":"blue"}}`,
+			Tints{Coordinator: "purple", Worker: "blue", Stopped: "orange", Silent: "yellow", Gone: "red"}},
+		{"empty means none", `{"tint":{"worker":"","gone":""}}`,
+			Tints{Coordinator: "purple", Worker: "", Stopped: "orange", Silent: "yellow", Gone: ""}},
+		{"names fold to lower case, hex too", `{"tint":{"coordinator":"Indigo","stopped":"#AbCdEf"}}`,
+			Tints{Coordinator: "indigo", Worker: "teal", Stopped: "#abcdef", Silent: "yellow", Gone: "red"}},
+		{"null keeps the default", `{"tint":{"worker":null}}`,
+			Tints{Coordinator: "purple", Worker: "teal", Stopped: "orange", Silent: "yellow", Gone: "red"}},
+		{"surrounding spaces are dropped", `{"tint":{"silent":" mint "}}`,
+			Tints{Coordinator: "purple", Worker: "teal", Stopped: "orange", Silent: "mint", Gone: "red"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := Defaults()
+			if err := json.Unmarshal([]byte(tc.json), &c); err != nil {
+				t.Fatal(err)
+			}
+			got, err := c.Tints()
+			if err != nil || got != tc.want {
+				t.Errorf("Tints() = %+v, %v; want %+v", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestTintsBadColourKeepsDefaultAndNamesKey(t *testing.T) {
+	c := Defaults()
+	if err := json.Unmarshal([]byte(`{"tint":{"worker":"chartreuse","gone":"#abc","silent":"pink"}}`), &c); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.Tints()
+	want := Tints{Coordinator: "purple", Worker: "teal", Stopped: "orange", Silent: "pink", Gone: "red"}
+	if got != want {
+		t.Errorf("Tints() = %+v, want %+v (a bad colour falls back to its default, the others stand)", got, want)
+	}
+	if err == nil {
+		t.Fatal("no error for two bad colours")
+	}
+	for _, w := range []string{"tint.worker", "chartreuse", "tint.gone", "#abc", "#rrggbb"} {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("error %q does not mention %q", err, w)
+		}
+	}
+	if strings.Contains(err.Error(), "tint.silent") {
+		t.Errorf("error %q names a good key", err)
+	}
+}
+
+func TestLoadDoesNotFailOnABadTint(t *testing.T) {
+	dir := isolate(t)
+	p := filepath.Join(dir, "quartermaster", "config.json")
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(`{"tint":{"worker":"chartreuse"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load = %v; a bad tint must not stop a command that works without it", err)
+	}
+}
+
+func TestSaveLeavesUnsetTintsOut(t *testing.T) {
+	isolate(t)
+	c := Defaults()
+	if err := Save(c); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := Path()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "purple") || strings.Contains(string(b), "teal") {
+		t.Errorf("Save wrote the default palette, so a later change of it would not reach this user:\n%s", b)
+	}
+}
+
+// A model left to the default is not written, so a later default reaches
+// this user; an empty one is the user's choice and stays.
+func TestSaveKeepsCoordinatorModelUnset(t *testing.T) {
+	isolate(t)
+	if err := Save(Defaults()); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := Path()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "coordinator_model") || strings.Contains(string(b), "coordinator_fallback") {
+		t.Errorf("Save wrote the default model:\n%s", b)
+	}
+	if err := os.WriteFile(p, []byte(`{"up":{"coordinator_model":""}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(c); err != nil {
+		t.Fatal(err)
+	}
+	if c, err = Load(); err != nil {
+		t.Fatal(err)
+	}
+	if m, err := c.CoordinatorModel(); m != "" || err != nil {
+		t.Errorf("model %q, %v after a save of an empty one", m, err)
+	}
+}
+
+func TestCodexUsageRead(t *testing.T) {
+	yes, no := true, false
+	for _, tc := range []struct {
+		v    *bool
+		want bool
+	}{{nil, true}, {&yes, true}, {&no, false}} {
+		var c Config
+		c.Codex.UsageRead = tc.v
+		if c.CodexUsageRead() != tc.want {
+			t.Errorf("usage_read %v: not %v", tc.v, tc.want)
+		}
 	}
 }

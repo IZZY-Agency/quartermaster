@@ -1,5 +1,5 @@
 // Package watch gives each unfinished worker of a qm up project a state
-// (gone, stopped, silent, working) and waits for one to stop (qm watch).
+// (gone, stopped, silent, waiting, working) and waits for one to stop (qm watch).
 package watch
 
 import (
@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/IZZY-Agency/quartermaster/internal/claudecode"
+	"github.com/IZZY-Agency/quartermaster/internal/launch"
+	"github.com/IZZY-Agency/quartermaster/internal/plain"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
 	"github.com/IZZY-Agency/quartermaster/internal/up"
 )
@@ -25,6 +27,9 @@ const (
 	Gone    State = "gone"
 	Stopped State = "stopped"
 	Silent  State = "silent"
+	// Waiting: the turn ended while something of the session's own (a
+	// background task, a scheduled wakeup) is still to wake it up.
+	Waiting State = "waiting"
 	Working State = "working"
 	// Unknown: the process list could not be read.
 	Unknown State = "unknown"
@@ -43,12 +48,14 @@ const (
 
 // Turn is a session's turn as its turn hooks recorded it; Known is false
 // when no turn hook ran (no plugin, or an older one). PID is the claude
-// process that recorded it.
+// process that recorded it. Pending says the turn ended with background
+// tasks in flight or wakeups scheduled.
 type Turn struct {
-	Known bool
-	Open  bool
-	At    time.Time
-	PID   int
+	Known   bool
+	Open    bool
+	At      time.Time
+	PID     int
+	Pending bool
 }
 
 // Machine is what rows are decided from. Detect is the process list's
@@ -95,6 +102,10 @@ type Row struct {
 	Model    string    `json:"model,omitempty"`
 	Folder   string    `json:"folder,omitempty"`
 	Handoff  string    `json:"handoff,omitempty"`
+	// Tab is the agterm tab recorded for the worker (Tabs; the zero ref when
+	// there is none), Cwd its folder.
+	Tab launch.SessionRef `json:"-"`
+	Cwd string            `json:"-"`
 }
 
 // Workers is the unfinished workers of project p (design 3.1): the workers
@@ -115,6 +126,26 @@ func Workers(p up.Project, recs []route.Record, handoffDir string) ([]up.Candida
 		out = append(out, c)
 	}
 	return out, nil
+}
+
+// Tabs are the agterm tabs recorded for the workers cands of p, by session id.
+// A tab recorded for another session of p too is left out: which of them it
+// shows is not known.
+func Tabs(p up.Project, recs []route.Record, cands []up.Candidate) map[string]launch.SessionRef {
+	recorded := up.RecordedTabs(p, recs)
+	held := map[string]int{}
+	for _, r := range recorded {
+		if r.Launcher == "agterm" {
+			held[r.ID]++
+		}
+	}
+	out := map[string]launch.SessionRef{}
+	for _, c := range cands {
+		if r := recorded[c.SessionID]; r.Launcher == "agterm" && r.ID != "" && held[r.ID] == 1 {
+			out[c.SessionID] = r
+		}
+	}
+	return out
 }
 
 // proc is a live process and the session id it runs now.
@@ -215,6 +246,7 @@ func rowOf(root string, c up.Candidate, m Machine, follow map[string]proc) Row {
 		Folder:    folder(root, c.Cwd),
 		Handoff:   c.Handoff,
 		Activity:  c.Started,
+		Cwd:       c.Cwd,
 	}
 	id, pid, live := current(c, m, follow)
 	if !live {
@@ -250,15 +282,22 @@ func rowOf(root string, c up.Candidate, m Machine, follow map[string]proc) Row {
 		r.State = Unknown
 	case !live && m.Now.Sub(c.Started) >= Grace:
 		r.State = Gone
-	case live && turn.Known && !turn.Open:
+	case live && turn.Known && !turn.Open && !turn.Pending:
 		r.State = Stopped
 		r.StopAt = turn.At
 		r.Since, r.HasSince = m.Now.Sub(turn.At), true
 	default:
-		// Working, silent, or a worker just spawned whose process is not
-		// visible yet (within Grace).
+		// Working, waiting, silent, or a worker just spawned whose process is
+		// not visible yet (within Grace). A turn that ended with a background
+		// task in flight may be open again with no start recorded (the hooks
+		// documentation does not list a background command's end among what
+		// fires UserPromptSubmit). So waiting, like working, is measured from
+		// the last activity, and goes silent.
 		r.Since, r.HasSince = m.Now.Sub(r.Activity), !r.Activity.IsZero()
 		r.State = Working
+		if live && turn.Known && !turn.Open {
+			r.State = Waiting
+		}
 		if live && r.HasSince && r.Since >= m.Silent {
 			r.State = Silent
 		}
@@ -354,7 +393,7 @@ func Table(rows []Row, labels map[string]string, home string) string {
 		if l := labels[r.SessionID]; l != "" {
 			state += " (" + l + ")"
 		}
-		lines = append(lines, []string{r.Name, state, r.SinceText(), r.ContextText(), r.Model, r.Folder})
+		lines = append(lines, []string{plain.Line(r.Name), plain.Line(state), r.SinceText(), r.ContextText(), plain.Line(r.Model), plain.Line(r.Folder)})
 	}
 	width := make([]int, len(lines[0]))
 	for _, l := range lines {
@@ -376,7 +415,7 @@ func Table(rows []Row, labels map[string]string, home string) string {
 			continue
 		}
 		if r := rows[n-1]; r.Handoff != "" && (r.State == Stopped || r.State == Gone) {
-			fmt.Fprintf(&b, "    handoff note: %s\n", Tilde(r.Handoff, home))
+			fmt.Fprintf(&b, "    handoff note: %s\n", plain.Line(Tilde(r.Handoff, home)))
 		}
 	}
 	return b.String()

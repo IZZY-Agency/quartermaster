@@ -289,7 +289,7 @@ func TestProjectWithoutAdoptionKeys(t *testing.T) {
 // AllCtx stops between project files once its context ends.
 func TestAllCtxStopsWhenCancelled(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	if err := Save(Project{ID: "p-1", Root: "/r"}); err != nil {
+	if err := Save(Project{ID: ProjectID("/r"), Root: "/r"}); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -299,5 +299,25 @@ func TestAllCtxStopsWhenCancelled(t *testing.T) {
 	}
 	if all, err := AllCtx(context.Background()); err != nil || len(all) != 1 {
 		t.Fatalf("all %v err %v", all, err)
+	}
+}
+
+// An inherited GIT_DIR and GIT_WORK_TREE must not make another repository
+// the project root.
+func TestRootIgnoresInheritedGitVariables(t *testing.T) {
+	dir, other := t.TempDir(), t.TempDir()
+	for _, d := range []string{dir, other} {
+		if out, err := exec.Command("git", "-C", d, "init", "-q").CombinedOutput(); err != nil {
+			t.Fatalf("git init: %v\n%s", err, out)
+		}
+	}
+	t.Setenv("GIT_DIR", filepath.Join(other, ".git"))
+	t.Setenv("GIT_WORK_TREE", other)
+	got, err := Root(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, _ := filepath.EvalSymlinks(dir); got != want {
+		t.Errorf("Root = %q, want %q", got, want)
 	}
 }

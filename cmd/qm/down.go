@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/IZZY-Agency/quartermaster/internal/launch"
+	"github.com/IZZY-Agency/quartermaster/internal/plain"
 	"github.com/IZZY-Agency/quartermaster/internal/up"
 )
 
@@ -31,12 +32,13 @@ func runDown(args []string, stdout, stderr io.Writer) int {
 	case err == nil, errors.Is(err, flag.ErrHelp):
 		return 0
 	case errors.Is(err, errUsage), errors.Is(err, up.ErrInput):
-		_, _ = fmt.Fprintf(stderr, "qm down: %v\n%s", err, downUsage)
+		printErr(stderr, "qm down", err)
+		_, _ = fmt.Fprint(stderr, downUsage)
 		return 2
 	case errors.Is(err, errQuiet):
 		return 1
 	default:
-		_, _ = fmt.Fprintf(stderr, "qm down: %v\n", err)
+		printErr(stderr, "qm down", err)
 		return 1
 	}
 }
@@ -60,19 +62,31 @@ func (refTerms) Sessions(ctx context.Context, launcher, workspace string) ([]lau
 // PaneRuns says whether tmux window ref's pane runs session sessionID's
 // process in its foreground; false when the session does not run.
 func (refTerms) PaneRuns(ctx context.Context, ref launch.SessionRef, sessionID string) (bool, error) {
+	// Sessions not read matter only when this one is not among those read.
 	live, err := upLive()
-	if err != nil {
-		return false, err
-	}
 	l, ok := live[sessionID]
 	if !ok {
-		return false, nil
+		return false, err
 	}
 	target := ref.ID
 	if ref.Workspace != "" {
 		target = "=" + ref.Workspace + ":" + ref.ID
 	}
 	return upPaneRuns(ctx, target, l.PID)
+}
+
+// Locate finds a window wherever it is now; a launcher that cannot find one
+// finds none.
+func (refTerms) Locate(ctx context.Context, ref launch.SessionRef) ([]launch.SessionRef, error) {
+	l, err := upPick(ref.Launcher)
+	if err != nil {
+		return nil, err
+	}
+	f, ok := l.(launch.Locator)
+	if !ok {
+		return nil, nil
+	}
+	return f.Locate(ctx, ref)
 }
 
 func (refTerms) Close(ctx context.Context, ref launch.SessionRef) error {
@@ -133,9 +147,12 @@ func downMain(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	steps, _, notes, _, err := upPlan(&p, recs, false, "closed")
+	steps, _, notes, _, inc, err := upPlan(&p, recs, false, "closed")
 	if err != nil {
 		return err
+	}
+	for i := range steps {
+		steps[i].MaybeLive = inc != nil && steps[i].Action != up.Leave
 	}
 	var listed map[string]map[string]launch.SessionRef
 	if !keepOpen {
@@ -155,32 +172,40 @@ func downMain(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 	}
-	outs := up.Down(context.Background(), &p, steps, refTerms{}, keepOpen)
+	terms := &downTerms{}
+	outs := up.Down(context.Background(), &p, steps, terms, keepOpen)
 	failed := false
 	for _, o := range outs {
 		if o.Err != nil {
 			failed = true
-			_, _ = fmt.Fprintf(stderr, "qm down: %v\n", o.Err)
+			printErr(stderr, "qm down", o.Err)
 			continue
 		}
-		skipped := o.Step.Action == up.Skip
-		switch {
-		case o.Ref.Warning == up.LeftOpen:
-			_, _ = fmt.Fprintf(stdout, "recorded %s; its %s %s %s\n", o.Step.Name, o.Ref.Launcher, o.Ref.ID, up.LeftOpen)
-		case skipped:
-			_, _ = fmt.Fprintf(stdout, "closed %s, finished or skipped (%s %s)\n", o.Step.Name, o.Ref.Launcher, o.Ref.ID)
-		case keepOpen:
-			_, _ = fmt.Fprintf(stdout, "recorded %s\n", o.Step.Name)
-		case o.Ref.ID != "":
-			_, _ = fmt.Fprintf(stdout, "closed %s (%s %s)\n", o.Step.Name, o.Ref.Launcher, o.Ref.ID)
-		default:
-			_, _ = fmt.Fprintf(stdout, "recorded %s (no terminal session to close)\n", o.Step.Name)
-		}
+		printDown(stdout, o, keepOpen)
+	}
+	if terms.note != "" {
+		printNotes(stdout, []string{terms.note})
 	}
 	if failed {
 		return errQuiet
 	}
 	return nil
+}
+
+// printDown prints what qm down did with one session.
+func printDown(stdout io.Writer, o up.Outcome, keepOpen bool) {
+	switch {
+	case up.IsLeftOpen(o.Ref.Warning):
+		printLine(stdout, "recorded %s; its %s %s %s", o.Step.Name, o.Ref.Launcher, o.Ref.ID, o.Ref.Warning)
+	case o.Step.Action == up.Skip:
+		printLine(stdout, "closed %s, finished or skipped (%s %s)", o.Step.Name, o.Ref.Launcher, o.Ref.ID)
+	case keepOpen:
+		printLine(stdout, "recorded %s", o.Step.Name)
+	case o.Ref.ID != "":
+		printLine(stdout, "closed %s (%s %s)", o.Step.Name, o.Ref.Launcher, o.Ref.ID)
+	default:
+		printLine(stdout, "recorded %s (no terminal session to close)", o.Step.Name)
+	}
 }
 
 // showDown lists what qm down records and, unless keepOpen, closes: the
@@ -207,12 +232,18 @@ func showDown(stdout io.Writer, p *up.Project, steps []up.Step, keepOpen bool, l
 				note = " (" + why + ")"
 			}
 		}
-		rows = append(rows, fmt.Sprintf("  %s %s: %s%s\n", s.Role, s.Name, term, note))
+		rows = append(rows, plain.Line(fmt.Sprintf("  %s %s: %s%s", s.Role, s.Name, term, note))+"\n")
 	}
 	verb := "will record and close"
 	if keepOpen {
 		verb = "will record (--keep-open)"
 	}
-	_, _ = fmt.Fprintf(stdout, "project %s (%s): %s %d session(s)\n%s", p.ID, p.Root, verb, len(rows), strings.Join(rows, ""))
+	_, _ = fmt.Fprintf(stdout, "project %s (%s): %s %d session(s)\n%s", p.ID, plain.Line(p.Root), verb, len(rows), strings.Join(rows, ""))
 	return len(rows)
 }
+
+// qm down finds a window that was moved only through these.
+var (
+	_ launch.Locator = refTerms{}
+	_ launch.Locator = (*downTerms)(nil)
+)

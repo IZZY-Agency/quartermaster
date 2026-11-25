@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/IZZY-Agency/quartermaster/internal/config"
 	"github.com/IZZY-Agency/quartermaster/internal/launch"
 	"github.com/IZZY-Agency/quartermaster/internal/spawn"
 )
@@ -118,5 +119,70 @@ func TestReportStartedPrintsPinWarning(t *testing.T) {
 	res.Ref.Warning = ""
 	if err := reportStarted(res, &out, &errb); err != nil || errb.Len() != 0 {
 		t.Errorf("no warning: err %v, stderr %q", err, errb.String())
+	}
+}
+
+func TestSpawnWorkerDryRunShowsTheTint(t *testing.T) {
+	routeHermetic(t)
+	t.Setenv("AGTERM_SESSION_ID", "")
+	t.Setenv("TMUX", "")
+	t.Setenv("CLAUDE_PID", "")
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(t.TempDir(), "claude"))
+	t.Setenv("QM_WORKER_PLUGIN", t.TempDir())
+	repo := routeRepo(t)
+	brief := routeFile(t, t.TempDir(), "brief.md", "Fix the typo in the readme.\n")
+	args := []string{"spawn", "worker", "--brief", brief, "--type", "docs", "--size", "S", "--hint", "sonnet/low", "--name", "w1", "--cwd", repo, "--dry-run"}
+	var out, errb bytes.Buffer
+	if code := run(args, &out, &errb); code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, errb.String())
+	}
+	if !strings.Contains(out.String(), "\ntint: teal on icon\n") {
+		t.Errorf("output lacks the default tint:\n%s", out.String())
+	}
+
+	cfgPath, err := config.Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ cfg, want, note string }{
+		{`{"tint":{"worker":""}}`, "\ntint: none\n", ""},
+		{`{"tint":{"worker":"#00FF00"}}`, "\ntint: #00ff00 on icon\n", ""},
+		{`{"tint":{"worker":"chartreuse"}}`, "\ntint: teal on icon\n", "qm spawn: note: config: tint.worker"},
+	} {
+		if err := os.WriteFile(cfgPath, []byte(tc.cfg), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out.Reset()
+		errb.Reset()
+		if code := run(args, &out, &errb); code != 0 {
+			t.Fatalf("%s: exit %d, stderr %q", tc.cfg, code, errb.String())
+		}
+		if !strings.Contains(out.String(), tc.want) {
+			t.Errorf("%s: output lacks %q:\n%s", tc.cfg, tc.want, out.String())
+		}
+		if (tc.note == "") != (errb.Len() == 0) || !strings.Contains(errb.String(), tc.note) {
+			t.Errorf("%s: stderr %q, want a line with %q", tc.cfg, errb.String(), tc.note)
+		}
+	}
+}
+
+func TestReportStartedPrintsTintNotes(t *testing.T) {
+	var out, errb bytes.Buffer
+	res := spawn.Result{
+		Ref:      launch.SessionRef{Launcher: "agterm", ID: "s-1", Name: "w1", TintNote: "tab not tinted: this agterm does not know --tint; update agterm"},
+		TintNote: "config: tint.worker: \"x\" is not a colour",
+	}
+	if err := reportStarted(res, &out, &errb); err != nil {
+		t.Fatal(err)
+	}
+	want := "qm spawn: note: config: tint.worker: \"x\" is not a colour\nqm spawn: note: tab not tinted: this agterm does not know --tint; update agterm\n"
+	if errb.String() != want {
+		t.Errorf("stderr = %q, want %q", errb.String(), want)
+	}
+	if !strings.HasPrefix(out.String(), "started agterm s-1 (w1)\n") {
+		t.Errorf("stdout = %q", out.String())
 	}
 }

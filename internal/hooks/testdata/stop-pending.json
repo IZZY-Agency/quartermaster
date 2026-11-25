@@ -1,0 +1,12 @@
+{
+  "session_id": "test-session",
+  "hook_event_name": "Stop",
+  "background_tasks": [
+    {"id": "b1", "type": "shell", "status": "running", "description": "SECRET-description", "command": "SECRET-command"},
+    {"id": "b2", "type": "subagent", "status": "pending", "description": "SECRET-description"},
+    {"id": "b3", "type": "shell", "status": "running"}
+  ],
+  "session_crons": [
+    {"id": "c1", "schedule": "0 9 * * 1-5", "recurring": true, "prompt": "SECRET-prompt"}
+  ]
+}

@@ -1,0 +1,1 @@
+{"ok":true,"result":{"tree":{"workspaces":[{"id":"w1","name":"alpha","sessions":[{"id":"s1","name":"coordinator","tint":"purple","tintOn":["icon","name"]},{"id":"s2","name":"task-1","tint":"#ABCDEF","tintOn":["name"]},{"id":"s3","name":"plain"},{"id":"s4","name":"odd","tint":"Teal","tintOn":["name","icon"]}]}]}}}

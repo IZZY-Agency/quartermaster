@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -138,15 +139,21 @@ func readFile(t *testing.T, path string) string {
 	return string(b)
 }
 
-// promptOf is the prompt file a script reads its first prompt from.
+// promptOf is the text of the file a script's first prompt points to, which
+// must not be in the script itself.
 func promptOf(t *testing.T, script string) string {
 	t.Helper()
-	_, after, ok := strings.Cut(script, "; cat ")
-	if !ok {
+	m := regexp.MustCompile(` the file (/\S+\.md)[:,] `).FindStringSubmatch(script)
+	if m == nil {
 		t.Fatalf("script has no prompt file:\n%s", script)
 	}
-	path, _, _ := strings.Cut(after, ")")
-	return readFile(t, strings.Trim(path, "'"))
+	text := readFile(t, m[1])
+	for _, line := range strings.Split(text, "\n") {
+		if len(line) > 20 && strings.Contains(script, line) {
+			t.Errorf("the prompt's text is in the script: %q", line)
+		}
+	}
+	return text
 }
 
 func upRecords(recs []route.Record) map[string]route.Record {
@@ -327,7 +334,7 @@ func TestUpFreshCoordinatorFromSummary(t *testing.T) {
 		t.Errorf("project coordinator %+v, past %v", w.project.Coordinator, w.project.PastCoordinators)
 	}
 	script := readFile(t, o.Script)
-	if !strings.Contains(script, " claude --permission-mode acceptEdits -n repo-coord --session-id "+o.NewSessionID+" ") {
+	if !strings.Contains(script, " claude --permission-mode acceptEdits --settings ") || !strings.Contains(script, " -n repo-coord --session-id "+o.NewSessionID+" ") {
 		t.Errorf("script:\n%s", script)
 	}
 	prompt := promptOf(t, script)
@@ -1293,7 +1300,8 @@ func (s *seqLister) Sessions(context.Context, string) ([]launch.SessionRef, erro
 // open meanwhile) is left open.
 func TestUpStaleWindowRecheckedBeforeClose(t *testing.T) {
 	before := launch.SessionRef{Launcher: "tmux", ID: "@4", Name: "repo-coord", Workspace: "repo", Idle: true, Panes: 1}
-	busy, pane, renamed := before, before, before
+	busy, pane, renamed, linked := before, before, before, before
+	linked.Linked = true
 	busy.Idle = false
 	pane.Idle, pane.Panes = false, 2
 	renamed.Name = "vim"
@@ -1306,7 +1314,8 @@ func TestUpStaleWindowRecheckedBeforeClose(t *testing.T) {
 		{"still idle", before, true, false},
 		{"a job started", busy, false, true},
 		{"a pane added", pane, false, true},
-		{"another window", renamed, false, false},
+		{"another window", renamed, false, true},
+		{"linked into another session", linked, false, true},
 	} {
 		w := newWorld(t)
 		w.project.Sessions = map[string]launch.SessionRef{coordID: {Launcher: "tmux", ID: "@4", Name: "repo-coord"}}

@@ -25,7 +25,10 @@ description: How the coordinator starts workers and reviews through qm. Use befo
    or failed with a usage error (outside a `qm up` project, for one); in
    those cases start it again only after your next spawn. Each stop,
    silence or disappearance wakes you once: a restarted watch lists the
-   ones already reported as `(reported)`.
+   ones already reported as `(reported)`. A `waiting` worker ended its turn
+   with a background task of its own running or a wakeup scheduled: leave
+   it, the watch waits on. So it does for a live worker already reported
+   silent.
 3. **Reviews only through `qm spawn review`.** Never run `codex exec` or
    `codex review` yourself: `qm spawn review --prompt FILE [--repo DIR]`.
    qm counts the round and measures the diff itself, for the branch checked

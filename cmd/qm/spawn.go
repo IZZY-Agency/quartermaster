@@ -15,8 +15,8 @@ import (
 	"github.com/IZZY-Agency/quartermaster/internal/config"
 	"github.com/IZZY-Agency/quartermaster/internal/declog"
 	"github.com/IZZY-Agency/quartermaster/internal/launch"
-	"github.com/IZZY-Agency/quartermaster/internal/limits"
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
+	"github.com/IZZY-Agency/quartermaster/internal/plain"
 	"github.com/IZZY-Agency/quartermaster/internal/spawn"
 	"github.com/IZZY-Agency/quartermaster/internal/up"
 )
@@ -56,10 +56,11 @@ func runSpawnWorker(args []string, stdout, stderr io.Writer) int {
 	case err == nil, errors.Is(err, flag.ErrHelp):
 		return 0
 	case errors.Is(err, errUsage), errors.Is(err, spawn.ErrInput):
-		_, _ = fmt.Fprintf(stderr, "qm spawn: %v\n%s", err, spawnUsage)
+		printErr(stderr, "qm spawn", err)
+		_, _ = fmt.Fprint(stderr, spawnUsage)
 		return 2
 	default:
-		_, _ = fmt.Fprintf(stderr, "qm spawn: %v\n", err)
+		printErr(stderr, "qm spawn", err)
 		return 1
 	}
 }
@@ -114,10 +115,10 @@ func spawnWorker(args []string, stdout, stderr io.Writer) error {
 		}
 		switch {
 		case err != nil:
-			_, _ = fmt.Fprintf(stderr, "qm spawn: warning: project not read: %v; worker not tied to a project\n", err)
+			printLine(stderr, "qm spawn: warning: project not read: %v; worker not tied to a project", err)
 		case found:
 			if why := spawnerTie(&p); why != "" {
-				_, _ = fmt.Fprintf(stderr, "qm spawn: note: %s: worker not tied to project %s\n", why, p.ID)
+				printLine(stderr, "qm spawn: note: %s: worker not tied to project %s", why, p.ID)
 				break
 			}
 			req.UpProject, upWorkspace = p.ID, p.Workspace
@@ -144,13 +145,7 @@ func spawnWorker(args []string, stdout, stderr io.Writer) error {
 	}
 	deps := spawn.Deps{
 		Config: cfg, Ask: rd.ask, Gate: rd.gate, Claude: claudeState(stderr),
-		Codex: func() limits.CodexState {
-			st, err := limits.Codex(codexLook)
-			if err != nil {
-				return limits.CodexState{Reason: "Codex usage unreadable: " + err.Error()}
-			}
-			return st
-		},
+		Codex:  rd.cachedCodex,
 		Getenv: os.Getenv, PS: spawn.PS, ProcExe: spawn.ProcExe, Pick: launch.Pick, Exe: exe, Mark: rd.mark,
 		Trusted: func(dir string) (bool, error) {
 			cj, err := paths.ClaudeJSON()
@@ -163,16 +158,19 @@ func spawnWorker(args []string, stdout, stderr io.Writer) error {
 	res, err := spawn.Worker(context.Background(), req, deps)
 	if err != nil {
 		if res.Ref.ID != "" {
-			_, _ = fmt.Fprintf(stdout, "started %s %s (%s)\n", res.Ref.Launcher, res.Ref.ID, res.Ref.Name)
+			printLine(stdout, "started %s %s (%s)", res.Ref.Launcher, res.Ref.ID, res.Ref.Name)
 		}
 		return err
 	}
 	if req.DryRun {
 		trust := ""
 		if res.TrustNote != "" {
-			trust = "trust: " + res.TrustNote + "\n"
+			trust = "trust: " + plain.Line(res.TrustNote) + "\n"
 		}
-		_, err = fmt.Fprintf(stdout, "%s\nlauncher: %s\n%sscript (dry run, not written):\n%s", decisionLine(res.Decision), res.LauncherNote, trust, res.Script)
+		if res.TintNote != "" {
+			printLine(stderr, "qm spawn: note: %s", res.TintNote)
+		}
+		_, err = fmt.Fprintf(stdout, "%s\nlauncher: %s\n%stint: %s\nbrief: %s, to be copied to %s\nscript (dry run, not written):\n%s", decisionLine(res.Decision), plain.Line(res.LauncherNote), trust, plain.Line(tintLine(res.Tint)), plain.Line(req.Brief), plain.Line(res.BriefPath), res.Script)
 		return err
 	}
 	return reportStarted(res, stdout, stderr)
@@ -198,12 +196,26 @@ func spawnerTie(p *up.Project) string {
 	return ""
 }
 
-// reportStarted prints the started worker and its decision, and the
+// tintLine says what a worker's tab is tinted: "teal on icon", or "none".
+func tintLine(t launch.Tint) string {
+	if t.IsZero() {
+		return "none"
+	}
+	return t.Color + " on " + t.On
+}
+
+// reportStarted prints the started worker and its decision, the tint notes
+// (a colour the config got wrong; a tab started untinted) and the
 // launcher's warning (a failed agterm pin) to stderr.
 func reportStarted(res spawn.Result, stdout, stderr io.Writer) error {
-	if res.Ref.Warning != "" {
-		_, _ = fmt.Fprintf(stderr, "qm spawn: warning: %s\n", res.Ref.Warning)
+	for _, n := range []string{res.TintNote, res.Ref.TintNote} {
+		if n != "" {
+			printLine(stderr, "qm spawn: note: %s", n)
+		}
 	}
-	_, err := fmt.Fprintf(stdout, "started %s %s (%s)\n%s\nwatch it: qm watch\n", res.Ref.Launcher, res.Ref.ID, res.Ref.Name, decisionLine(res.Decision))
+	if res.Ref.Warning != "" {
+		printLine(stderr, "qm spawn: warning: %s", res.Ref.Warning)
+	}
+	_, err := fmt.Fprintf(stdout, "started %s %s (%s)\n%s\nwatch it: qm watch\n", res.Ref.Launcher, plain.Line(res.Ref.ID), plain.Line(res.Ref.Name), decisionLine(res.Decision))
 	return err
 }

@@ -20,6 +20,7 @@ PROFILE="${2:?$usage}"
 NAME="${3:?$usage}"
 LAUNCH_ARG="${4:---version}"
 fail() { echo "notarize: $*" >&2; exit 1; }
+[[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "bad submission name '$NAME' (letters, digits, . _ - only)"
 
 codesign --verify --strict "$BIN"
 # Captured first: with pipefail, `codesign | grep -q` fails when grep exits early.
@@ -30,7 +31,13 @@ grep -q "flags=.*runtime" <<<"$INFO" || fail "$BIN lacks the hardened runtime (c
 WORK="$(mktemp -d)" || fail "could not create a scratch folder"
 WORK="$(cd "$WORK" && pwd -P)"
 case "$WORK" in /?*) ;; *) fail "bad scratch folder: $WORK" ;; esac
-trap 'rm -rf "$WORK"' EXIT
+QUARANTINED=0
+# The quarantine attribute is removed on any exit the shell can trap (not SIGKILL).
+cleanup() {
+  if [ "$QUARANTINED" = 1 ]; then xattr -d com.apple.quarantine "$BIN" 2>/dev/null || true; fi
+  rm -rf "$WORK" || true
+}
+trap cleanup EXIT
 ZIP="$WORK/$NAME.zip"
 ditto -c -k "$BIN" "$ZIP"
 
@@ -59,14 +66,14 @@ for arch in $bin_archs; do
   if [ "$arch" = x86_64 ] && [ "$host_arch" = arm64 ] && rosetta; then can_run=1; fi
 done
 if [ "$can_run" = 1 ]; then
+  QUARANTINED=1
   xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");notarize.sh;" "$BIN"
   rc=0
   OUT="$(perl -e 'alarm 60; exec @ARGV' "$BIN" "$LAUNCH_ARG" 2>&1)" || rc=$?
   if [ "$rc" != 0 ] && ! { [ "$LAUNCH_ARG" = status ] && [ "$rc" = 3 ]; }; then
-    xattr -d com.apple.quarantine "$BIN" || true
     fail "the quarantined binary did not start (exit $rc): $OUT"
   fi
-  xattr -d com.apple.quarantine "$BIN"
+  xattr -d com.apple.quarantine "$BIN"; QUARANTINED=0
   LAUNCH="quarantined launch printed: $OUT"
 else
   LAUNCH="launch check skipped: $bin_archs binary on $host_arch"

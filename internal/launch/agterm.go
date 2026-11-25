@@ -3,7 +3,9 @@ package launch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 )
 
@@ -17,41 +19,147 @@ type Agterm struct {
 	Anchor string
 }
 
-// Spawn runs: agtermctl session new [--workspace ID | --workspace-name NAME
-// --create-workspace | --after ANCHOR] --cwd DIR --name NAME --no-select
-// --command "/bin/sh SCRIPT" --json, and reads the new session id from the
-// response, {"ok":true,"result":{"id":...}}. It then pins the session
+// Spawn creates the session with agtermctl session new (create) and pins it
 // (Pin) so agterm does not restore it by itself; a failed pin is a Warning on
 // the returned ref, not an error. A workspace by name wins over the anchor.
+// With a Tint in the spec the tab is created tinted and what qm set is
+// remembered (the tint memory, see ApplyTint), and expired entries are dropped
+// from it; a tint that cannot be set or remembered never fails the launch: the
+// session starts without it and the ref's TintNote says why. That includes a
+// wait of more than tintsWait for another qm's lock on the memory, which is
+// held while a tinted tab is created.
 func (a Agterm) Spawn(ctx context.Context, s LaunchSpec) (SessionRef, error) {
 	if err := s.check(); err != nil {
 		return SessionRef{}, err
 	}
-	args := []string{"session", "new"}
-	switch {
-	case s.Workspace != "":
-		args = append(args, "--workspace", s.Workspace)
-	case s.WorkspaceName != "":
-		args = append(args, "--workspace-name", s.WorkspaceName, "--create-workspace")
-	case a.Anchor != "":
-		args = append(args, "--after", a.Anchor)
+	if s.Tint.IsZero() {
+		ref, _, err := a.create(ctx, s, Tint{})
+		return ref, err
 	}
-	args = append(args, "--cwd", s.Cwd, "--name", s.Name, "--no-select", "--command", Command(s.Script), "--json")
-	raw, err := a.call(ctx, "session new", args...)
+	// The tab is created and remembered under one lock, so no other qm
+	// sees it tinted before it is remembered. When the memory cannot be
+	// opened or locked, the tab is created untinted.
+	var (
+		ref    SessionRef
+		tinted bool
+		cerr   error
+		ran    bool
+	)
+	err := withTints(ctx, func(b *tintBook) error {
+		ran = true
+		b.Expire()
+		if ref, tinted, cerr = a.create(ctx, s, s.Tint); cerr != nil || !tinted {
+			return nil
+		}
+		b.Set(ref.ID, s.Tint)
+		return nil
+	})
+	switch {
+	case !ran:
+		ref, _, cerr = a.create(ctx, s, Tint{})
+		if cerr != nil {
+			return SessionRef{}, cerr
+		}
+		ref.TintNote = "tab not tinted: " + err.Error()
+	case cerr != nil:
+		return SessionRef{}, cerr
+	case err != nil && tinted:
+		ref.TintNote = a.untint(ctx, ref.ID, s.Tint, err)
+	}
+	return ref, nil
+}
+
+// create runs: agtermctl session new [--workspace ID | --workspace-name NAME
+// --create-workspace | --after ANCHOR] --cwd DIR --name NAME --no-select
+// --command "/bin/sh SCRIPT" [--tint COLOR --tint-on PLACES] --json, reads
+// the new session id from the response, {"ok":true,"result":{"id":...}}, and
+// pins the session (Pin) at once. An agterm older than --tint refuses the
+// flag in agtermctl's argument parser, before anything is sent, so no tab
+// exists: the session is then created once more without a tint (tinted is
+// false, TintNote says why). Any other failure may have created the tab and
+// is not retried.
+func (a Agterm) create(ctx context.Context, s LaunchSpec, tint Tint) (ref SessionRef, tinted bool, err error) {
+	newArgs := func(tint Tint) []string {
+		args := []string{"session", "new"}
+		switch {
+		case s.Workspace != "":
+			args = append(args, "--workspace", s.Workspace)
+		case s.WorkspaceName != "":
+			args = append(args, "--workspace-name", s.WorkspaceName, "--create-workspace")
+		case a.Anchor != "":
+			args = append(args, "--after", a.Anchor)
+		}
+		args = append(args, "--cwd", s.Cwd, "--name", s.Name, "--no-select", "--command", Command(s.Script))
+		if !tint.IsZero() {
+			args = append(args, "--tint", tint.Color, "--tint-on", tint.On)
+		}
+		return append(args, "--json")
+	}
+	note := ""
+	raw, err := a.call(ctx, "session new", newArgs(tint)...)
+	if !tint.IsZero() && unknownTintOption(err) {
+		tint, note = Tint{}, "tab not tinted: this agterm does not know --tint; update agterm"
+		raw, err = a.call(ctx, "session new", newArgs(tint)...)
+	}
 	if err != nil {
-		return SessionRef{}, fmt.Errorf("agterm: %w", err)
+		return SessionRef{}, false, fmt.Errorf("agterm: %w", newErr(err))
 	}
 	var res struct {
 		ID string `json:"id"`
 	}
 	if err := json.Unmarshal(raw, &res); err != nil || res.ID == "" {
-		return SessionRef{}, fmt.Errorf("agterm: %s session new returned no session id", a.Bin)
+		return SessionRef{}, false, fmt.Errorf("agterm: %s session new returned no session id: %w", a.Bin, ErrMaybeStarted)
 	}
-	ref := SessionRef{Launcher: "agterm", ID: res.ID, Name: s.Name}
+	ref = SessionRef{Launcher: "agterm", ID: res.ID, Name: s.Name, TintNote: note}
 	if err := a.Pin(ctx, ref.ID); err != nil {
 		ref.Warning = "agterm restore pin failed: " + err.Error()
 	}
-	return ref, nil
+	return ref, !tint.IsZero(), nil
+}
+
+// untint takes a tint off the new tab id after the memory could not record it
+// (cause), as an unremembered tint would read as the owner's. It clears the
+// tab only while it still shows the tint it was created with, so a colour the
+// owner picked meanwhile stays. It returns the TintNote.
+func (a Agterm) untint(ctx context.Context, id string, tint Tint, cause error) string {
+	refs, _, err := a.allSessions(ctx)
+	if err == nil {
+		for _, r := range refs {
+			if r.ID != id {
+				continue
+			}
+			if r.Tint != tint {
+				return "tab tinted, but not remembered, and left alone: its tint changed meanwhile (" + cause.Error() + ")"
+			}
+			if err = a.setTint(ctx, id, Tint{}); err == nil {
+				return "tab not tinted: " + cause.Error()
+			}
+			break
+		}
+	}
+	if err != nil {
+		cause = errors.Join(cause, err)
+	}
+	return "tab tinted, but not remembered, so qm will leave its tint alone: " + cause.Error()
+}
+
+// usageExit is agtermctl's exit code for arguments it does not take.
+const usageExit = 64
+
+// newErr is a failed session new, marked ErrMaybeStarted unless agtermctl
+// says the session was not opened: agterm answered ok:false, it could not
+// connect to agterm, it refused its arguments, or it did not run at all. Any
+// other failed run (a lost reply, a kill) may have opened it.
+func newErr(err error) error {
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		return err
+	}
+	msg := strings.ReplaceAll(err.Error(), " ", "")
+	if exit.ExitCode() == usageExit || !killed(err) && (strings.Contains(msg, `"ok":false`) || strings.Contains(msg, "Error:connect(")) {
+		return err
+	}
+	return fmt.Errorf("%w (%w)", err, ErrMaybeStarted)
 }
 
 // call runs agtermctl with args (verb names the command in errors), decodes
@@ -63,14 +171,17 @@ func (a Agterm) call(ctx context.Context, verb string, args ...string) (json.Raw
 		return nil, err
 	}
 	var resp struct {
-		OK     bool            `json:"ok"`
+		OK     *bool           `json:"ok"`
 		Error  string          `json:"error"`
 		Result json.RawMessage `json:"result"`
 	}
 	if err := json.Unmarshal(out, &resp); err != nil {
-		return nil, fmt.Errorf("%s %s: unexpected output %q: %w", a.Bin, verb, out, err)
+		return nil, fmt.Errorf("%s %s: unexpected output %q: %w (%w)", a.Bin, verb, out, err, ErrMaybeStarted)
 	}
-	if !resp.OK {
+	if resp.OK == nil && resp.Error == "" {
+		return nil, fmt.Errorf("%s %s: unexpected output %q, neither ok nor an error (%w)", a.Bin, verb, out, ErrMaybeStarted)
+	}
+	if resp.OK == nil || !*resp.OK {
 		msg := resp.Error
 		if msg == "" {
 			msg = "agtermctl reported failure"
@@ -94,7 +205,17 @@ func (a Agterm) Pin(ctx context.Context, id string) error {
 // and cwd are read into Foreground and Cwd; a tab split into several panes
 // is Split.
 func (a Agterm) Workspaces(ctx context.Context) ([]Workspace, error) {
-	raw, err := a.call(ctx, "tree", "tree", "--json")
+	return a.workspaces(ctx, "")
+}
+
+// workspaces reads one window's tree: the frontmost window's when window is
+// "", else the window with that id.
+func (a Agterm) workspaces(ctx context.Context, window string) ([]Workspace, error) {
+	args := []string{"tree", "--json"}
+	if window != "" {
+		args = append(args, "--window", window)
+	}
+	raw, err := a.call(ctx, "tree", args...)
 	if err != nil {
 		return nil, fmt.Errorf("agterm: %w", err)
 	}
@@ -110,6 +231,8 @@ func (a Agterm) Workspaces(ctx context.Context) ([]Workspace, error) {
 					Foreground      []string `json:"foreground"`
 					Cwd             string   `json:"cwd"`
 					Split           bool     `json:"split"`
+					Tint            string   `json:"tint"`
+					TintOn          []string `json:"tintOn"`
 				} `json:"sessions"`
 			} `json:"workspaces"`
 		} `json:"tree"`
@@ -121,7 +244,7 @@ func (a Agterm) Workspaces(ctx context.Context) ([]Workspace, error) {
 	for _, w := range res.Tree.Workspaces {
 		ws := Workspace{ID: w.ID, Name: w.Name}
 		for _, s := range w.Sessions {
-			ws.Sessions = append(ws.Sessions, SessionRef{Launcher: "agterm", ID: s.ID, Name: s.Name, Idle: s.ForegroundShell != "", Foreground: strings.Join(s.Foreground, " "), Cwd: s.Cwd, Split: s.Split})
+			ws.Sessions = append(ws.Sessions, SessionRef{Launcher: "agterm", ID: s.ID, Name: s.Name, Idle: s.ForegroundShell != "", Foreground: strings.Join(s.Foreground, " "), Cwd: s.Cwd, Split: s.Split, Tint: readTint(s.Tint, s.TintOn)})
 		}
 		out = append(out, ws)
 	}

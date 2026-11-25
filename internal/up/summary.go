@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
+	"github.com/IZZY-Agency/quartermaster/internal/plain"
 	"github.com/IZZY-Agency/quartermaster/internal/spawn"
 )
 
@@ -250,7 +251,9 @@ func cell(s string) string {
 	return strings.ReplaceAll(oneLine(s), "|", "\\|")
 }
 
-func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
+// oneLine is s on one line, its runs of white space one space each, without
+// control characters (plain.Line).
+func oneLine(s string) string { return strings.Join(strings.Fields(plain.Line(s)), " ") }
 
 // cut shortens s to at most n characters.
 func cut(s string, n int) string {

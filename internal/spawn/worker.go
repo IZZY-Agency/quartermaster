@@ -15,10 +15,8 @@ import (
 	"time"
 
 	"github.com/IZZY-Agency/quartermaster/internal/config"
-	"github.com/IZZY-Agency/quartermaster/internal/declog"
 	"github.com/IZZY-Agency/quartermaster/internal/launch"
 	"github.com/IZZY-Agency/quartermaster/internal/limits"
-	"github.com/IZZY-Agency/quartermaster/internal/paths"
 	"github.com/IZZY-Agency/quartermaster/internal/reviewin"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
 )
@@ -80,10 +78,19 @@ type Result struct {
 	ScriptPath   string // "" in a dry run
 	// SessionID is the Claude session id the worker is launched with.
 	SessionID string
+	// BriefPath is qm's copy of the brief, the file the worker is pointed to;
+	// a dry run does not write it.
+	BriefPath string
 	Ref       launch.SessionRef
 	// TrustNote, in a dry run only, says why the launch would stop: the
 	// folder is not trusted, or its trust could not be read.
 	TrustNote string
+	// Tint is the tint the worker's tab is created with (the zero Tint: none,
+	// or a launcher that does not tint). TintNote says why a configured colour
+	// was not used: the key and value the config got wrong, in which case the
+	// default colour is used.
+	Tint     launch.Tint
+	TintNote string
 }
 
 // ErrInput marks bad input: the request, or a routing input route rejects.
@@ -106,7 +113,10 @@ func ValidName(name string) bool { return validName.MatchString(name) }
 
 // Worker spawns a worker session. The launcher is picked before routing, so
 // a missing launcher stops it before anything is written or logged; a dry
-// run needs none. The decision is logged only once the session has started.
+// run needs none. The worker is
+// reserved before the launch; its Records are logged when it started, the
+// worker's alone when it may have started, and by the next qm up when qm ends
+// in between; a refused launch withdraws the reservation.
 func Worker(ctx context.Context, req WorkerRequest, deps Deps) (Result, error) {
 	var res Result
 	if err := checkRequest(&req); err != nil {
@@ -164,7 +174,15 @@ func Worker(ctx context.Context, req WorkerRequest, deps Deps) (Result, error) {
 	if res.SessionID, err = NewSessionID(); err != nil {
 		return res, err
 	}
-	res.Script = LaunchScript(p, d.Tier, req.Name, res.SessionID, req.Cwd, req.Brief, qmDir)
+	res.Tint, res.TintNote = workerTint(l, deps.Config)
+	brief, err := readBrief(req.Brief)
+	if err != nil {
+		return res, fmt.Errorf("%w: %w", ErrInput, err)
+	}
+	if res.BriefPath, err = BriefPath(res.SessionID); err != nil {
+		return res, err
+	}
+	res.Script = launchScript(p, d.Tier, req.Name, res.SessionID, req.Cwd, briefFile{res.BriefPath, req.Brief}, qmDir)
 	if res.TrustNote, err = checkTrust(req.Cwd, deps.Trusted, req.DryRun); err != nil {
 		return res, err
 	}
@@ -172,19 +190,66 @@ func Worker(ctx context.Context, req WorkerRequest, deps Deps) (Result, error) {
 		return res, nil
 	}
 
-	if res.ScriptPath, err = WriteScript(req.Name, res.Script); err != nil {
+	if _, err := WriteBrief(res.SessionID, brief); err != nil {
 		return res, err
 	}
-	res.Ref, err = l.Spawn(ctx, launch.LaunchSpec{Name: req.Name, Cwd: req.Cwd, Script: res.ScriptPath, Workspace: req.Workspace, WorkspaceName: req.WorkspaceName})
+	if res.ScriptPath, err = WriteScript(req.Name, res.Script); err != nil {
+		_ = os.Remove(res.BriefPath)
+		return res, err
+	}
+	// Held before its process is visible (reservation): an adoption that sees
+	// the session finds its Record.
+	recs := workerRecords(d, req, repo, branch, round, res.SessionID, time.Now().UTC())
+	w := &recs[len(recs)-1]
+	w.Detail = DetailNotConfirmed + res.ScriptPath
+	// Only the worker's Record: a review that may never have run is no round.
+	held, err := reserveWorker(res.SessionID, recs[len(recs)-1:])
 	if err != nil {
 		_ = os.Remove(res.ScriptPath)
+		_ = os.Remove(res.BriefPath)
+		res.ScriptPath = ""
+		return res, fmt.Errorf("worker not started: %w", err)
+	}
+	res.Ref, err = l.Spawn(ctx, launch.LaunchSpec{Name: req.Name, Cwd: req.Cwd, Script: res.ScriptPath, Workspace: req.Workspace, WorkspaceName: req.WorkspaceName, Tint: res.Tint})
+	if errors.Is(err, launch.ErrMaybeStarted) {
+		// It may run all the same: its Record is logged, its brief and script
+		// stay.
+		w.Detail = DetailMaybeStarted + res.ScriptPath
+		if lerr := held.log(recs[len(recs)-1:]); lerr != nil {
+			err = fmt.Errorf("%w; its Record was not logged (the next qm up logs it): %w", err, lerr)
+		}
+		return res, err
+	}
+	if err != nil {
+		if werr := held.withdraw(); werr != nil {
+			err = fmt.Errorf("%w; its reservation was not withdrawn (the next qm up recovers it): %w", err, werr)
+		}
+		_ = os.Remove(res.ScriptPath)
+		_ = os.Remove(res.BriefPath)
 		res.ScriptPath = ""
 		return res, err
 	}
-	if err := logWorker(d, req, repo, branch, round, res); err != nil {
-		return res, fmt.Errorf("session %s started, but the decision was not logged: %w", res.Ref.ID, err)
+	w.Detail = res.Ref.Launcher + " " + res.Ref.ID
+	w.TermLauncher, w.TermID = res.Ref.Launcher, res.Ref.ID
+	if err := held.log(recs); err != nil {
+		return res, fmt.Errorf("session %s started, but the decision was not logged (the next qm up logs it): %w", res.Ref.ID, err)
 	}
 	return res, nil
+}
+
+// workerTint is the tint of a worker's tab: tint.worker, or its default when
+// the config's colour is not valid (note says so). tmux does not tint, and a
+// dry run that found no launcher shows the tint as it would be.
+func workerTint(l launch.Launcher, cfg config.Config) (launch.Tint, string) {
+	tints, err := cfg.Tints()
+	note := ""
+	if err != nil {
+		note = "config: " + err.Error()
+	}
+	if _, ok := l.(launch.Tmux); ok {
+		return launch.Tint{}, note
+	}
+	return launch.WorkerTint(tints.Worker), note
 }
 
 // checkTrust returns ErrUntrusted when trusted says Claude Code has not
@@ -214,30 +279,26 @@ func checkTrust(cwd string, trusted func(string) (bool, error), dryRun bool) (no
 // logs: a review round whose findings qm does not read.
 const SessionVerdict = "session"
 
-// logWorker logs the worker Record of a launched session (kind "worker",
-// whatever table routed it, so a reviewer session is a worker in qm report).
-// A --type review session also logs a review Record, which counts its round;
-// it is written first, so the report never assigns it to the reviewer's own
-// worker Record.
-func logWorker(d route.Decision, req WorkerRequest, repo, branch string, round int, res Result) error {
-	now := time.Now().UTC()
+// workerRecords are the Records of a worker started at now under session sid:
+// last its worker Record (kind "worker", whatever table routed it, so a
+// reviewer session is a worker in qm report). A --type review session also has
+// a review Record, which counts its round; it comes first, so the report never
+// assigns it to the reviewer's own worker Record.
+func workerRecords(d route.Decision, req WorkerRequest, repo, branch string, round int, sid string, now time.Time) []route.Record {
+	var recs []route.Record
 	if req.Type == "review" {
-		if err := declog.Append(route.Record{
+		recs = append(recs, route.Record{
 			Time: now, Kind: "review", Project: repo, Branch: branch, Name: req.Name,
 			Round: round, Decision: &d,
 			Detail: fmt.Sprintf(`{"verdict":%q,"p1":0,"p2":0,"p3":0}`, SessionVerdict),
-		}); err != nil {
-			return err
-		}
+		})
 		now = now.Add(time.Microsecond)
 	}
-	return declog.Append(route.Record{
+	return append(recs, route.Record{
 		Time: now, Kind: "worker", Project: repo, Branch: branch, Name: req.Name,
 		Cwd: req.Cwd, UpProject: req.UpProject,
-		ClaudeSession: res.SessionID, Type: req.Type, Size: req.Size,
+		ClaudeSession: sid, Type: req.Type, Size: req.Size,
 		Round: round, Override: req.ForceWhy, Decision: &d,
-		Detail:       res.Ref.Launcher + " " + res.Ref.ID,
-		TermLauncher: res.Ref.Launcher, TermID: res.Ref.ID,
 	})
 }
 
@@ -290,8 +351,8 @@ func checkRequest(req *WorkerRequest) error {
 	if req.Brief, err = filepath.Abs(req.Brief); err != nil {
 		return fmt.Errorf("spawn: %w", err)
 	}
-	if _, err := os.Stat(req.Brief); err != nil {
-		return fmt.Errorf("spawn: brief: %w", err)
+	if _, err := readBrief(req.Brief); err != nil {
+		return err
 	}
 	if req.Cwd, err = filepath.Abs(req.Cwd); err != nil {
 		return fmt.Errorf("spawn: %w", err)
@@ -373,17 +434,17 @@ func FileName(s string) bool { return fileName.MatchString(s) }
 
 // WriteScript writes a launch script to <state>/launch/<name>-<unixnano>.sh,
 // mode 0700, never over an existing file, and returns its path. Scripts
-// older than ScriptAge are removed first. A name FileName refuses is an
+// older than ScriptAge, and brief copies older than BriefAge, are removed
+// first. A name FileName refuses is an
 // error, and nothing is written.
 func WriteScript(name, script string) (string, error) {
 	if !FileName(name) {
 		return "", fmt.Errorf("launch script: session name %q is not usable in a file name", name)
 	}
-	state, err := paths.StateDir()
+	dir, err := launchDir()
 	if err != nil {
 		return "", fmt.Errorf("launch script: %w", err)
 	}
-	dir := filepath.Join(state, "launch")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("launch script: %w", err)
 	}
@@ -409,7 +470,8 @@ func WriteScript(name, script string) (string, error) {
 	return "", errors.New("launch script: no free file name")
 }
 
-// sweepScripts removes the launch scripts in dir older than age.
+// sweepScripts removes the launch scripts in dir older than age, and the
+// brief copies older than BriefAge.
 func sweepScripts(dir string, age time.Duration) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -417,7 +479,11 @@ func sweepScripts(dir string, age time.Duration) {
 	}
 	for _, e := range entries {
 		fi, err := e.Info()
-		if err == nil && fi.Mode().IsRegular() && strings.HasSuffix(e.Name(), ".sh") && time.Since(fi.ModTime()) > age {
+		if err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		old := time.Since(fi.ModTime())
+		if strings.HasSuffix(e.Name(), ".sh") && old > age || briefName.MatchString(e.Name()) && old > BriefAge {
 			_ = os.Remove(filepath.Join(dir, e.Name()))
 		}
 	}

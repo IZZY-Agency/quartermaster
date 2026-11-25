@@ -90,7 +90,7 @@ func TestTurnWriteWaitsForItsOwnLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
-	go func() { done <- writeTurn("test-session", "stop") }()
+	go func() { done <- writeTurn("test-session", "stop", turnMark{}) }()
 	select {
 	case err := <-done:
 		t.Fatalf("write did not wait for the turn lock (err %v)", err)

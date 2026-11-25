@@ -21,7 +21,7 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
 export GIT_ASKPASS=/usr/bin/false SSH_ASKPASS=/usr/bin/false GIT_ALLOW_PROTOCOL=file
 export HOMEBREW_NO_AUTO_UPDATE=1
 unset PUBLISH_TEST_TARGET PUBLISH_TEST_REMOTE PUBLISH_IDENT TAP_TEST_ASSETS_DIR TAP_TEST_REMOTE
-unset SIGN_IDENTITY NOTARY_PROFILE COMMIT PACKAGE_ALLOW_DIRTY PACKAGE_DEV REQUIRE_SIGNATURE EXPECTED_TEAM_ID
+unset SWIFTC SIGN_IDENTITY NOTARY_PROFILE COMMIT PACKAGE_ALLOW_DIRTY PACKAGE_DEV REQUIRE_SIGNATURE EXPECTED_TEAM_ID
 unset MAKEFLAGS MFLAGS GNUMAKEFLAGS MAKELEVEL MAKEFILES
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -765,6 +765,80 @@ if [[ "$(uname -s)" == Darwin ]]; then
     bash "$pb/scripts/verify-release.sh" "$work/rel-broken" "$DV" "$(git -C "$pb" rev-parse --short HEAD)"
 fi
 
+# The version is a plain X.Y.Z (or dev-X.Y.Z): nothing that could be a path or an option.
+for badv in ../x -h "1.2" "9.9.9;x" "9.9.9/.." "-9.9.9"; do
+  expect "verify-release refuses the version '$badv'" 2 "bad version" bash "$p/scripts/verify-release.sh" "$out1" "$badv" "$c"
+done
+expect "verify-release takes a pre-release version, as package.sh does" 1 "archive or .sha256 missing" bash "$p/scripts/verify-release.sh" "$out1" "1.2.3-rc.1" "$c"
+# With REQUIRE_SIGNATURE=1 the signature is checked before the binaries run: a
+# macOS x86_64 archive whose qm and qm-privcheck leave a mark when run, on a
+# host that says it is macOS x86_64, with a codesign that refuses everything.
+stage_m="$work/stage-m"; mkdir -p "$stage_m"; tar -xzf "$out1/quartermaster-$DV-macos-x86_64.tar.gz" -C "$stage_m"
+for b in qm qm-privcheck; do
+  printf '#!/bin/sh\ntouch "$RAN_MARK"\necho "qm %s (%s)"\n' "$DV" "$c" > "$stage_m/$b"; chmod 755 "$stage_m/$b"
+done
+cp -R "$out1" "$work/rel-mark"
+(cd "$stage_m" && tar -cf - LICENSE README.md THIRD_PARTY_NOTICES.md qm qm-privcheck share) | gzip -n > "$work/rel-mark/quartermaster-$DV-macos-x86_64.tar.gz"
+(cd "$work/rel-mark" && sha_line "quartermaster-$DV-macos-x86_64.tar.gz" > "quartermaster-$DV-macos-x86_64.tar.gz.sha256")
+fakemac="$work/fake-mac"; mkdir -p "$fakemac"
+printf '#!/bin/sh\ncase "$1" in -s) echo Darwin ;; -m) echo x86_64 ;; *) echo Darwin ;; esac\n' > "$fakemac/uname"
+printf '#!/bin/sh\nexit 1\n' > "$fakemac/codesign"; cp "$fakemac/codesign" "$fakemac/spctl"; chmod +x "$fakemac"/*
+rm -f "$work/ran-mark"
+expect "verify-release checks the signature before it runs a binary" 1 "macos-x86_64.tar.gz: qm: the signature does not verify" \
+  env PATH="$fakemac:$PATH" RAN_MARK="$work/ran-mark" REQUIRE_SIGNATURE=1 bash "$p/scripts/verify-release.sh" "$work/rel-mark" "$DV" "$c"
+[[ ! -e "$work/ran-mark" ]] && ok "an archive that fails the signature check is never run" || bad "binary ran before the signature check" "$LAST_OUT"
+# qm passes and qm-privcheck fails: still refused and never run; both pass: run.
+printf '#!/bin/sh\ncase "$1" in -dvv) echo "Authority=Developer ID Application: Test (TESTTEAM00)"; echo "flags=0x10000(runtime)" ;; --verify) for a; do case "$a" in */qm-privcheck) exit 1 ;; esac; done ;; esac\nexit 0\n' > "$fakemac/codesign"
+printf '#!/bin/sh\necho "x: accepted source=Notarized Developer ID"\n' > "$fakemac/spctl"
+rm -f "$work/ran-mark"
+expect "verify-release refuses an archive whose helper fails the signature check" 1 "macos-x86_64.tar.gz: qm-privcheck: the signature does not verify" \
+  env PATH="$fakemac:$PATH" RAN_MARK="$work/ran-mark" REQUIRE_SIGNATURE=1 bash "$p/scripts/verify-release.sh" "$work/rel-mark" "$DV" "$c"
+[[ ! -e "$work/ran-mark" ]] && ok "an archive with one unsigned binary is never run" || bad "binary ran after a partial signature failure" "$LAST_OUT"
+printf '#!/bin/sh\ncase "$1" in -dvv) echo "Authority=Developer ID Application: Test (TESTTEAM00)"; echo "flags=0x10000(runtime)" ;; esac\nexit 0\n' > "$fakemac/codesign"
+rm -f "$work/ran-mark"
+env PATH="$fakemac:$PATH" RAN_MARK="$work/ran-mark" REQUIRE_SIGNATURE=1 bash "$p/scripts/verify-release.sh" "$work/rel-mark" "$DV" "$c" > "$work/vr-signed.out" 2>&1
+[[ -e "$work/ran-mark" ]] && grep -q "macos-x86_64.tar.gz: qm: Developer ID signature" "$work/vr-signed.out" \
+  && ok "a signed archive is checked, then run" || bad "signed archive" "$(cat "$work/vr-signed.out")"
+
+# notarize.sh: the submission name is a plain word (no path, no option).
+fakebin="$work/notarize-bin"; : > "$work/notarize-target"
+for badn in "../x" "-x" "a/b" "a b" ".hidden"; do
+  expect "notarize refuses the submission name '$badn'" 1 "bad submission name" \
+    bash "$here/notarize.sh" "$work/notarize-target" prof "$badn"
+done
+if [[ "$(uname -s)" == Darwin ]]; then
+  # A run that dies while the quarantined binary runs leaves no quarantine
+  # attribute behind. Stand-in tools (first on PATH): codesign, ditto, xcrun,
+  # spctl and lipo accept everything; perl, which runs the binary, kills the
+  # script with SIGTERM.
+  mkdir -p "$fakebin"
+  cat > "$fakebin/codesign" <<'EOF'
+#!/bin/sh
+case "$1" in -dvv) echo "Authority=Developer ID Application: Test (TESTTEAM00)"; echo "flags=0x10000(runtime)" ;; esac
+exit 0
+EOF
+  printf '#!/bin/sh\n: > "$4"\n' > "$fakebin/ditto"
+  printf '#!/bin/sh\necho "{\\"status\\":\\"Accepted\\",\\"id\\":\\"abc\\"}"\n' > "$fakebin/xcrun"
+  printf '#!/bin/sh\necho "x: accepted source=Notarized Developer ID"\n' > "$fakebin/spctl"
+  printf '#!/bin/sh\nuname -m\n' > "$fakebin/lipo"
+  # The stand-in perl notes that the attribute is set, then kills the script
+  # (the pid its starter wrote) and its own parent, the command substitution.
+  printf '#!/bin/sh\nxattr -p com.apple.quarantine "$NBIN" > "$NMARK" 2>/dev/null\nkill -TERM "$(cat "$NPID")" $PPID\nsleep 1\n' > "$fakebin/perl"
+  chmod +x "$fakebin"/*
+  nbin="$work/notarize-bin-target"; printf '#!/bin/sh\necho ok\n' > "$nbin"; chmod 755 "$nbin"
+  rm -f "$work/nmark"
+  env PATH="$fakebin:$PATH" NBIN="$nbin" NMARK="$work/nmark" NPID="$work/npid" \
+    sh -c 'echo $$ > "$NPID"; exec bash "$0" "$@"' "$here/notarize.sh" "$nbin" prof test-name >/dev/null 2>&1
+  nrc=$?
+  if [[ ! -s "$work/nmark" || "$nrc" == 0 ]]; then
+    bad "notarize quarantine test did not reach the quarantined launch" "exit $nrc, mark: $(cat "$work/nmark" 2>/dev/null)"
+  elif xattr -p com.apple.quarantine "$nbin" >/dev/null 2>&1; then
+    bad "notarize left the quarantine attribute after a killed run" ""
+  else
+    ok "notarize removes the quarantine attribute when the run is killed"
+  fi
+fi
+
 # A release build is made only in a clone of the public repository at the tag
 # of its version.
 expect "package refuses a release build outside the public repository" 1 "clone of the public repository" \
@@ -983,6 +1057,7 @@ expect "release.sh refuses unknown options" 2 "usage" rel --push
 # The release's make sees no MAKEFLAGS, MAKEFILES or Go switches from the
 # environment, and REQUIRE_SIGNATURE=1 as an argument wins.
 mkdir -p "$work/mk"
+printf 'y:\n\t@echo "swiftc=[$$SWIFTC$$SDKROOT$$TOOLCHAINS]"\n' > "$work/mk/Makefile.y"
 printf 'x:\n\t@echo "sig=$(REQUIRE_SIGNATURE) extra=$(EXTRA) goflags=[$$GOFLAGS] goenv=[$$GOENV] gotoolchain=[$$GOTOOLCHAIN]"\n' > "$work/mk/Makefile"
 printf 'EXTRA := from-makefiles\n' > "$work/mk/extra.mk"
 eval "$(sed -n '/^clean_make() {/,/^}/p' "$here/release.sh")"
@@ -990,6 +1065,8 @@ mk_out="$(cd "$work/mk" && MAKEFLAGS='REQUIRE_SIGNATURE=0' MAKEFILES="$work/mk/e
   clean_make -s x REQUIRE_SIGNATURE=1 2>&1)"
 [[ "$mk_out" == "sig=1 extra= goflags=[] goenv=[off] gotoolchain=[]" ]] \
   && ok "the release's make ignores MAKEFLAGS, MAKEFILES and Go switches" || bad "clean_make" "$mk_out"
+sw_out="$(cd "$work/mk" && SWIFTC=/evil/swiftc SDKROOT=/x TOOLCHAINS=y clean_make -s -f Makefile.y y 2>&1)"
+[[ "$sw_out" == "swiftc=[]" ]] && ok "the release's make does not see SWIFTC" || bad "clean_make SWIFTC" "$sw_out"
 grep -q 'clean_make verify-release REQUIRE_SIGNATURE=1' "$here/release.sh" \
   && ok "release.sh passes REQUIRE_SIGNATURE=1 to make as an argument" || bad "release.sh verify call" ""
 : > "$ghlog"

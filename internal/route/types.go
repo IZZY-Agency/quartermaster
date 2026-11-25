@@ -88,6 +88,10 @@ type Record struct {
 	// for the session, so qm down closes it and qm up pins it again.
 	TermLauncher string `json:"term_launcher,omitempty"`
 	TermID       string `json:"term_id,omitempty"`
+	// DefaultModel is the model qm itself gave the coordinator session the
+	// Record is about (up.coordinator_model); "" when the user chose one, or
+	// none was given (up records).
+	DefaultModel string `json:"default_model,omitempty"`
 }
 
 // Asker asks Jev a set of typed questions about one state. A nil Asker means

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/IZZY-Agency/quartermaster/internal/config"
+	"github.com/IZZY-Agency/quartermaster/internal/plain"
 )
 
 // notifyTimeout bounds one notifier run, so a stuck notifier cannot hold a
@@ -67,7 +68,7 @@ func NotifyContext(ctx context.Context, cfg config.Config, title, text string) e
 	if title != "" {
 		msg = title + ": " + text
 	}
-	argv := append(append([]string{}, cfg.Notify...), msg)
+	argv := append(append([]string{}, cfg.Notify...), plain.Line(msg))
 	if err := runCommand(ctx, argv); err != nil {
 		return fmt.Errorf("notify %s: %w", cfg.Notify[0], err)
 	}

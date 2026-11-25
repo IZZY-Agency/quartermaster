@@ -13,12 +13,13 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
+	"github.com/IZZY-Agency/quartermaster/internal/gitcmd"
 	"github.com/IZZY-Agency/quartermaster/internal/launch"
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
@@ -74,11 +75,26 @@ type Project struct {
 	Created          time.Time                    `json:"created"`
 	Updated          time.Time                    `json:"updated"`
 	DownAt           time.Time                    `json:"down_at,omitzero"`
+	// Closed holds the sessions qm down closed, or found not running, and
+	// when (closedByDown). qm down --keep-open closes none; a state with
+	// DownAt and no Closed (nil, not empty) was saved by an older qm. qm up
+	// clears both when it restores (ClearDown).
+	Closed map[string]time.Time `json:"closed,omitzero"`
 	// Dropped holds the session ids whose terminal session was closed or
 	// is no longer listed: their worker Records' refs are not loaded again.
 	Dropped map[string]bool `json:"dropped,omitempty"`
 	// Adopted holds the adopted workers, by Claude session id.
 	Adopted map[string]AdoptedSession `json:"adopted,omitempty"`
+	// Starting holds, by its new session id, the Record of each worker being
+	// started fresh, from before its launch until the Record is logged
+	// (reserve, RecoverStarts).
+	Starting map[string]route.Record `json:"starting,omitempty"`
+	// DefaultModels holds, by its session id, the model qm itself gave a
+	// coordinator it started from scratch (up.coordinator_model). It is kept
+	// apart from ClaudeArgs, the user's own choice: the config decides again
+	// at each fresh start. "" is a session since given a model or a fallback
+	// by the user (ReplaceClaudeArgs).
+	DefaultModels map[string]string `json:"default_models,omitempty"`
 }
 
 // Tied says whether decision Record r belongs to p: its up_project is p, or
@@ -92,9 +108,14 @@ func (p *Project) Tied(r *route.Record) bool {
 }
 
 // drop removes session id's terminal session from p.Sessions and remembers
-// it in p.Dropped.
+// it in p.Dropped. A worker whose Record is not logged yet (Starting) keeps
+// an entry with no terminal session: that is what holds it.
 func (p *Project) drop(id string) {
-	delete(p.Sessions, id)
+	if r, ok := p.Starting[id]; ok {
+		p.Sessions[id] = launch.SessionRef{Name: r.Name}
+	} else {
+		delete(p.Sessions, id)
+	}
 	if p.Dropped == nil {
 		p.Dropped = map[string]bool{}
 	}
@@ -110,7 +131,7 @@ func Root(dir string) (string, error) {
 		return "", fmt.Errorf("project root: %w", err)
 	}
 	root := abs
-	out, err := exec.Command("git", "-C", abs, "rev-parse", "--show-toplevel").Output()
+	out, err := gitcmd.Command(context.Background(), abs, "rev-parse", "--show-toplevel").Output()
 	if err == nil {
 		if top := strings.TrimSpace(string(out)); top != "" {
 			root = top
@@ -121,6 +142,15 @@ func Root(dir string) (string, error) {
 		return "", fmt.Errorf("project root: %w", err)
 	}
 	return resolved, nil
+}
+
+// checkRoot says why root cannot be a project's folder: its state file holds
+// text, so a path that is not UTF-8 would be read back as another folder's.
+func checkRoot(root string) error {
+	if !utf8.ValidString(root) {
+		return fmt.Errorf("project folder %q is not valid UTF-8: qm cannot record it", root)
+	}
+	return nil
 }
 
 // ProjectID is <name>-<8 hex>: name is root's base name reduced to letters,
@@ -208,9 +238,10 @@ func LoadID(id string) (Project, bool, error) {
 }
 
 // readProject reads the state file at path, <id>.json, whose id must be
-// that file name's, with an absolute project folder. A file that cannot be read, is not a project's state or
-// holds another id is an unreadable error (unreadable), which says how to
-// move it aside; one a newer qm wrote asks for an upgrade instead.
+// that file name's and its project folder's (ProjectID), an absolute path. A
+// file that cannot be read, is not a project's state or holds another id is
+// an unreadable error (unreadable), which says how to move it aside; one a
+// newer qm wrote asks for an upgrade instead.
 func readProject(path string) (Project, error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -235,6 +266,9 @@ func readProject(path string) (Project, error) {
 	if !filepath.IsAbs(p.Root) {
 		return Project{}, unreadable(path, fmt.Errorf("its project folder %q is not an absolute path", p.Root))
 	}
+	if id := ProjectID(p.Root); p.ID != id {
+		return Project{}, unreadable(path, fmt.Errorf("its project folder %q has project id %q", p.Root, id))
+	}
 	return p, nil
 }
 
@@ -251,10 +285,17 @@ func unreadable(path string, cause error) error {
 }
 
 // Save writes p to <state>/projects/<id>.json atomically (mode 0600, folder
-// 0700), with Updated set to now and Version to the current one.
+// 0700), with Updated set to now and Version to the current one. The id must
+// be that of p's folder, as a file read back must hold it.
 func Save(p Project) error {
 	if !safeName(p.ID) {
 		return fmt.Errorf("save project: bad id %q", p.ID)
+	}
+	if err := checkRoot(p.Root); err != nil {
+		return fmt.Errorf("save project: %w", err)
+	}
+	if id := ProjectID(p.Root); p.ID != id {
+		return fmt.Errorf("save project: id %q is not that of its folder %q (%q)", p.ID, p.Root, id)
 	}
 	dir, err := projectsDir()
 	if err != nil {

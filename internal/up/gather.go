@@ -15,6 +15,7 @@ import (
 	"github.com/IZZY-Agency/quartermaster/internal/claudecode"
 	"github.com/IZZY-Agency/quartermaster/internal/launch"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
+	"github.com/IZZY-Agency/quartermaster/internal/spawn"
 	"github.com/IZZY-Agency/quartermaster/internal/transcript"
 )
 
@@ -89,12 +90,16 @@ type Env struct {
 	Finished       func(c Candidate) string
 	HandoffDir     string
 	Run            DirRunner
+	// Shallow reads no transcript: one that exists counts as readable, and
+	// its file's time as its last activity (Last.At), with no context size.
+	Shallow bool
 }
 
 // Gather lists the sessions of project p: its coordinator from the state,
 // then its workers from the decision Records (kind "worker", tied to p:
 // up_project p.ID or a session p adopted), the newest Record per session id,
-// minus the ids another Record replaces, oldest start first, then its
+// the reserved ones of p.Starting included, minus the ids another Record
+// replaces, oldest start first, then its
 // hand-started workers (adopted, no Record), oldest start first. It also
 // loads into p.Sessions the terminal session each worker Record names
 // (term_launcher and term_id, or the Detail of an older Record) when
@@ -103,6 +108,7 @@ type Env struct {
 // candidate's Note, never an error: an unreadable transcript counts as
 // missing.
 func Gather(p *Project, recs []route.Record, env Env) ([]Candidate, error) {
+	recs = p.withStarting(recs)
 	seedSessions(p, recs)
 	var out []Candidate
 	if p.Coordinator.ID != "" {
@@ -127,9 +133,11 @@ func Gather(p *Project, recs []route.Record, env Env) ([]Candidate, error) {
 				if err != nil || path == "" {
 					continue // unreadable counts as missing
 				}
-				started, err := transcript.FirstAt(path)
-				if err != nil {
-					continue
+				var started time.Time
+				if !env.Shallow {
+					if started, err = transcript.FirstAt(path); err != nil {
+						continue
+					}
 				}
 				old := Candidate{Role: RoleCoordinator, SessionID: id, Name: c.Name, Cwd: c.Cwd, Branch: c.Branch, Started: started, Instead: c.SessionID}
 				fill(&old, p.ID, env)
@@ -174,7 +182,31 @@ func Gather(p *Project, recs []route.Record, env Env) ([]Candidate, error) {
 		out = append(out, c)
 	}
 	out = append(out, handStarted(p, newest, seen, env)...)
+	dropOthersNotes(out)
 	return out, nil
+}
+
+// Ran tells whether the session runs or has a transcript. A session that did
+// not may only have been launched.
+func (c Candidate) Ran() bool { return c.Live || c.Transcript != "" }
+
+// dropOthersNotes takes the handoff note from each worker whose launch nothing
+// confirmed and that never ran, when another session of its name ran or
+// started later (a retry): a note is known by the worker's name, and that
+// session wrote it, or may have.
+func dropOthersNotes(cands []Candidate) {
+	for i := range cands {
+		c := &cands[i]
+		if c.Handoff == "" || c.Ran() || c.Record == nil || !spawn.Unconfirmed(c.Record) {
+			continue
+		}
+		if slices.ContainsFunc(cands, func(o Candidate) bool {
+			return o.Role == RoleWorker && o.SessionID != c.SessionID && o.Name == c.Name && (o.Ran() || o.Started.After(c.Started))
+		}) {
+			c.Handoff = ""
+			c.addNote("its launch was not confirmed, and the handoff note of its name is another session's")
+		}
+	}
 }
 
 // handStarted is the candidates of p's hand-started workers (adopt design
@@ -257,6 +289,12 @@ func lineStarts(p *Project, recs []route.Record) map[string]time.Time {
 	return out
 }
 
+// RecordedTabs are the terminal sessions p records, by session id, its worker
+// Records' included (effectiveSessions).
+func RecordedTabs(p Project, recs []route.Record) map[string]launch.SessionRef {
+	return effectiveSessions(p, recs)
+}
+
 // effectiveSessions are the terminal sessions p records as Gather reads
 // them: p.Sessions, and for a session with none there that p never dropped,
 // its newest worker Record's (seedSessions). p is not changed.
@@ -268,11 +306,12 @@ func effectiveSessions(p Project, recs []route.Record) map[string]launch.Session
 
 // seedSessions loads into p.Sessions the terminal session of each worker
 // Record of p (the newest per session id) when p.Sessions has none for it
+// (a reservation's empty one counts as none, reserve)
 // and the session's ref was never closed or dropped (p.Dropped): a tmux
 // window id from a Record may name another window by now.
 func seedSessions(p *Project, recs []route.Record) {
 	for sid, r := range newestWorkers(p, recs) {
-		if _, ok := p.Sessions[sid]; ok || p.Dropped[sid] {
+		if p.Sessions[sid].ID != "" || p.Dropped[sid] {
 			continue
 		}
 		ref, ok := termRef(r)
@@ -385,7 +424,15 @@ func fill(c *Candidate, projectID string, env Env) {
 			c.Transcript = path
 		}
 	}
-	if c.Transcript != "" {
+	if c.Transcript != "" && env.Shallow {
+		fi, err := os.Stat(c.Transcript)
+		if err != nil {
+			c.addNote("transcript not read, counted as missing: " + err.Error())
+			c.Transcript = ""
+		} else {
+			c.Last.At = fi.ModTime()
+		}
+	} else if c.Transcript != "" {
 		last, err := transcript.LastContext(c.Transcript)
 		if err == nil && c.Cwd == "" {
 			// The folder to resume from is the one the session started in.

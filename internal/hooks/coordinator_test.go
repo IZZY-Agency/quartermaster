@@ -333,3 +333,14 @@ func TestPendingReviewSwept(t *testing.T) {
 		t.Errorf("new pending review: %v", err)
 	}
 }
+
+// An inherited GIT_DIR must not make a hook name another repository as a
+// worker's project.
+func TestGitTopIgnoresInheritedGitVariables(t *testing.T) {
+	dir, other := reviewRepo(t), reviewRepo(t)
+	t.Setenv("GIT_DIR", filepath.Join(other, ".git"))
+	t.Setenv("GIT_WORK_TREE", other)
+	if got, want := gitTop(dir), func() string { w, _ := filepath.EvalSymlinks(dir); return w }(); got != want {
+		t.Errorf("gitTop = %q, want %q", got, want)
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"syscall"
 )
 
 // LaunchSpec is one session to start: its name, working folder, the launch
@@ -19,6 +20,10 @@ import (
 // window joins. Setting both is an error.
 type LaunchSpec struct {
 	Name, Cwd, Script, Workspace, WorkspaceName string
+	// Tint is the colour the session's tab is created with; the zero Tint is
+	// none. Only agterm tints: tmux ignores it. A tint that cannot be set never
+	// fails the launch (SessionRef.TintNote).
+	Tint Tint
 }
 
 // errBothWorkspaces: a spec names its workspace twice.
@@ -40,7 +45,8 @@ func (s LaunchSpec) check() error {
 // listing when nothing but a shell runs in the session, so qm may close or
 // reuse it: agterm, when its foreground is an idle shell (agterm's
 // foregroundShell key); tmux, when the window has one pane and that pane is
-// dead or runs a shell. It is not stored. Foreground (the argv of the pane's
+// dead, or runs nothing but shells waiting for input (no script, no
+// suspended or background job). It is not stored. Foreground (the argv of the pane's
 // foreground process, joined by spaces as ps prints a command line) and Cwd
 // (the session's folder) are what an agterm listing reports; they are not
 // stored; Panes, a tmux listing's pane count, is not stored either. Adopted is stored: the session is the user's own tab or window,
@@ -58,8 +64,21 @@ type SessionRef struct {
 	Cwd        string `json:"-"`
 	// Panes is the number of panes of a listed tmux window (0 otherwise).
 	Panes int `json:"-"`
+	// PanePID is the process tmux started in a listed window's pane, and
+	// Linked says the window is in more than one tmux session. Neither is
+	// stored.
+	PanePID int  `json:"-"`
+	Linked  bool `json:"-"`
+	// tmuxSession is the id of the tmux session a listed window was read in.
+	tmuxSession string
 	// Split says a listed agterm tab is split into several panes.
 	Split bool `json:"-"`
+	// Tint is the tint a listed agterm tab shows (the zero Tint when it has
+	// none). It is not stored.
+	Tint Tint `json:"-"`
+	// TintNote, set by Spawn, says why a tint asked for was not set; the
+	// session started without it. It is not stored.
+	TintNote string `json:"-"`
 }
 
 // shells are the command names of the shells a terminal session falls back
@@ -109,6 +128,17 @@ func FindSession(ws []Workspace, sessionID string) (Workspace, bool) {
 // elsewhere is safe.
 var ErrRefused = errors.New("terminal refused the session")
 
+// ErrMaybeStarted: the launch failed, but the session may have started all
+// the same (its terminal answered without an id, say).
+var ErrMaybeStarted = errors.New("the session may have started")
+
+// killed says whether err is a command a signal ended: what it had done by
+// then is not known.
+func killed(err error) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit) && !exit.Exited()
+}
+
 // Reuser runs a launch script inside an existing idle session instead of
 // starting a new one. It is an optional interface beside Lister and Closer:
 // agterm implements it, tmux does not. The returned ref keeps ref's ID and
@@ -120,6 +150,21 @@ type Reuser interface {
 // ErrGone: Close found the session already gone (closed by hand, or its
 // terminal not running any more). Callers treat it as closed.
 var ErrGone = errors.New("session already gone")
+
+// ChangedError: Close read the session again and it is not the one it was
+// given any more (renamed, taken into use, moved): it was left open.
+type ChangedError struct{ ID, Why string }
+
+func (e *ChangedError) Error() string {
+	return fmt.Sprintf("tmux: window %s left open: %s", e.ID, e.Why)
+}
+
+// Locator finds a session by its id wherever it is now, for one a listing of
+// its workspace no longer shows. It is an optional interface beside Lister
+// and Closer: tmux implements it.
+type Locator interface {
+	Locate(ctx context.Context, ref SessionRef) ([]SessionRef, error)
+}
 
 // Closer closes a session started earlier. A session that does not exist
 // any more is an error that matches ErrGone.
@@ -133,10 +178,22 @@ var ErrNoLauncher = errors.New(`no launcher: run qm inside agterm or tmux, or se
 // Runner runs bin with args and returns its standard output; tests replace it.
 type Runner func(ctx context.Context, bin string, args ...string) ([]byte, error)
 
+// ownGroupKey is the context key of ownGroup.
+type ownGroupKey struct{}
+
+// ownGroup has Exec run the command in a process group of its own, so a Ctrl-C
+// at the terminal, which goes to qm's group, does not end it.
+func ownGroup(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ownGroupKey{}, true)
+}
+
 // Exec is the Runner that runs the real command. A failure carries the
 // command's standard error.
 func Exec(ctx context.Context, bin string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, bin, args...)
+	if ctx.Value(ownGroupKey{}) != nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
@@ -211,15 +268,4 @@ func Quote(s string) string {
 		return s
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
-// firstWordOfLastLine is the id a create command printed: the first word of
-// its last non-empty line.
-func firstWordOfLastLine(out []byte) string {
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	f := strings.Fields(lines[len(lines)-1])
-	if len(f) == 0 {
-		return ""
-	}
-	return f[0]
 }

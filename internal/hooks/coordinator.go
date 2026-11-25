@@ -16,6 +16,7 @@ import (
 
 	"github.com/IZZY-Agency/quartermaster/internal/config"
 	"github.com/IZZY-Agency/quartermaster/internal/declog"
+	"github.com/IZZY-Agency/quartermaster/internal/gitcmd"
 	"github.com/IZZY-Agency/quartermaster/internal/limits"
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
 	"github.com/IZZY-Agency/quartermaster/internal/privacy"
@@ -258,7 +259,7 @@ func agentReviewInput(cwd, prompt string) (route.ReviewInput, string, error) {
 		return route.ReviewInput{}, "", errNoReviewDiff
 	}
 	base := reviewin.Base(top)
-	verify := exec.Command("git", "-C", top, "rev-parse", "--verify", "--quiet", base+"^{commit}")
+	verify := gitcmd.Command(context.Background(), top, "rev-parse", "--verify", "--quiet", base+"^{commit}")
 	if err := verify.Run(); err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) && exit.ExitCode() == 1 {

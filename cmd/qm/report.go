@@ -35,6 +35,10 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if fs.NArg() > 0 {
+		_, _ = fmt.Fprintf(stderr, "qm report: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
 	if (*before != "" || len(projects) > 0) && !*baseline {
 		_, _ = fmt.Fprintln(stderr, "qm report: --before and --project need --baseline")
 		return 2
@@ -64,7 +68,12 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "qm report: %v\n", err)
 		return 1
 	}
-	finder := &outcomes.WorkerFinder{Claude: cl}
+	finder := &outcomes.WorkerFinder{Claude: cl, Owned: map[string]bool{}}
+	for _, r := range all {
+		if r.Kind == "worker" && r.ClaudeSession != "" {
+			finder.Owned[r.ClaudeSession] = true
+		}
+	}
 	in := outcomes.Input{
 		Records: recs,
 		Worker: func(r route.Record) (outcomes.Transcript, bool) {
@@ -182,7 +191,7 @@ func buildBaseline(cl outcomes.Claude, m outcomes.Matcher, all []route.Record, b
 		if !ok {
 			typ = typeByName[names[id]]
 		}
-		e := entry{t: t, typ: typ, reviewer: m.IsReviewer(t)}
+		e := entry{t: t, typ: typ, reviewer: m.IsReviewer(t) || typ == "review"}
 		if e.typ == "" {
 			e.typ = outcomes.BriefType(t)
 		}

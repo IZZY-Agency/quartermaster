@@ -19,8 +19,10 @@ import (
 )
 
 // coordinatorScript is the coordinator's script: resume sid, or start a new
-// session sid with prompt (a summary file, "" for none).
-func coordinatorScript(p *Project, sid, prompt string, resume bool, exe string) (string, error) {
+// session sid with prompt (a summary file, "" for none). What m adds comes
+// before the project's own arguments, so no flag left without a value there
+// takes it as one.
+func coordinatorScript(p *Project, sid, prompt string, resume bool, m ModelChoice, exe string) (string, error) {
 	note, err := HandoffPath(p.ID, p.Coordinator.Name)
 	if err != nil {
 		return "", err
@@ -28,7 +30,7 @@ func coordinatorScript(p *Project, sid, prompt string, resume bool, exe string) 
 	return spawn.CoordinatorScript(spawn.CoordinatorLaunch{
 		Name: p.Coordinator.Name, SessionID: sid, Cwd: p.Root, QMDir: qmDirOf(exe),
 		ProjectID: p.ID, Workspace: p.Workspace, HandoffPath: note,
-		PromptPath: prompt, Args: p.ClaudeArgs, Resume: resume,
+		PromptPath: prompt, Args: append(m.flags(), p.ClaudeArgs...), Resume: resume,
 	})
 }
 
@@ -270,7 +272,7 @@ func LiveArgs(id string, live map[string]claudecode.LiveSession, procs []claudec
 		if pr.PID != l.PID {
 			continue
 		}
-		if args, isClaude := claudecode.IsClaude(pr.Cmd); isClaude {
+		if args, isClaude := claudecode.ClaudeArgs(pr.Cmd); isClaude {
 			flags, err := livePermission(args)
 			if err != nil {
 				return nil, true, fmt.Errorf("the claude arguments of its process %d: %w", l.PID, err)

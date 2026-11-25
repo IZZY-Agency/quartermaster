@@ -71,7 +71,7 @@ func (f *hereFake) term(agtermID, tmuxPane, prefer string) HereTerm {
 }
 
 func hereProject() *Project {
-	return &Project{ID: "repo-1", Root: "/r/repo", Workspace: "repo", Coordinator: Session{ID: "c1", Name: "repo-coord"}, Sessions: map[string]launch.SessionRef{}}
+	return &Project{ID: "repo-27d361db", Root: "/r/repo", Workspace: "repo", Coordinator: Session{ID: "c1", Name: "repo-coord"}, Sessions: map[string]launch.SessionRef{}}
 }
 
 func tab(ids ...string) []launch.SessionRef {
@@ -117,8 +117,8 @@ func TestHereAgtermCreatesTheWorkspaceWhenMissing(t *testing.T) {
 }
 
 func TestHereAgtermRefusals(t *testing.T) {
-	other := Project{ID: "other-1", Root: "/r/other", Workspace: "theirs", Sessions: map[string]launch.SessionRef{"x": {Launcher: "agterm", ID: "tX"}}}
-	mine := Project{ID: "repo-1", Root: "/r/repo", Workspace: "repo", Sessions: map[string]launch.SessionRef{"w1": {Launcher: "agterm", ID: "tW"}}}
+	other := Project{ID: "other-70d61259", Root: "/r/other", Workspace: "theirs", Sessions: map[string]launch.SessionRef{"x": {Launcher: "agterm", ID: "tX"}}}
+	mine := Project{ID: "repo-27d361db", Root: "/r/repo", Workspace: "repo", Sessions: map[string]launch.SessionRef{"w1": {Launcher: "agterm", ID: "tW"}}}
 	for name, tc := range map[string]struct {
 		wss  []launch.Workspace
 		all  []Project
@@ -175,8 +175,8 @@ func TestHereAgtermRefusals(t *testing.T) {
 
 // A worker's tab known only from its worker Record is that worker's.
 func TestHereAgtermTabOfAWorkerRecordIsRefused(t *testing.T) {
-	other := Project{ID: "other-1", Root: "/r/other", Workspace: "theirs"}
-	rec := route.Record{Kind: "worker", Name: "w", UpProject: "other-1", ClaudeSession: "wk", TermLauncher: "agterm", TermID: "t1", Time: now}
+	other := Project{ID: "other-70d61259", Root: "/r/other", Workspace: "theirs"}
+	rec := route.Record{Kind: "worker", Name: "w", UpProject: "other-70d61259", ClaudeSession: "wk", TermLauncher: "agterm", TermID: "t1", Time: now}
 	f := &hereFake{wss: []launch.Workspace{{ID: "w0", Name: "scratch", Sessions: tab("t1")}, {ID: "w1", Name: "repo"}}, all: []Project{other}, recs: []route.Record{rec}}
 	ref, note := f.term("t1", "", "agterm").Resolve(context.Background(), hereProject(), []string{"c1"}, false)
 	if ref.ID != "" || !strings.Contains(note, "recorded for another session") {
@@ -185,7 +185,7 @@ func TestHereAgtermTabOfAWorkerRecordIsRefused(t *testing.T) {
 }
 
 func TestHereAgtermTabRecordedForTheCoordinatorsOwnSessionIsFine(t *testing.T) {
-	mine := Project{ID: "repo-1", Root: "/r/repo", Workspace: "repo", Sessions: map[string]launch.SessionRef{"c0": {Launcher: "agterm", ID: "t1"}}}
+	mine := Project{ID: "repo-27d361db", Root: "/r/repo", Workspace: "repo", Sessions: map[string]launch.SessionRef{"c0": {Launcher: "agterm", ID: "t1"}}}
 	f := &hereFake{wss: []launch.Workspace{{ID: "w1", Name: "repo", Sessions: tab("t1")}}, all: []Project{mine}}
 	ref, note := f.term("t1", "", "agterm").Resolve(context.Background(), hereProject(), []string{"c1", "c0"}, false)
 	if ref.ID != "t1" || note != "" {
@@ -242,7 +242,7 @@ func TestHereTmuxFirstRunKeepsAUsableCoordinatorName(t *testing.T) {
 }
 
 func TestHereTmuxRefusals(t *testing.T) {
-	other := Project{ID: "other-1", Root: "/r/other", Workspace: "theirs"}
+	other := Project{ID: "other-70d61259", Root: "/r/other", Workspace: "theirs"}
 	for name, tc := range map[string]struct {
 		sess  string
 		panes int
@@ -655,7 +655,7 @@ func TestApplyHereDropsTheTabOfTheSessionItStandsFor(t *testing.T) {
 // qm down never closes a split agterm tab: what runs beside the coordinator
 // would end with it.
 func TestDownLeavesASplitTabOpen(t *testing.T) {
-	p := &Project{ID: "repo-1", Root: "/r/repo", Workspace: "repo", Sessions: map[string]launch.SessionRef{"c1": {Launcher: "agterm", ID: "t1"}}}
+	p := &Project{ID: "repo-27d361db", Root: "/r/repo", Workspace: "repo", Sessions: map[string]launch.SessionRef{"c1": {Launcher: "agterm", ID: "t1"}}}
 	step := Step{Candidate: Candidate{Role: RoleCoordinator, SessionID: "c1", Name: "repo-coord", Cwd: "/r/repo"}, Action: Leave}
 	terms := &fakeCloser{p: p, split: map[string]bool{"t1": true}}
 	t.Setenv("XDG_STATE_HOME", t.TempDir())

@@ -7,7 +7,6 @@ import (
 	"io"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -18,8 +17,10 @@ import (
 
 	"github.com/IZZY-Agency/quartermaster/internal/config"
 	"github.com/IZZY-Agency/quartermaster/internal/declog"
+	"github.com/IZZY-Agency/quartermaster/internal/gitcmd"
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
+	"github.com/IZZY-Agency/quartermaster/internal/spawn"
 	"github.com/IZZY-Agency/quartermaster/internal/transcript"
 )
 
@@ -46,7 +47,7 @@ const (
 	contextNoteStep = 50000
 )
 
-// hookTimeout bounds one hook call; past it the action passes and an error is
+// hookTimeout bounds one hook call, reading its input included; past it the action passes and an error is
 // logged. Claude Code's own timeout for these hooks is 25 s.
 var hookTimeout = 20 * time.Second
 
@@ -93,6 +94,7 @@ type rule struct {
 var rules = map[string]rule{
 	"read-budget":     {stateful: true, track: trackPhase, run: readBudget},
 	"raw-launch-gate": {stateful: true, run: launchGate},
+	"pattern-kill":    {run: patternKillGate},
 	"explorer-model":  {run: explorerModel},
 	"lsp-note":        {run: lspNote},
 	"write-note":      {run: writeNote},
@@ -123,9 +125,24 @@ func Names() []string {
 // unknown hook, a rule error, a panic or a call past hookTimeout passes the
 // action and is logged as a kind "error" Record.
 func Handle(name string, stdin io.Reader, cfg config.Config) []byte {
-	in, err := Read(stdin)
-	if err != nil {
-		logRecord(Input{}, "error", name, "", err.Error())
+	deadline := time.After(hookTimeout)
+	var in Input
+	read := make(chan error, 1)
+	go func() {
+		got, err := Read(stdin)
+		if err == nil {
+			in = got // read below only after the channel says so
+		}
+		read <- err
+	}()
+	select {
+	case err := <-read:
+		if err != nil {
+			logRecord(Input{}, "error", name, "", err.Error())
+			return nil
+		}
+	case <-deadline:
+		logRecord(Input{}, "error", name, "", fmt.Sprintf("timed out after %v reading the input", hookTimeout))
 		return nil
 	}
 	r, ok := rules[name]
@@ -151,7 +168,7 @@ func Handle(name string, stdin io.Reader, cfg config.Config) []byte {
 	select {
 	case out := <-done:
 		return out
-	case <-time.After(hookTimeout):
+	case <-deadline:
 		logRecord(in, "error", name, "", fmt.Sprintf("timed out after %v", hookTimeout))
 		return nil
 	}
@@ -279,9 +296,10 @@ func trackPhase(s *State, in Input) {
 }
 
 // readBudget denies exploration reads over cfg.ReadBudget in one phase.
-// Subagents (the explorer itself) are not counted.
+// Subagents (the explorer itself) are not counted, nor is the worker's read of
+// its own brief.
 func readBudget(c *call) (result, error) {
-	if c.in.AgentID != "" || !isExploration(c.in.ToolName, c.in.ToolInput) {
+	if c.in.AgentID != "" || !isExploration(c.in.ToolName, c.in.ToolInput) || isBriefRead(c.in) {
 		return result{}, nil
 	}
 	c.st.Reads++
@@ -293,6 +311,19 @@ func readBudget(c *call) (result, error) {
 		return result{}, nil
 	}
 	return c.guardDeny("read-budget", readBudgetReason), nil
+}
+
+// isBriefRead tells whether a call is a Read of the file the worker was given
+// its task in (QM_BRIEF, set by its launch script): that path exactly, and a
+// file there that is not a symlink to another.
+func isBriefRead(in Input) bool {
+	brief := os.Getenv(spawn.BriefEnv)
+	path, _ := in.ToolInput["file_path"].(string)
+	if in.ToolName != "Read" || brief == "" || path != brief {
+		return false
+	}
+	fi, err := os.Lstat(path)
+	return err == nil && fi.Mode().IsRegular()
 }
 
 // launchGate denies raw launches of Codex reviews and Claude sessions.
@@ -465,7 +496,7 @@ func project(cwd string) string {
 func gitTop(cwd string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "git", "-C", cwd, "rev-parse", "--show-toplevel").Output()
+	out, err := gitcmd.Command(ctx, cwd, "rev-parse", "--show-toplevel").Output()
 	if err != nil || len(bytes.TrimSpace(out)) == 0 {
 		return cwd
 	}

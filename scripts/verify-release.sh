@@ -29,6 +29,7 @@ usage="usage: scripts/verify-release.sh <dir> <version> <commit> [--rebuild]"
 DIR="${1:?$usage}"
 VERSION="${2:?$usage}"
 COMMIT="${3:?$usage}"
+[[ "$VERSION" =~ ^(dev-)?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "verify-release: bad version '$VERSION' (want X.Y.Z, X.Y.Z-suffix or dev-X.Y.Z)" >&2; exit 2; }
 REBUILD=0
 case "${4:-}" in "") ;; --rebuild) REBUILD=1 ;; *) echo "$usage" >&2; exit 2 ;; esac
 [[ "$COMMIT" =~ ^[0-9a-f]{7,40}$ ]] || { echo "verify-release: bad commit '$COMMIT'" >&2; exit 2; }
@@ -108,6 +109,23 @@ for suffix in macos-arm64 macos-x86_64 linux-arm64 linux-x86_64; do
   if ((helper)) && [ ! -x "$x/qm-privcheck" ]; then
     echo "[FAIL] $name: qm-privcheck is not executable"; fail=1; continue
   fi
+  # The signature is checked before either binary is run.
+  if [ "${REQUIRE_SIGNATURE:-0}" = 1 ] && ((helper)); then
+    if [ "$os" != Darwin ]; then
+      echo "[FAIL] $name: REQUIRE_SIGNATURE=1 needs macOS (codesign, spctl)"; fail=1; continue
+    fi
+    sigbad=0
+    for b in qm qm-privcheck; do
+      problems="$(signed "$x/$b")"
+      if [ -z "$problems" ]; then
+        echo "[ok]   $name: $b: Developer ID signature, hardened runtime, notarized"
+      else
+        echo "[FAIL] $name: $b: $problems"; fail=1; sigbad=1
+      fi
+    done
+    # An unsigned or altered binary is never run.
+    ((sigbad)) && continue
+  fi
   if runnable "$suffix"; then
     out="$("$x/qm" --version 2>&1)"
     if [ "$out" = "qm $VERSION ($COMMIT)" ]; then
@@ -126,19 +144,6 @@ for suffix in macos-arm64 macos-x86_64 linux-arm64 linux-x86_64; do
     fi
   else
     echo "[ok]   $name: checksum and contents (not run on $os/$arch)"
-  fi
-  if [ "${REQUIRE_SIGNATURE:-0}" = 1 ] && ((helper)); then
-    if [ "$os" != Darwin ]; then
-      echo "[FAIL] $name: REQUIRE_SIGNATURE=1 needs macOS (codesign, spctl)"; fail=1; continue
-    fi
-    for b in qm qm-privcheck; do
-      problems="$(signed "$x/$b")"
-      if [ -z "$problems" ]; then
-        echo "[ok]   $name: $b: Developer ID signature, hardened runtime, notarized"
-      else
-        echo "[FAIL] $name: $b: $problems"; fail=1
-      fi
-    done
   fi
 done
 

@@ -29,7 +29,7 @@ var subcommands = map[string]struct {
 }{
 	"route": {kinds: []string{"worker", "review"}},
 	"spawn": {kinds: []string{"worker", "review"}},
-	"up":    {kinds: []string{"done", "handoff"}, open: true},
+	"up":    {kinds: []string{"done", "handoff", "note"}, open: true},
 }
 
 // readmeCommands returns every "qm <command>" that md shows as code, in a

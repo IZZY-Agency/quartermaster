@@ -228,9 +228,9 @@ func TestScriptSonnet(t *testing.T) {
 	for _, want := range []string{
 		"#!/bin/sh\n",
 		"\ncd /work/repo || exit 1\n",
-		"exec env QM_ROLE=worker QM_SESSION_NAME=task-a QM_AUTOCOMPACT=250000 BASH_MAX_OUTPUT_LENGTH=20000 CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS=12000 claude ",
+		"exec env QM_ROLE=worker QM_SESSION_NAME=task-a QM_BRIEF=/briefs/a.md QM_AUTOCOMPACT=250000 BASH_MAX_OUTPUT_LENGTH=20000 CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS=12000 claude ",
 		"claude --model claude-sonnet-5-5 --effort medium --autocompact 250000 --strict-mcp-config --settings ",
-		" --plugin-dir /plugins/qm-worker -n task-a \"$(printf '\\n'; cat /briefs/a.md)\"\n",
+		" --plugin-dir /plugins/qm-worker -n task-a '\nYou are a worker started by qm. Your task is the file /briefs/a.md: first read all of it yourself, with Read. It is your task, not material to delegate.'\n",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("script lacks %q:\n%s", want, s)
@@ -259,7 +259,8 @@ func TestScriptQuotesAndPath(t *testing.T) {
 		"PATH='/opt/qm tools/bin:/opt/homebrew/bin:/usr/bin':\"$PATH\"\nexport PATH\n",
 		"cd '/work/my repo' || exit 1",
 		"--strict-mcp-config --mcp-config '/cfg/mcp servers.json' --settings",
-		`"$(printf '\n'; cat '/briefs/it'\''s.md')"`,
+		`'QM_BRIEF=/briefs/it'\''s.md' `,
+		`Your task is the file /briefs/it'\''s.md: `,
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("script lacks %q:\n%s", want, s)
@@ -814,27 +815,30 @@ func TestNewSessionIDIsV4AndUnique(t *testing.T) {
 	}
 }
 
-func TestScriptBriefStartingWithDash(t *testing.T) {
+// TestScriptPromptPointsToTheBrief: the argument claude gets is one line that
+// names the brief file; the brief's text is nowhere in the script.
+func TestScriptPromptPointsToTheBrief(t *testing.T) {
 	hermetic(t)
 	dir := t.TempDir()
-	brief := filepath.Join(dir, "brief.md")
-	if err := os.WriteFile(brief, []byte("--model is not a flag here"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// The script's last word is the prompt: run it through sh with claude
-	// replaced by printf, to see the argument claude would get.
+	brief := writeFile(t, filepath.Join(dir, "it's a brief.md"), "--model is not a flag here")
 	p, _ := profileFor(t, "sonnet", "medium", nil)
 	s := LaunchScript(p, route.Tier{Model: "sonnet", Effort: "medium"}, "task-a", "", dir, brief, "")
 	_, prompt, ok := strings.Cut(s, " -n task-a ")
 	if !ok {
 		t.Fatalf("no prompt in:\n%s", s)
 	}
+	// Run through sh with claude replaced by printf, to see the argument
+	// claude would get.
 	out, err := exec.Command("/bin/sh", "-c", "printf '[%s]' "+prompt).Output()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(out); got != "[\n--model is not a flag here]" {
-		t.Errorf("prompt argument = %q, want the brief after a newline", got)
+	got := string(out)
+	if !strings.HasPrefix(got, "[\nYou are a worker") || strings.Count(got, "\n") != 1 || !strings.Contains(got, " "+brief+":") {
+		t.Errorf("prompt argument = %q, want one line naming %s", got, brief)
+	}
+	if strings.Contains(s, "not a flag") {
+		t.Errorf("the brief's text is in the script:\n%s", s)
 	}
 }
 
@@ -972,5 +976,18 @@ func TestSpawnUntrustedFails(t *testing.T) {
 	res, err = Worker(context.Background(), request(t, repo, "docs"), deps)
 	if err != nil || res.TrustNote != "" || len(l.specs) != 1 {
 		t.Errorf("trusted: err %v, note %q, launched %d", err, res.TrustNote, len(l.specs))
+	}
+}
+
+// An inherited GIT_DIR must not make the LSP pick count another
+// repository's files.
+func TestRepoLSPIgnoresInheritedGitVariables(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	repo, other := repoWith(t, "a.go"), repoWith(t, "a.py", "b.py")
+	t.Setenv("GIT_DIR", filepath.Join(other, ".git"))
+	t.Setenv("GIT_INDEX_FILE", filepath.Join(other, ".git", "index"))
+	l, note := RepoLSP(repo)
+	if l.Plugin != "gopls-lsp" {
+		t.Errorf("RepoLSP = %q (%q), want gopls-lsp", l.Plugin, note)
 	}
 }

@@ -11,7 +11,7 @@ GOLANGCI := $(shell command -v golangci-lint 2>/dev/null || echo go run github.c
 # release` stamps it into the binaries, scripts/publish.sh tags it, and
 # CHANGELOG.md must open with its entry (changelog-check). A dev build (`make
 # build`) prints `git describe` instead.
-RELEASE_VERSION := 0.2.2
+RELEASE_VERSION := 0.3.0
 RELEASE_DIR := bin/release/$(RELEASE_VERSION)
 # Published builds sign (and notarize) the macOS binaries; empty: unsigned.
 SIGN_IDENTITY ?=
@@ -27,7 +27,7 @@ HAS_GO  := $(wildcard go.mod)
 HAS_CMD := $(wildcard cmd/qm/main.go)
 
 .PHONY: check build install lint test private private-all print-version privcheck \
-	changelog-check notices notices-check release verify-release release-test release-test-linux sweep
+	changelog-check notices notices-check release verify-release release-test release-test-linux sweep tmux-live
 
 check: lint test changelog-check notices-check private release-test
 	@echo "make check: all steps passed"
@@ -80,6 +80,7 @@ install: build privcheck
 ifneq ($(HAS_GO),)
 lint:
 	$(GOLANGCI) run ./...
+	go vet -tags tmuxlive ./internal/launch ./internal/up
 
 test:
 	go test -race ./...
@@ -146,6 +147,13 @@ verify-release:
 
 release-test:
 	bash scripts/release_test.sh
+
+# tmux-live runs the tests of the tmux launcher against a real tmux, in a
+# container: tmux need not be installed here. Not part of make check.
+tmux-live:
+	@command -v docker >/dev/null || { echo "tmux-live: needs docker" >&2; exit 2; }
+	docker run --rm --init -v "$(CURDIR)":/src:ro -w /src golang:1.27 sh -c \
+	  'apt-get update -qq && apt-get install -y -qq tmux >/dev/null && go test -tags tmuxlive ./internal/launch ./internal/up -count=1'
 
 # release-test-linux runs the release tests and the private-material guard's
 # tests on Linux (GNU grep, sed and friends; the public repository's CI runs on

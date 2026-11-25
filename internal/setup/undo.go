@@ -46,6 +46,8 @@ func Undo(_ context.Context, s Streams, o Options) error {
 		}
 	}
 
+	hookLeft := rec.HookLine != "" && !removeHook(p, rec)
+
 	cfgPath, _ := config.Path()
 	for _, path := range slices.Backward(rec.Created) {
 		// Every created file but the config is a Claude Code settings file
@@ -66,10 +68,22 @@ func Undo(_ context.Context, s Streams, o Options) error {
 			return err
 		}
 	}
-	if err := os.Remove(recPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
+	if hookLeft {
+		// Kept for a later undo: the line is still in hooks.conf.
+		kept := Record{
+			SettingsPath: rec.SettingsPath, Time: rec.Time,
+			HooksPath: rec.HooksPath, HookLine: rec.HookLine, HookBefore: rec.HookBefore, HookCreated: rec.HookCreated,
+		}
+		if err := writeRecord(kept); err != nil {
+			return err
+		}
+		say(s.Out, "The agterm hook line is still there: remove it by hand, or run qm init --undo again once its file can be written\n")
+	} else {
+		if err := os.Remove(recPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		_ = os.Remove(filepath.Dir(recPath)) // only when init left it empty
 	}
-	_ = os.Remove(filepath.Dir(recPath)) // only when init left it empty
 
 	say(s.Out, "\nInside Claude Code, run:\n  %s\n", pluginUninstall)
 	if log, err := declog.Path(); err == nil {

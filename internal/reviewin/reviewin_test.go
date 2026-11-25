@@ -282,3 +282,20 @@ func TestRoundCountsReviewerSessionRecord(t *testing.T) {
 		t.Errorf("round %d, %v; want 2: the reviewer session's own record counts", n, err)
 	}
 }
+
+// An inherited GIT_DIR must not make the review sizing read another
+// repository.
+func TestRepoIgnoresInheritedGitVariables(t *testing.T) {
+	dir := repo(t)
+	other := t.TempDir()
+	gitRun(t, other, "init", "-q", "-b", "elsewhere")
+	t.Setenv("GIT_DIR", filepath.Join(other, ".git"))
+	t.Setenv("GIT_WORK_TREE", other)
+	top, branch, err := Repo(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, _ := filepath.EvalSymlinks(dir); top != want || branch != "work" {
+		t.Errorf("Repo = %q on %q, want %q on work", top, branch, want)
+	}
+}

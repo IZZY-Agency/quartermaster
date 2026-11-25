@@ -16,15 +16,19 @@ func TestResumeScriptMatchesLaunch(t *testing.T) {
 	p.Env["QM_WORKSPACE"] = "try"
 	tier := route.Tier{Model: "opus", Effort: "high"}
 	const id = "00000000-0000-4000-8000-000000000001"
-	launchS := LaunchScript(p, tier, "task-a", id, "/work/my repo", "/briefs/a.md", "/opt/qm/bin")
+	brief, err := WriteBrief(id, []byte("Do it.\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	launchS := LaunchScript(p, tier, "task-a", id, "/work/my repo", brief, "/opt/qm/bin")
 	resume := ResumeScript(p, tier, "task-a", id, "/work/my repo", "/opt/qm/bin")
 
-	prompt := " \"$(printf '\\n'; cat /briefs/a.md)\"\n"
+	prompt := " '\n" + workerPrompt(briefFile{brief, brief}) + "'\n"
 	want := strings.Replace(strings.TrimSuffix(launchS, prompt)+"\n", " --session-id "+id, " --resume "+id, 1)
 	if !strings.HasSuffix(launchS, prompt) || resume != want {
 		t.Errorf("resume script =\n%s\nwant the launch script with --resume and no prompt:\n%s", resume, want)
 	}
-	if strings.Contains(resume, "--session-id") || strings.Contains(resume, "cat ") {
+	if strings.Contains(resume, "--session-id") || strings.Contains(resume, "You are") {
 		t.Errorf("resume script still sets the id or reads a prompt:\n%s", resume)
 	}
 	if !strings.Contains(resume, " QM_PROJECT_ID=try-00000000 QM_WORKSPACE=try ") {
@@ -79,8 +83,10 @@ func TestCoordinatorScriptPrompt(t *testing.T) {
 		"PATH=/opt/qm/bin:/usr/bin:\"$PATH\"\nexport PATH\n" +
 		"cd /work/try || exit 1\n" +
 		"exec env QM_PROJECT_ID=try-00000000 QM_WORKSPACE=try QM_SESSION_NAME=try-coord " + handoff +
-		" claude --permission-mode acceptEdits -n try-coord --session-id 00000000-0000-4000-8000-000000000002" +
-		" \"$(printf '\\n'; cat '/state/up/try'\\''s summary.md')\"\n"
+		" claude --permission-mode acceptEdits" +
+		` --settings '{"permissions":{"allow":["Read(//state/up/try'\''s summary.md)"]}}'` +
+		" -n try-coord --session-id 00000000-0000-4000-8000-000000000002" +
+		" '\nYou continue an earlier session. First read all of the file /state/up/try'\\''s summary.md, with Read: it is qm'\\''s summary of that session.'\n"
 	if got, err := CoordinatorScript(c); err != nil || got != want {
 		t.Errorf("script = %v\n%s\nwant\n%s", err, got, want)
 	}

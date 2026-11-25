@@ -12,6 +12,7 @@ import (
 
 	"github.com/IZZY-Agency/quartermaster/internal/claudecode"
 	"github.com/IZZY-Agency/quartermaster/internal/launch"
+	"github.com/IZZY-Agency/quartermaster/internal/plain"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
 	"github.com/IZZY-Agency/quartermaster/internal/spawn"
 )
@@ -37,6 +38,12 @@ type Deps struct {
 	Pin         func(ctx context.Context, id string) error
 	Exe         string
 	Coordinator []string
+	// Model is the config's model and fallback for a coordinator that starts
+	// from scratch (none when empty). ModelCheck says why claude cannot use
+	// them ("" when it can; nil: no check); it is called only when they are
+	// to be used.
+	Model      CoordinatorModel
+	ModelCheck func() string
 	// MCPConfigs are the config's project_mcp files: a restored worker
 	// keeps its recorded MCP config only when it is one of them.
 	MCPConfigs []string
@@ -78,13 +85,12 @@ type Deps struct {
 // capped at: the project's saved ones, lowered to the running coordinator's
 // own when it runs stricter (spawn.LowerPermission of both). A live read can
 // only lower what the saved arguments allow, so prompt text misread as a
-// flag cannot raise the cap, and neither can a coordinator not seen running
-// (its session file unreadable, say): the saved arguments are then the cap,
-// as before live reads. The coordinator is any of ids, the sessions this
+// flag cannot raise the cap. The coordinator is any of ids, the sessions this
 // restore's coordinator step stands for (coordinatorIDs), and the saved
 // coordinator; when several run, the weakest of their flags. When a running
-// coordinator's flags cannot be read it fails rather than fall back on the
-// saved ones, which could allow more than the coordinator has.
+// coordinator's flags cannot be read, or it cannot be told whether it runs (a
+// session file that cannot be read, say), it fails rather than fall back on
+// the saved ones, which could allow more than the coordinator has.
 func coordinatorCap(p *Project, ids []string, d Deps) ([]string, error) {
 	if d.CoordinatorArgs == nil {
 		return p.ClaudeArgs, nil
@@ -153,7 +159,9 @@ type Outcome struct {
 	Ref          launch.SessionRef
 	NewSessionID string
 	Script       string
-	Err          error
+	// Model is the model and fallback the coordinator was given.
+	Model ModelChoice
+	Err   error
 	// Here says the coordinator is to start in the tab qm up runs in: its
 	// script is ready, and the caller runs it in place of qm when Err is nil.
 	Here bool
@@ -166,14 +174,15 @@ type Outcome struct {
 
 // Apply carries out the plan (spec 6): stale tmux windows closed, then the
 // coordinator, then the workers; each session started is recorded in
-// p.Sessions, the state saved after it, and a kind "up" Record logged for
+// p.Sessions, the state saved after it (a new session's id before it too,
+// reserve), and a kind "up" Record logged for
 // every step, leave and skip included. Live agterm sessions of the project
 // are pinned again. A failure on one session is its Outcome's Err; the rest go
 // on. The plan carried out is d.Stale, the one shown, when set: an idle
 // agterm tab recorded for a session is reused, not closed. Without a launcher, Apply only writes the scripts and starts nothing:
-// no terminal session is recorded and no kind "up" Record logged, but a
-// fresh session's new id is (the new coordinator in the state, a fresh
-// worker's Record), so a printed line once run is a session the next qm up
+// no terminal session is recorded and no kind "up" Record logged (but
+// a defaulted coordinator's, logScript), but a fresh session's new id
+// is (the new coordinator in the state, a fresh worker's Record), so a printed line once run is a session the next qm up
 // knows, and the duplicate guard covers it. With d.Here, a coordinator that
 // starts comes last: its script is written, the tab qm up runs in recorded
 // (d.Here), the state saved and its Record logged, launcher or not, but it is
@@ -224,18 +233,21 @@ func Apply(ctx context.Context, p *Project, steps []Step, d Deps) []Outcome {
 			if starting {
 				o.Ref = repin(ctx, p, s, d)
 			}
+			leftCurrent(p, s, &o)
 		case Resume, Fresh:
 			start(ctx, p, order, s, d, sp, coordIDs, &o)
 			if w := append(slices.Clone(warnings[s.SessionID]), nonEmpty(o.warn)...); len(w) > 0 {
 				o.Ref.Warning = strings.Join(append(w, nonEmpty(o.Ref.Warning)...), "; ")
 			}
 		}
+		id := o.Step.SessionID
+		if o.NewSessionID != "" {
+			id = o.NewSessionID
+		}
 		if (starting || o.Here) && o.Err == nil {
-			id := o.Step.SessionID
-			if o.NewSessionID != "" {
-				id = o.NewSessionID
-			}
 			logUp(d, p, o.Step, id, d.now(), &o)
+		} else {
+			logScript(d, p, o.Step, id, d.now(), &o)
 		}
 		if s.Role == RoleCoordinator {
 			coordIDs = coordinatorIDs(p, &o)
@@ -356,12 +368,16 @@ func PlanStale(ctx context.Context, p *Project, steps []Step, d Deps) *StalePlan
 		if !ok || rec.ID == "" {
 			continue
 		}
+		shown := false
 		for _, l := range listed {
+			shown = shown || sameWindow(rec, l)
 			if l.ID == "" || keepID[l.ID] || taken[l.ID] || (rec.Launcher != "" && rec.Launcher != l.Launcher) || !sameWindow(rec, l) {
 				continue
 			}
 			taken[l.ID] = true
 			switch {
+			case l.Linked:
+				sp.Notes = append(sp.Notes, fmt.Sprintf("%s: its window (%s %s): %s: left open, a new window will be opened", oneLine(s.Name), l.Launcher, l.ID, launch.LinkedWhy))
 			case l.Launcher != "agterm" && (rec.Adopted || !l.Idle):
 				// The user's own window (adopted), or one that runs
 				// something other than a shell now: never closed.
@@ -379,6 +395,11 @@ func PlanStale(ctx context.Context, p *Project, steps []Step, d Deps) *StalePlan
 				sp.Notes = append(sp.Notes, fmt.Sprintf("%s: its tab (agterm %s) is busy: left open, a new tab will be opened", oneLine(s.Name), l.ID))
 			}
 		}
+		if !shown && !keepID[rec.ID] {
+			if why := movedWhy(ctx, d.Lister, p.Workspace, rec); why != "" {
+				sp.Notes = append(sp.Notes, fmt.Sprintf("%s: its window (%s %s): %s: left open, a new window will be opened", oneLine(s.Name), rec.Launcher, rec.ID, why))
+			}
+		}
 	}
 	return sp
 }
@@ -390,21 +411,26 @@ func RenderStale(sp *StalePlan) string {
 		return ""
 	}
 	var b strings.Builder
+	// say writes one line: nothing of the names and listings it shows can
+	// start another.
+	say := func(format string, args ...any) {
+		b.WriteString(plain.Line(fmt.Sprintf(format, args...)) + "\n")
+	}
 	for _, r := range sp.reused {
-		fmt.Fprintf(&b, "reuse %s (%s %s)\n", orDash(oneLine(r.name)), r.ref.Launcher, r.ref.ID)
+		say("reuse %s (%s %s)", orDash(oneLine(r.name)), r.ref.Launcher, r.ref.ID)
 	}
 	for _, s := range sp.Close {
-		fmt.Fprintf(&b, "will close: %s (%s %s), a stale shell of %s\n", orDash(oneLine(s.Ref.Name)), s.Ref.Launcher, s.Ref.ID, oneLine(s.Step.Name))
+		say("will close: %s (%s %s), a stale shell of %s", orDash(oneLine(s.Ref.Name)), s.Ref.Launcher, s.Ref.ID, oneLine(s.Step.Name))
 	}
 	for _, n := range sp.Notes {
-		fmt.Fprintln(&b, n)
+		say("%s", n)
 	}
 	seen := map[string]bool{}
 	for _, ws := range sp.Warn {
 		for _, w := range ws {
 			if !seen[w] {
 				seen[w] = true
-				fmt.Fprintf(&b, "warning: %s\n", w)
+				say("warning: %s", w)
 			}
 		}
 	}
@@ -440,9 +466,9 @@ func closeStale(ctx context.Context, sp *StalePlan, d Deps) map[string][]string 
 }
 
 // staleNow lists stale window ref's workspace again: gone when the window
-// is no longer listed as the same window (its id and name), so there is
-// nothing to close; else why it is left open now when it is no longer an
-// idle window of the panes it was planned with ("" to close it).
+// is gone, so there is nothing to close; else why it is left open now when it
+// is no longer the same idle window of the panes it was planned with, in this
+// tmux session alone ("" to close it).
 func staleNow(ctx context.Context, ref launch.SessionRef, d Deps) (gone bool, why string) {
 	if d.Lister == nil {
 		return false, "its workspace cannot be listed again"
@@ -452,13 +478,22 @@ func staleNow(ctx context.Context, ref launch.SessionRef, d Deps) (gone bool, wh
 		return false, "its workspace was not listed again: " + err.Error()
 	}
 	for _, l := range listed {
-		if l.Launcher != ref.Launcher || !sameWindow(ref, l) {
+		if l.Launcher != ref.Launcher || l.ID != ref.ID {
 			continue
+		}
+		if !sameWindow(ref, l) {
+			return false, launch.Renamed(ref, l)
+		}
+		if l.Linked {
+			return false, launch.LinkedWhy
 		}
 		if !l.Idle || l.Panes != ref.Panes {
 			return false, "it runs something now, or has another pane"
 		}
 		return false, ""
+	}
+	if why := movedWhy(ctx, d.Lister, ref.Workspace, ref); why != "" {
+		return false, why
 	}
 	return true, ""
 }
@@ -493,7 +528,9 @@ func repin(ctx context.Context, p *Project, s Step, d Deps) launch.SessionRef {
 }
 
 // start writes the script of a resume or fresh step and, with a launcher,
-// starts it in the project's workspace, records it and saves the state. With
+// starts it in the project's workspace, records it and saves the state; a new
+// session's id is saved before it is started (reserve), and withdrawn when the
+// launch fails. With
 // d.Live it first reads the running sessions again: a session that started
 // running while qm up asked (resumed by hand) is left, and o.Step becomes a
 // leave with a warning; a failed read starts nothing.
@@ -511,7 +548,7 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 			defer unlock()
 		}
 	}
-	if (d.Launcher != nil || here) && d.Live != nil {
+	if d.Live != nil {
 		live, err := d.Live()
 		if err != nil {
 			o.Err = fmt.Errorf("the running sessions were not read again, so %s was not started (it may have been resumed by hand meanwhile): %w", s.Name, err)
@@ -524,6 +561,9 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 			o.Step.Action, o.Step.Why = Leave, "it started running while qm up asked"
 			o.Ref.Warning = "it started running while qm up asked: left as it is, not started again"
 			keepRunningRef(ctx, p, s, id, d)
+			if _, ok := live[s.Instead]; !ok {
+				leftCurrent(p, s, o)
+			}
 			return
 		}
 	}
@@ -535,12 +575,17 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 	sid := s.SessionID
 	switch {
 	case s.Role == RoleCoordinator && s.Action == Resume:
-		script, err = coordinatorScript(p, sid, "", true, d.Exe)
+		o.Model = resumeModel(p, sid, d)
+		script, err = coordinatorScript(p, sid, "", true, o.Model, d.Exe)
 	case s.Role == RoleCoordinator:
 		var summary string
 		if summary, err = writeSummary(p, steps, s, d); err == nil {
 			if sid, err = spawn.NewSessionID(); err == nil {
-				script, err = coordinatorScript(p, sid, summary, false, d.Exe)
+				if summary, err = spawn.CopyBrief(sid, summary); err != nil {
+					break
+				}
+				o.Model = FreshModel(p.ClaudeArgs, d)
+				script, err = coordinatorScript(p, sid, summary, false, o.Model, d.Exe)
 			}
 		}
 	case s.Adopted != nil:
@@ -598,6 +643,9 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 		if sid, err = spawn.NewSessionID(); err != nil {
 			break
 		}
+		if note, err = spawn.CopyBrief(sid, note); err != nil {
+			break
+		}
 		script = spawn.LaunchScript(prof, tier, s.Name, sid, s.Cwd, note, qmDir)
 		// The fields of the worker's start (spec 5.3), not a copy: the old
 		// Record's coordinator session or override no longer apply.
@@ -622,6 +670,12 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 		return
 	}
 	done := "script " + o.Script + " written"
+	now := d.now()
+	fresh := Session{ID: sid, Name: s.Name, Started: now}
+	// Saved with the id, before the session starts.
+	p.setDefaultModel(sid, o.Model.Model)
+	// withdraw undoes the reservation of a new session the launcher starts.
+	var withdraw func() error
 	switch {
 	case here:
 		// Started by the caller in place of qm: the tab qm up runs in is
@@ -650,9 +704,21 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 			p.drop(s.Instead)
 		}
 	case d.Launcher != nil:
+		if sid != s.SessionID {
+			if newRec != nil {
+				newRec.Time = now
+			}
+			if withdraw, err = p.reserve(s, sid, fresh, newRec); err != nil {
+				o.Err = fmt.Errorf("%s not started: the project was not saved: %w", s.Name, err)
+				return
+			}
+		}
 		var reused bool
 		if o.Ref, reused, err = launchStep(ctx, p, s, d, sp, o.Script); err != nil {
 			o.Err = err
+			if withdraw != nil {
+				o.Err = startFailed(p, sid, newRec, withdraw, d, err, o.Script)
+			}
 			return
 		}
 		if reused {
@@ -674,18 +740,10 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 	} else if _, ok := p.Sessions[s.SessionID]; ok {
 		p.drop(s.SessionID)
 	}
-	now := d.now()
 	var problems []string
-	if s.Role == RoleCoordinator && s.SessionID != p.Coordinator.ID {
-		// Gather fell back to a past coordinator (the current one never
-		// ran): it is the project's coordinator again.
-		p.PastCoordinators = slices.DeleteFunc(p.PastCoordinators, func(id string) bool { return id == s.SessionID })
-		p.Coordinator = Session{ID: s.SessionID, Name: s.Name, Started: s.Started}
-	}
 	switch {
-	case s.Role == RoleCoordinator && sid != s.SessionID:
-		p.PastCoordinators = append(p.PastCoordinators, s.SessionID)
-		p.Coordinator = Session{ID: sid, Name: s.Name, Started: now}
+	case s.Role == RoleCoordinator && withdraw == nil: // else reserved already
+		p.takeCoordinator(s, sid, fresh)
 	case newRec != nil:
 		newRec.Time = now
 		newRec.Detail = o.Ref.Launcher + " " + o.Ref.ID
@@ -694,10 +752,8 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 			newRec.Detail = "no launcher: " + o.Script
 			newRec.TermLauncher, newRec.TermID = "", ""
 		}
-		if d.Log != nil {
-			if err := d.Log(*newRec); err != nil {
-				problems = append(problems, "its worker Record was not logged: "+err.Error())
-			}
+		if err := logStarted(p, sid, *newRec, d); err != nil {
+			problems = append(problems, "its worker Record was not logged: "+err.Error())
 		}
 	}
 	if err := Save(*p); err != nil {
@@ -706,6 +762,48 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 	if len(problems) > 0 {
 		o.Err = fmt.Errorf("%s %s, but %s", s.Name, done, strings.Join(problems, "; "))
 	}
+}
+
+// startFailed is the error of a fresh start whose launch failed with err: the
+// reservation of sid is withdrawn. One that may have started all the same
+// (launch.ErrMaybeStarted) stays held: a coordinator's reservation is kept, a
+// worker's Record rec logged, as for a line printed for the user to run. The
+// next qm up leaves the session when it runs, and restores the previous one
+// when it never ran.
+func startFailed(p *Project, sid string, rec *route.Record, withdraw func() error, d Deps, err error, script string) error {
+	if !errors.Is(err, launch.ErrMaybeStarted) {
+		if werr := withdraw(); werr != nil {
+			return fmt.Errorf("%w; its reservation was not withdrawn (the next qm up recovers it): the project was not saved: %w", err, werr)
+		}
+		return err
+	}
+	if rec == nil {
+		return err
+	}
+	rec.Detail = spawn.DetailMaybeStarted + script
+	if lerr := logStarted(p, sid, *rec, d); lerr != nil {
+		err = fmt.Errorf("%w; its worker Record was not logged: %w", err, lerr)
+	}
+	if serr := Save(*p); serr != nil {
+		err = fmt.Errorf("%w; the project was not saved: %w", err, serr)
+	}
+	return err
+}
+
+// logStarted logs the Record r of a worker started fresh under sid and ends
+// its reservation. A Record that cannot be logged stays reserved, for the
+// next qm up to log (RecoverStarts).
+func logStarted(p *Project, sid string, r route.Record, d Deps) error {
+	if d.Log != nil {
+		if err := d.Log(r); err != nil {
+			if _, ok := p.Starting[sid]; ok {
+				p.Starting[sid] = r
+			}
+			return err
+		}
+	}
+	p.unreserve(sid)
+	return nil
 }
 
 // launchStep starts the script of step s: in its recorded idle agterm tab
@@ -737,7 +835,7 @@ func launchStep(ctx context.Context, p *Project, s Step, d Deps, sp *StalePlan, 
 		return ref, true, nil
 	}
 	if !errors.Is(err, launch.ErrRefused) {
-		return launch.SessionRef{}, false, fmt.Errorf("%w; the tab (agterm %s) may have received the launch line: look at it before running qm up again", err, old.ID)
+		return launch.SessionRef{}, false, fmt.Errorf("%w: %w; the tab (agterm %s) may have received the launch line: look at it before running qm up again", launch.ErrMaybeStarted, err, old.ID)
 	}
 	if ref, err = d.Launcher.Spawn(ctx, spec); err != nil {
 		return ref, false, err
@@ -806,11 +904,10 @@ func waitStarted(ctx context.Context, d Deps, outs []Outcome) {
 	}
 	why := "claude did not start"
 	for i := 0; len(pending) > 0; i++ {
-		if live, err := d.Live(); err == nil {
-			for id := range pending {
-				if _, ok := live[id]; ok {
-					delete(pending, id)
-				}
+		live, _ := d.Live() // those read, when not all are known
+		for id := range pending {
+			if _, ok := live[id]; ok {
+				delete(pending, id)
 			}
 		}
 		if len(pending) == 0 {
@@ -858,6 +955,20 @@ func keepRunningRef(ctx context.Context, p *Project, s Step, id string, d Deps) 
 	_ = Save(*p)
 }
 
+// leftCurrent makes a past coordinator that runs, restored by hand after the
+// current one never ran, the project's coordinator again when its step s is
+// left, and saves the state: what the coordinator is asked (qm up handoff)
+// is asked of the one that works. The never-run id stays held.
+func leftCurrent(p *Project, s Step, o *Outcome) {
+	if s.Role != RoleCoordinator || s.SessionID == p.Coordinator.ID {
+		return
+	}
+	p.takeCoordinator(s, s.SessionID, Session{})
+	if err := Save(*p); err != nil {
+		o.Ref.Warning = strings.Join(append(nonEmpty(o.Ref.Warning), "it is not saved as the project's coordinator: "+err.Error()), "; ")
+	}
+}
+
 // replaces is the session a fresh start from s replaces: the never-run
 // session s stands in for, else s's own.
 func replaces(s Step) string {
@@ -882,6 +993,7 @@ func logUp(d Deps, p *Project, s Step, id string, now time.Time, o *Outcome) {
 	r := route.Record{
 		Time: now, Kind: "up", Project: p.Root, UpProject: p.ID, Action: string(s.Action),
 		ClaudeSession: id, Name: s.Name, Detail: s.Why, Cwd: s.Cwd, Branch: s.Branch,
+		DefaultModel: p.DefaultModels[id],
 	}
 	if id != s.SessionID {
 		r.Replaces = s.SessionID

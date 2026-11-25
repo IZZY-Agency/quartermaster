@@ -9,9 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"time"
+
+	"github.com/IZZY-Agency/quartermaster/internal/gitcmd"
 )
 
 // errNoFolder: the folder git would run in does not exist, so it is in no
@@ -22,21 +23,15 @@ var errNoFolder = errors.New("not a git repository: no such folder")
 const gitTimeout = 5 * time.Second
 
 // runGit runs git with args in dir and returns its standard output; tests
-// replace it. GIT_DIR, GIT_WORK_TREE and GIT_COMMON_DIR are removed from its
-// environment, so an inherited one (qm run from a git hook) does not make
-// git answer for another repository.
+// replace it. No GIT_* variable reaches it (gitcmd), so an inherited one does
+// not make git answer for another repository, or for none.
 var runGit = func(dir string, args ...string) ([]byte, error) {
 	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
 		return nil, fmt.Errorf("%w: %w", errNoFolder, err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool {
-		k, _, _ := strings.Cut(kv, "=")
-		return k == "GIT_DIR" || k == "GIT_WORK_TREE" || k == "GIT_COMMON_DIR"
-	})
-	out, err := cmd.Output()
+	out, err := gitcmd.Command(ctx, dir, args...).Output()
 	if err != nil && ctx.Err() != nil {
 		return nil, fmt.Errorf("git: %w", ctx.Err())
 	}

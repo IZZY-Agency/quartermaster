@@ -155,9 +155,11 @@ type sessionFile struct {
 // start time (a pid reused after a reboot fails this); or (b) a claude
 // process's arguments carry --resume ID, -r ID, --resume=ID, --session-id ID
 // or --session-id=ID. A missing sessions folder leaves (b) only; a session
-// file that cannot be read is skipped.
+// file that cannot be read, and a folder that cannot be listed, are skipped:
+// a session missing from the result may run. A caller that acts on a
+// session's absence uses LiveComplete.
 func Live(claudeDir string, procs []Proc) (map[string]LiveSession, error) {
-	return live(context.Background(), claudeDir, procs, time.Local)
+	return LiveCtx(context.Background(), claudeDir, procs)
 }
 
 // LiveCtx is Live that stops between session files when ctx ends, with
@@ -166,45 +168,163 @@ func LiveCtx(ctx context.Context, claudeDir string, procs []Proc) (map[string]Li
 	return live(ctx, claudeDir, procs, time.Local)
 }
 
+// LiveComplete is LiveCtx that tells a session's absence from data it could
+// not read: what it skips is an *IncompleteError, returned together with the
+// sessions it did read. That is a sessions folder that exists but cannot be
+// listed, and a session file that cannot be read, or names no session, or
+// names another process than its name does, or has a start time that cannot
+// be compared, unless it is certain that no
+// running claude process wrote it: a file that is gone when it is read, and
+// one whose name is the pid of a process that is not running or not claude,
+// are absence. A file caught half-written is read again a few times first. A
+// process run by the path of an installed claude version is claude here.
+func LiveComplete(ctx context.Context, claudeDir string, procs []Proc) (map[string]LiveSession, error) {
+	out, unread, err := probe(ctx, claudeDir, procs, time.Local, true)
+	if err == nil && len(unread) > 0 {
+		err = &IncompleteError{Unread: unread}
+	}
+	return out, err
+}
+
+// Unread is a session file, or the sessions folder (Folder), that could not
+// be read while it may name a running session. PID is the claude process
+// that wrote the file, 0 when its name does not say.
+type Unread struct {
+	Path   string
+	PID    int
+	Folder bool
+	Err    error
+}
+
+func (u Unread) String() string {
+	err := u.Err
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		err = pe.Err // the path is named once
+	}
+	switch {
+	case u.Folder:
+		return fmt.Sprintf("Claude Code's sessions folder %s cannot be listed (%v): make it readable", u.Path, err)
+	case u.PID > 0:
+		return fmt.Sprintf("the session file %s of the running claude process %d cannot be read (%v): make it readable, or exit that Claude session", u.Path, u.PID, err)
+	}
+	return fmt.Sprintf("the session file %s cannot be read (%v): make it readable, or remove it", u.Path, err)
+}
+
+// IncompleteError says which session data LiveComplete could not read, so a
+// session it did not return may still be running, and how to recover.
+type IncompleteError struct{ Unread []Unread }
+
+func (e *IncompleteError) Error() string {
+	parts := make([]string, len(e.Unread))
+	for i, u := range e.Unread {
+		parts[i] = u.String()
+	}
+	return "the running Claude sessions are not all known: " + strings.Join(parts, "; ")
+}
+
+func (e *IncompleteError) Unwrap() []error {
+	errs := make([]error, len(e.Unread))
+	for i, u := range e.Unread {
+		errs[i] = u.Err
+	}
+	return errs
+}
+
 // live is LiveCtx with the zone ps prints lstart in.
 func live(ctx context.Context, claudeDir string, procs []Proc, local *time.Location) (map[string]LiveSession, error) {
-	byPID := make(map[int]Proc, len(procs))
+	out, _, err := probe(ctx, claudeDir, procs, local, false)
+	return out, err
+}
+
+// probe reads the live sessions, and what it could not read. Only a complete
+// probe reads a half-written file again.
+func probe(ctx context.Context, claudeDir string, procs []Proc, local *time.Location, complete bool) (map[string]LiveSession, []Unread, error) {
+	claudes := make(map[int]Proc, len(procs))
 	out := map[string]LiveSession{}
 	for _, p := range procs {
-		byPID[p.PID] = p
 		args, ok := IsClaude(p.Cmd)
+		if complete {
+			args, ok = ClaudeArgs(p.Cmd)
+		}
 		if !ok {
 			continue
 		}
+		claudes[p.PID] = p
 		if id, name := sessionOfArgs(args); id != "" {
 			out[id] = LiveSession{PID: p.PID, SessionID: id, Name: name}
 		}
 	}
-	files, err := filepath.Glob(filepath.Join(claudeDir, "sessions", "*.json"))
-	if err != nil {
-		return nil, fmt.Errorf("session files: %w", err)
+	dir := filepath.Join(claudeDir, "sessions")
+	var unread []Unread
+	// Entries listed before a failure are read all the same.
+	entries, err := os.ReadDir(dir)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		unread = append(unread, Unread{Path: dir, Folder: true, Err: err})
 	}
-	for _, f := range files {
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		s, err := readSessionFile(f)
-		if err != nil {
-			continue // unreadable, gone since the glob, or not JSON: skipped
+		path := filepath.Join(dir, e.Name())
+		pid := pidOfName(e.Name())
+		_, running := claudes[pid]
+		// Only a claude process that runs, or may (no pid in the name), makes
+		// an unreadable file worth another read, and the data incomplete.
+		mayRun := running || pid == 0
+		s, err := readSessionFile(path, pid)
+		for i := 0; complete && mayRun && i < liveRetries && errors.Is(err, errHalfWritten); i++ {
+			liveWait(ctx)
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+			s, err = readSessionFile(path, pid)
 		}
-		p, ok := byPID[s.PID]
-		if !ok || s.SessionID == "" {
-			continue
+		p, ok := claudes[s.PID]
+		same := s.ProcStart == "" || ok && sameStart(s.ProcStart, p.Start, local)
+		if err == nil && ok && !same && !comparableStarts(s.ProcStart, p.Start) {
+			err = fmt.Errorf("its start time %q cannot be compared with the process's %q", s.ProcStart, p.Start)
 		}
-		if _, ok := IsClaude(p.Cmd); !ok {
-			continue
+		if err != nil && mayRun && !errors.Is(err, fs.ErrNotExist) {
+			unread = append(unread, Unread{Path: path, PID: pid, Err: err})
 		}
-		if s.ProcStart != "" && !sameStart(s.ProcStart, p.Start, local) {
-			continue
+		if complete && err != nil {
+			continue // not a session file to go by, whoever it names
+		}
+		if !ok || s.SessionID == "" || !same {
+			continue // not read, or not a running claude's
 		}
 		out[s.SessionID] = LiveSession{PID: s.PID, SessionID: s.SessionID, Cwd: s.Cwd, Name: s.Name}
 	}
-	return out, nil
+	return out, unread, nil
+}
+
+// pidOfName is the pid a session file is named by (<pid>.json), 0 when its
+// name is no pid.
+func pidOfName(name string) int {
+	pid, err := strconv.Atoi(strings.TrimSuffix(name, ".json"))
+	if err != nil || pid <= 0 {
+		return 0
+	}
+	return pid
+}
+
+// liveRetries is how often LiveComplete reads a half-written session file
+// again, waiting liveRetry before each.
+const (
+	liveRetries = 4
+	liveRetry   = 50 * time.Millisecond
+)
+
+// liveWait waits liveRetry, or until ctx ends; tests replace it.
+var liveWait = func(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(liveRetry):
+	}
 }
 
 // SessionsNote says, when <claudeDir>/sessions is missing or cannot be
@@ -222,16 +342,39 @@ func SessionsNote(claudeDir string) string {
 	return fmt.Sprintf("Claude Code's sessions folder not read (%v): running sessions found from process arguments only", err)
 }
 
-func readSessionFile(path string) (sessionFile, error) {
-	var s sessionFile
+// errHalfWritten: a session file was read but its content is not a whole
+// session, as a writer caught midway leaves it.
+var errHalfWritten = errors.New("not a whole session file")
+
+// readSessionFile reads the session file at path, named by pid (0: by none).
+// A file that parses is returned even when it is not a whole session.
+func readSessionFile(path string, pid int) (sessionFile, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return s, err
+		return sessionFile{}, err
 	}
+	var s sessionFile
 	if err := json.Unmarshal(b, &s); err != nil {
-		return s, err
+		return sessionFile{}, fmt.Errorf("%w: %w", errHalfWritten, err)
+	}
+	switch {
+	case pid == 0:
+		// Not named as Claude Code names a session file: it counts for what
+		// it says, and may well be none.
+	case s.SessionID == "" || s.PID <= 0:
+		return s, fmt.Errorf("%w: it names no session", errHalfWritten)
+	case s.PID != pid:
+		return s, fmt.Errorf("%w: it names process %d", errHalfWritten, s.PID)
 	}
 	return s, nil
+}
+
+// comparableStarts says whether procStart and lstart both parse, so that they
+// differ only when they name different instants (sameStart).
+func comparableStarts(procStart, lstart string) bool {
+	_, err1 := time.Parse(lstartLayout, collapse(procStart))
+	_, err2 := time.Parse(lstartLayout, collapse(lstart))
+	return err1 == nil && err2 == nil
 }
 
 // sameStart reports whether a session file's procStart and ps's lstart name
@@ -339,9 +482,14 @@ var statFile = func(path string) bool {
 }
 
 // IsClaude splits a command line as ps prints it (argv joined by spaces)
-// into claude's arguments, when the executable is claude: argv[0] is
-// "claude", or a path ending in "/claude", which may hold spaces as long as
-// that path is an existing file.
+// into claude's arguments, when it runs claude: argv[0] is "claude", or a
+// path ending in "/claude", which may hold spaces as long as that path is an
+// existing file; or argv[0] is the path of an existing version file of
+// Claude Code's own installer (.../claude/versions/<version>). A process
+// writes its own command line, so this alone proves nothing: what gives a
+// permission flag away also checks the executable (spawn.ParentPermission).
+// A claude that node runs is not taken: its executable is node's, and only
+// its command line would tell it from any other script.
 func IsClaude(cmd string) ([]string, bool) {
 	f := strings.Fields(cmd)
 	if len(f) == 0 {
@@ -361,7 +509,40 @@ func IsClaude(cmd string) ([]string, bool) {
 		}
 		i = end + next
 	}
+	if path, args, ok := versionedClaude(cmd); ok && statFile(path) {
+		return args, true
+	}
 	return nil, false
+}
+
+// ClaudeArgs are claude's arguments in the command line of a process that
+// LiveComplete takes for claude: IsClaude, or run by the path of an installed
+// version whose file is gone (an update removes old ones while they run).
+// What acts on a session LiveComplete returned reads them so.
+func ClaudeArgs(cmd string) ([]string, bool) {
+	if args, ok := IsClaude(cmd); ok {
+		return args, true
+	}
+	_, args, ok := versionedClaude(cmd)
+	return args, ok
+}
+
+// versionedClaude splits a command line whose argv[0] is the path of a
+// version of Claude Code's own installer (.../claude/versions/<version>)
+// into that path and the arguments. It does not look for the file.
+func versionedClaude(cmd string) (path string, args []string, ok bool) {
+	const dir = "/claude/versions/"
+	i := strings.Index(cmd, dir)
+	// The path is argv[0]: absolute, with no argument before it (a space in
+	// it is one in a folder's name).
+	if i < 0 || !strings.HasPrefix(cmd, "/") || strings.Contains(cmd[:i], " /") || strings.Contains(cmd[:i], " -") {
+		return "", nil, false
+	}
+	version, rest, _ := strings.Cut(cmd[i+len(dir):], " ")
+	if version == "" || strings.Contains(version, "/") {
+		return "", nil, false
+	}
+	return cmd[:i+len(dir)+len(version)], strings.Fields(rest), true
 }
 
 // maxAncestors bounds the walk of Ancestor (as spawn.ParentPermission's).

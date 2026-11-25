@@ -16,7 +16,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/IZZY-Agency/quartermaster/internal/config"
 	"github.com/IZZY-Agency/quartermaster/internal/limits"
+	"github.com/IZZY-Agency/quartermaster/internal/plain"
 	"github.com/IZZY-Agency/quartermaster/internal/policy"
 	"github.com/IZZY-Agency/quartermaster/internal/reviewin"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
@@ -71,10 +73,11 @@ func spawnReview(args []string, stdout, stderr io.Writer) int {
 	case err == nil, errors.Is(err, flag.ErrHelp):
 		return 0
 	case errors.Is(err, errUsage):
-		_, _ = fmt.Fprintf(stderr, "qm spawn review: %v\n%s", err, spawnUsage)
+		printErr(stderr, "qm spawn review", err)
+		_, _ = fmt.Fprint(stderr, spawnUsage)
 		return 2
 	default:
-		_, _ = fmt.Fprintf(stderr, "qm spawn review: %v\n", err)
+		printErr(stderr, "qm spawn review", err)
 		return 1
 	}
 }
@@ -129,11 +132,7 @@ func newReview(r reviewRequest, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	codex, err := limits.Codex(codexLook)
-	if err != nil {
-		codex = limits.CodexState{Reason: "Codex usage unreadable: " + err.Error()}
-	}
-	d, err := route.DecideReview(context.Background(), in, deps.ask, deps.gate, codex, claudeState(stderr))
+	d, err := route.DecideReview(context.Background(), in, deps.ask, deps.gate, deps.codex(limits.CodexAsk), claudeState(stderr))
 	if err != nil {
 		return routeError(err)
 	}
@@ -228,6 +227,9 @@ func runReviewJob(id string) error {
 	if p, err := claudeLook("claude"); err == nil {
 		r.Claude = p
 	}
+	if cfg, err := config.Load(); err == nil {
+		r.CodexRead = limits.CodexAsk.If(cfg.CodexUsageRead())
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, reviewTimeout)
@@ -285,7 +287,7 @@ func printReview(id, dir string, stdout io.Writer) error {
 		if err != nil {
 			return fmt.Errorf("review %s: %w", id, err)
 		}
-		_, err = fmt.Fprintf(stdout, "review %s: done\n%s", id, b)
+		_, err = fmt.Fprintf(stdout, "review %s: done\n%s", id, plain.JSON(b))
 		return err
 	case spawn.StatusFailed:
 		return fmt.Errorf("review %s failed; log: %s", id, filepath.Join(dir, "log"))

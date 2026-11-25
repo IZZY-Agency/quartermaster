@@ -326,3 +326,51 @@ func TestParseForeground(t *testing.T) {
 		}
 	}
 }
+
+// touch makes the file path with its folders.
+func touch(t *testing.T, path string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// A version file of Claude Code's own installer, run directly, is claude:
+// argv[0] is its path, which must be that of an existing file.
+func TestIsClaudeVersionedBinary(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "My Home")
+	bin := touch(t, filepath.Join(home, ".local", "share", "claude", "versions", "2.1.300"))
+	if args, ok := IsClaude(bin + " --model m"); !ok || !slices.Equal(args, []string{"--model", "m"}) {
+		t.Errorf("IsClaude(versioned) = %q, %v, want [--model m], true", args, ok)
+	}
+	if args, ok := IsClaude(bin); !ok || len(args) != 0 {
+		t.Errorf("IsClaude(versioned, no argument) = %q, %v, want none, true", args, ok)
+	}
+	nested := touch(t, filepath.Join(home, ".local", "share", "claude", "versions", "2.1.300.d", "rg"))
+	for _, cmd := range []string{
+		filepath.Join(home, ".local", "share", "claude", "versions", "9.9.9") + " --model m", // no such file
+		nested + " --files",
+		"/bin/sh -c " + bin + " --model m",
+	} {
+		if args, ok := IsClaude(cmd); ok {
+			t.Errorf("IsClaude(%q) = %q, true, want false", cmd, args)
+		}
+	}
+}
+
+// A process writes its own command line, and the executable of a script that
+// node runs is node's: nothing but the command line would tell Claude Code's
+// script from any other, so node is never claude.
+func TestIsClaudeNotThroughNode(t *testing.T) {
+	root := t.TempDir()
+	cli := touch(t, filepath.Join(root, "lib", "node_modules", "@anthropic-ai", "claude-code", "cli.js"))
+	for _, node := range []string{"node", "/usr/local/bin/node", "nodejs"} {
+		if args, ok := IsClaude(node + " " + cli + " --dangerously-skip-permissions"); ok {
+			t.Errorf("IsClaude(%s running cli.js) = %q, true, want false", node, args)
+		}
+	}
+}

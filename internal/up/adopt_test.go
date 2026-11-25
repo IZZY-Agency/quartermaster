@@ -101,6 +101,9 @@ type adoptWorld struct {
 	windowPanes                      map[string]int   // by window id; 1 when absent
 	notFg                            map[string]bool  // tmux windows whose pane's foreground is another job
 	paneErr                          map[string]error // tmux windows whose pane's foreground cannot be read
+	tty                              map[int]string   // a process's terminal; its own one when absent
+	bg                               map[int]bool     // processes not in their terminal's foreground
+	fgErr                            map[int]error    // processes whose terminal cannot be read
 	agterm                           *adoptTerm
 	untrusted                        map[string]bool
 	logged                           []route.Record
@@ -121,6 +124,7 @@ func newAdoptWorld(t *testing.T) *adoptWorld {
 		term: map[int]claudecode.TermEnv{
 			411: {AgtermSession: "s-c"}, 412: {AgtermSession: "s-q"}, 413: {AgtermSession: "s-h"},
 		},
+		tty: map[int]string{}, bg: map[int]bool{}, fgErr: map[int]error{},
 		panes:     map[string][3]string{},
 		untrusted: map[string]bool{},
 		starts: map[string]time.Time{
@@ -239,6 +243,14 @@ func (w *adoptWorld) deps() AdoptDeps {
 		TermOf: func(pid int) (claudecode.TermEnv, error) { return w.term[pid], nil },
 		Live: func() (map[string]claudecode.LiveSession, error) {
 			return claudecode.Live(w.claude, w.procs)
+		},
+		Procs: func() ([]claudecode.Proc, error) { return w.procs, nil },
+		Foreground: func(_ context.Context, pid int) (string, bool, error) {
+			tty, ok := w.tty[pid]
+			if !ok {
+				tty = fmt.Sprintf("ttys%03d", pid)
+			}
+			return tty, !w.bg[pid], w.fgErr[pid]
 		},
 		Trusted: func(dir string) (bool, error) { return !w.untrusted[dir], nil },
 		Log: func(r route.Record) error {

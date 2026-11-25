@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/IZZY-Agency/quartermaster/internal/hooks"
 	"github.com/IZZY-Agency/quartermaster/internal/outcomes"
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
+	"github.com/IZZY-Agency/quartermaster/internal/spawn"
 	"github.com/IZZY-Agency/quartermaster/internal/transcript"
 	"github.com/IZZY-Agency/quartermaster/internal/up"
 	"github.com/IZZY-Agency/quartermaster/internal/watch"
@@ -31,11 +33,14 @@ const watchUsage = `usage:
 
 Waits until a worker of this project stops, goes silent or goes away, prints
 why and exits 0. Run it in the background: its exit wakes the coordinator.
+A worker that ended its turn while a background task of its own runs, or a
+wakeup is scheduled, is waiting: that is no event, and the watch goes on.
 With names it watches those workers, else every unfinished worker. Each stop,
 silence and disappearance is reported once: a worker already stopped, silent
 or gone at the start is reported at once, unless an earlier watch reported it,
-and then it is listed as (reported) and not waited for. A watch prints and
-exits only for the events it reported itself.
+and then it is listed as (reported), and only a silent one is waited for: it
+can still stop. A watch prints and exits only for the events it reported
+itself.
 
   --silent DURATION    silence threshold (default: watch.silent_minutes, 10m)
   --timeout DURATION   give up after this long, exit 0 (default: none)
@@ -101,13 +106,13 @@ func watchExit(err error, sig int, stderr io.Writer) int {
 		}
 		return 128 + sig
 	case errors.Is(err, errUsage), errors.Is(err, watch.ErrUnknownName), errors.Is(err, errNoProject):
-		_, _ = fmt.Fprintf(stderr, "qm watch: %v\n", err)
+		printErr(stderr, "qm watch", err)
 		if !errors.Is(err, errNoProject) {
 			_, _ = fmt.Fprint(stderr, watchUsage)
 		}
 		return 2
 	default:
-		_, _ = fmt.Fprintf(stderr, "qm watch: %v\n", err)
+		printErr(stderr, "qm watch", err)
 		return 1
 	}
 }
@@ -172,6 +177,10 @@ func watchMain(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		return errNoProject
 	}
 	home, _ := os.UserHomeDir()
+	tints, err := cfg.Tints()
+	if err != nil {
+		printLine(stderr, "qm watch: note: %s", tintNotes("", err)[0])
+	}
 	return watch.Run(ctx, watch.Options{Names: f.names, Timeout: f.timeout, Start: start, Interval: f.interval}, watch.Deps{
 		Snapshot: func(ctx context.Context) (watch.Snapshot, error) { return workersSnapshot(ctx, p.ID, f.silent) },
 		Now:      watchNow,
@@ -180,9 +189,11 @@ func watchMain(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		Notify: func(ctx context.Context, text string) error {
 			return hooks.NotifyContext(ctx, cfg, "qm watch", text)
 		},
-		Home: home,
-		Out:  stdout,
-		Err:  stderr,
+		Tint:  watchTints(p.ID, tints, start),
+		Tints: fileMarks{path: tintMarksPath(p.ID)},
+		Home:  home,
+		Out:   stdout,
+		Err:   stderr,
 	})
 }
 
@@ -265,10 +276,18 @@ func readWorkers(id string, silent time.Duration) (watch.Snapshot, error) {
 	if !ok {
 		return watch.Snapshot{}, errNoProject
 	}
+	// With the workers a qm spawn worker that stopped left reserved: they may
+	// run. One still being started is shown once it is logged.
+	starting, err := spawn.ListStarting()
+	if err != nil {
+		return watch.Snapshot{}, err
+	}
+	starting = slices.DeleteFunc(starting, func(s spawn.Starting) bool { return s.Running })
 	recs, err := declog.Read(time.Time{})
 	if err != nil {
 		return watch.Snapshot{}, err
 	}
+	recs = spawn.AddStarting(recs, starting)
 	handoff, err := up.HandoffDir()
 	if err != nil {
 		return watch.Snapshot{}, err
@@ -313,6 +332,10 @@ func readWorkers(id string, silent time.Duration) (watch.Snapshot, error) {
 		}
 	}
 	s := watch.Snapshot{Rows: watch.Rows(p.Root, cands, m)}
+	tabs := watch.Tabs(p, recs, cands)
+	for i := range s.Rows {
+		s.Rows[i].Tab = tabs[s.Rows[i].SessionID]
+	}
 	if m.Detect != nil {
 		s.Note = m.Detect.Error()
 	}
@@ -326,7 +349,7 @@ func hookTurn(sessionID string) watch.Turn {
 	if err != nil || !t.Known {
 		return watch.Turn{}
 	}
-	return watch.Turn{Known: true, Open: t.Open, At: t.At, PID: t.PID}
+	return watch.Turn{Known: true, Open: t.Open, At: t.At, PID: t.PID, Pending: t.Tasks > 0 || t.Crons > 0}
 }
 
 // marksPath is where qm watch keeps a project's marks:
@@ -337,6 +360,17 @@ func marksPath(id string) string {
 		return ""
 	}
 	return filepath.Join(dir, "watch", id+".json")
+}
+
+// tintMarksPath is where qm watch keeps what it tinted, beside the marks of the
+// events and under a lock of its own: a tint may take seconds, and must not
+// hold up another watch's report.
+func tintMarksPath(id string) string {
+	p := marksPath(id)
+	if p == "" {
+		return ""
+	}
+	return strings.TrimSuffix(p, ".json") + ".tints.json"
 }
 
 // fileMarks keeps the marks in one JSON file. Update takes an exclusive

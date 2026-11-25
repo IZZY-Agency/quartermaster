@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"slices"
 
 	"github.com/IZZY-Agency/quartermaster/internal/claudecode"
@@ -14,7 +16,8 @@ import (
 // parent), looked up in the live sessions. One process may hold two ids
 // (the one its arguments name and the one its session file names, after
 // /clear or an in-session /resume), so every one is returned, sorted. None
-// when there is no claude ancestor or its session is not known.
+// when there is no claude ancestor or it has no session; an error when its
+// session is not known because the session data could not be read.
 func callerSessions() ([]string, error) {
 	procs, err := upProcs()
 	if err != nil {
@@ -28,8 +31,9 @@ func callerSessions() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	live, err := claudecode.Live(dir, procs)
-	if err != nil {
+	live, err := claudecode.LiveComplete(context.Background(), dir, procs)
+	var inc *claudecode.IncompleteError
+	if err != nil && !errors.As(err, &inc) {
 		return nil, err
 	}
 	var ids []string
@@ -37,6 +41,11 @@ func callerSessions() ([]string, error) {
 		if l.PID == anc.PID {
 			ids = append(ids, id)
 		}
+	}
+	if inc != nil && len(ids) == 0 && slices.ContainsFunc(inc.Unread, func(u claudecode.Unread) bool {
+		return u.PID == anc.PID || u.PID == 0 // the caller's, or no known process's
+	}) {
+		return nil, inc
 	}
 	slices.Sort(ids)
 	return ids, nil

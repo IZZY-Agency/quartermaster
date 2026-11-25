@@ -123,3 +123,15 @@ func TestReportFindsFinishedWorker(t *testing.T) {
 		t.Errorf("output:\n%s", out.String())
 	}
 }
+
+// qm report takes flags only: a word would be dropped, and the flags after
+// it with it ("qm report week --since 2026-01-01" would print all of time).
+func TestReportRefusesArguments(t *testing.T) {
+	hermetic(t)
+	for _, args := range [][]string{{"report", "week"}, {"report", "week", "--since", "2026-01-01"}, {"report", "--baseline", "--", "--before"}} {
+		var out, errb bytes.Buffer
+		if code := run(args, &out, &errb); code != 2 || !strings.Contains(errb.String(), "unexpected argument") || out.Len() != 0 {
+			t.Errorf("%v: exit %d, stdout %q, stderr %q", args, code, out.String(), errb.String())
+		}
+	}
+}

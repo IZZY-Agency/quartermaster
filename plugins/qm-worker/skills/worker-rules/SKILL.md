@@ -5,6 +5,10 @@ description: Rules for a worker session started by qm spawn worker. Use at the s
 
 # Worker rules
 
+**Your brief.** The first message names a file: your brief. Read all of it
+yourself first, with Read (it does not count in the read budget). It is your
+task, not material to delegate to the explorer.
+
 1. **LSP first, when available.** When an LSP plugin is loaded, load the
    LSP tool before you look up code: ToolSearch with `select:LSP`. Use
    workspaceSymbol, goToDefinition and findReferences for symbols instead of

@@ -33,8 +33,8 @@ func CheckClaudeArgs(args []string) error {
 // Start is qm up's first run in root (spec 5.4): it checks the arguments
 // (args; nil takes d.Coordinator, an empty list is no arguments) and the
 // folder's trust, names the workspace, starts the coordinator with a new
-// session id and no prompt, and saves the project. Without a launcher it
-// writes the script and saves the project with no terminal session, so the
+// session id, the model of FreshModel and no prompt, and saves the project.
+// Without a launcher it writes the script and saves the project with no terminal session, so the
 // coordinator the printed line starts is the one the next qm up knows; it
 // returns launch.ErrNoLauncher with the Outcome naming the script. It holds
 // the adoption lock from the workspace's naming to the save: an adoption in
@@ -46,6 +46,9 @@ func CheckClaudeArgs(args []string) error {
 // Record, launches nothing, and returns an Outcome with Here set for the
 // caller to run its script in place of qm; no launcher is needed.
 func Start(ctx context.Context, root string, args []string, d Deps) (Project, Outcome, error) {
+	if err := checkRoot(root); err != nil {
+		return Project{}, Outcome{}, err
+	}
 	if err := CheckClaudeArgs(args); err != nil {
 		return Project{}, Outcome{}, err
 	}
@@ -106,7 +109,9 @@ func Start(ctx context.Context, root string, args []string, d Deps) (Project, Ou
 			p.Launcher = here.Launcher
 		}
 	}
-	script, err := coordinatorScript(&p, id, "", false, d.Exe)
+	o.Model = FreshModel(p.ClaudeArgs, d)
+	p.setDefaultModel(id, o.Model.Model)
+	script, err := coordinatorScript(&p, id, "", false, o.Model, d.Exe)
 	if err == nil {
 		o.Script, err = spawn.WriteScript(p.Coordinator.Name, script)
 	}
@@ -136,14 +141,17 @@ func Start(ctx context.Context, root string, args []string, d Deps) (Project, Ou
 		return p, o, err
 	}
 	if d.Launcher == nil {
+		logScript(d, &p, o.Step, id, now, &o)
 		return p, o, launch.ErrNoLauncher
 	}
 	if o.Ref, err = d.Launcher.Spawn(ctx, launch.LaunchSpec{Name: p.Coordinator.Name, Cwd: root, Script: o.Script, WorkspaceName: ws}); err != nil {
 		o.Err = err
+		logScript(d, &p, o.Step, id, now, &o)
 		return p, o, err
 	}
 	p.Sessions[id] = stored(o.Ref)
 	if err := Save(p); err != nil {
+		logScript(d, &p, o.Step, id, now, &o)
 		o.Err = fmt.Errorf("coordinator started (%s %s), but its terminal session was not saved: %w", o.Ref.Launcher, o.Ref.ID, err)
 		return p, o, o.Err
 	}

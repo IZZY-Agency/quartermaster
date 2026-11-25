@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -30,10 +31,19 @@ func liveWorker(t *testing.T) {
 	})
 }
 
-// turnHook runs a turn hook for the test worker's session.
-func turnHook(t *testing.T, name, event string) {
+// turnHook runs a turn hook for the test worker's session; each of tasks is
+// the type of a background task in flight (a Stop input's).
+func turnHook(t *testing.T, name, event string, tasks ...string) {
 	t.Helper()
-	b, err := json.Marshal(map[string]any{"session_id": upWorkerID, "hook_event_name": event, "cwd": t.TempDir()})
+	in := map[string]any{"session_id": upWorkerID, "hook_event_name": event, "cwd": t.TempDir()}
+	if event == "Stop" {
+		list := []map[string]any{}
+		for _, typ := range tasks {
+			list = append(list, map[string]any{"id": "t1", "type": typ, "status": "running"})
+		}
+		in["background_tasks"], in["session_crons"] = list, []any{}
+	}
+	b, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,6 +116,46 @@ func TestWatchWakesOnTurnStop(t *testing.T) {
 	got := out.String()
 	if !strings.Contains(got, "w stopped ") || !strings.Contains(got, "sonnet/low") || sleeps != 2 {
 		t.Fatalf("sleeps %d, out:\n%s", sleeps, got)
+	}
+}
+
+// waiting, resumed by its background command with no prompt hook, stopped:
+// one report, at the real stop.
+func TestWatchWaitsOutABackgroundTask(t *testing.T) {
+	m := newUpMachine(t)
+	m.worker(t, m.project(t), "w")
+	liveWorker(t)
+	turnHook(t, "turn-start", "UserPromptSubmit")
+	sleeps := 0
+	fakeClock(t, func(n int) {
+		sleeps = n
+		switch n {
+		case 1:
+			turnHook(t, "turn-stop", "Stop", "shell")
+		case 3:
+			turnHook(t, "turn-stop", "Stop")
+		}
+	})
+	var out, errb bytes.Buffer
+	if code := run([]string{"watch", "--silent", "100000h", "--interval", "1s", "--timeout", "10s"}, &out, &errb); code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, errb.String())
+	}
+	if got := out.String(); strings.Count(got, "w stopped ") != 1 || sleeps != 3 {
+		t.Fatalf("sleeps %d, out:\n%s", sleeps, got)
+	}
+}
+
+func TestStatusListsWaitingWorker(t *testing.T) {
+	m := newUpMachine(t)
+	m.worker(t, m.project(t), "w")
+	liveWorker(t)
+	turnHook(t, "turn-stop", "Stop", "shell")
+	var out, errb bytes.Buffer
+	if code := run([]string{"status"}, &out, &errb); code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, errb.String())
+	}
+	if got := out.String(); !regexp.MustCompile(`(?m)^  w +waiting `).MatchString(got) {
+		t.Fatalf("out:\n%s", got)
 	}
 }
 
