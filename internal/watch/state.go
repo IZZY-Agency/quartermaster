@@ -85,6 +85,9 @@ type Machine struct {
 // Row is one worker's line of the workers table.
 type Row struct {
 	Name string `json:"name"`
+	// Base is the name the worker was spawned with, before the project prefix
+	// ("" when unknown); a bare name given to qm watch is read by it.
+	Base string `json:"-"`
 	// SessionID is the worker's session as qm recorded it; Current the
 	// session its process runs now (another after /clear or a compaction).
 	SessionID string `json:"session_id"`
@@ -247,6 +250,9 @@ func rowOf(root string, c up.Candidate, m Machine, follow map[string]proc) Row {
 		Handoff:   c.Handoff,
 		Activity:  c.Started,
 		Cwd:       c.Cwd,
+	}
+	if c.Record != nil {
+		r.Base = c.Record.BaseName
 	}
 	id, pid, live := current(c, m, follow)
 	if !live {

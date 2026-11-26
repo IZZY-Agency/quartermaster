@@ -99,15 +99,23 @@ type Config struct {
 	Worker struct {
 		Plugins        []string `json:"plugins"`
 		HandoffPercent *int     `json:"handoff_percent,omitempty"`
+		// NamePrefix is what qm spawn worker puts in front of a worker's name:
+		// "auto" (nil, left out, means the same) is the project's workspace name,
+		// "" is nothing; project_name_prefix overrides it per project. Read it
+		// with NamePrefixMode.
+		NamePrefix *string `json:"name_prefix,omitempty"`
 	} `json:"worker"`
 	// Rules maps a rule name to on|note|off; a rule not listed is on.
 	Rules          map[string]string   `json:"rules"`
 	ProjectPlugins map[string][]string `json:"project_plugins"`
 	ProjectMCP     map[string]string   `json:"project_mcp"`
-	ReadBudget     int                 `json:"read_budget"`
-	WorkerWindow   map[string]int      `json:"worker_window"`
-	TypeSafeKey    string              `json:"typesafe_api_key,omitempty"`
-	Launcher       string              `json:"launcher"`
+	// ProjectNamePrefix maps a repository's folder to the prefix of its
+	// workers' names ("" for none), over worker.name_prefix.
+	ProjectNamePrefix map[string]string `json:"project_name_prefix"`
+	ReadBudget        int               `json:"read_budget"`
+	WorkerWindow      map[string]int    `json:"worker_window"`
+	TypeSafeKey       string            `json:"typesafe_api_key,omitempty"`
+	Launcher          string            `json:"launcher"`
 	// Report configures qm report. WorkerMarkers are extra regexes (case
 	// insensitive, multiline) that mark a session whose first prompt matches as
 	// a worker, next to the built-in worker-brief markers.
@@ -165,6 +173,7 @@ func Defaults() Config {
 	c.Rules = map[string]string{}
 	c.ProjectPlugins = map[string][]string{}
 	c.ProjectMCP = map[string]string{}
+	c.ProjectNamePrefix = map[string]string{}
 	c.ReadBudget = 8
 	c.WorkerWindow = map[string]int{"sonnet": 250000, "opus": 400000, "fable": 400000}
 	c.Launcher = "auto"
@@ -235,6 +244,9 @@ func fillNil(c *Config) {
 	}
 	if c.ProjectMCP == nil {
 		c.ProjectMCP = d.ProjectMCP
+	}
+	if c.ProjectNamePrefix == nil {
+		c.ProjectNamePrefix = d.ProjectNamePrefix
 	}
 	if c.WorkerWindow == nil {
 		c.WorkerWindow = d.WorkerWindow
@@ -307,6 +319,15 @@ func (c Config) Key() string {
 		return k
 	}
 	return c.TypeSafeKey
+}
+
+// NamePrefixMode is worker.name_prefix: "auto" when unset, "" for no prefix.
+// Any other value is the caller's to refuse, naming the key.
+func (c Config) NamePrefixMode() string {
+	if c.Worker.NamePrefix == nil {
+		return "auto"
+	}
+	return *c.Worker.NamePrefix
 }
 
 // DefaultHandoffPercent is worker.handoff_percent when it is unset.

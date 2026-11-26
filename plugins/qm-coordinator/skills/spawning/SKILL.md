@@ -9,6 +9,9 @@ description: How the coordinator starts workers and reviews through qm. Use befo
    `agtermctl session new`, tmux or a raw `claude` command; the launch gate
    denies them. Write the brief to a file, then run:
    `qm spawn worker --brief FILE --type TYPE --size S|M|L --hint MODEL/EFFORT --name NAME --cwd DIR`
+   - NAME is the task part only (`db-sync`): qm adds the project prefix
+     itself (`ut-db-sync`), keeps a name that already has it, and
+     `qm watch`, `qm finish` and `qm up done` take either form.
    - TYPE: feature, fix, fix-pass, docs, release-paperwork, research,
      migration, ui or review.
    - Size S: one or two files or under ~50 lines; M: one feature in one
@@ -29,6 +32,11 @@ description: How the coordinator starts workers and reviews through qm. Use befo
    with a background task of its own running or a wakeup scheduled: leave
    it, the watch waits on. So it does for a live worker already reported
    silent.
+   After a message to a stopped worker, when no watch of the project is
+   running (it said `no worker (left) to wait for`), run `qm watch NAME`: it
+   waits for the worker to start again (`--wait-start`, 2 minutes), then
+   watches it. A running project watch needs no second one: it reports the
+   worker's next stop.
 3. **Reviews only through `qm spawn review`.** Never run `codex exec` or
    `codex review` yourself: `qm spawn review --prompt FILE [--repo DIR]`.
    qm counts the round and measures the diff itself, for the branch checked
@@ -45,7 +53,10 @@ description: How the coordinator starts workers and reviews through qm. Use befo
 7. **Mark finished workers.** Once you accept a worker's report as
    finished, run `qm up done NAME` with the worker's name, so `qm up`
    never restores it. qm finds the project from your folder when
-   `QM_PROJECT_ID` is unset.
+   `QM_PROJECT_ID` is unset. Once its pull request is merged, run
+   `qm finish NAME` instead: it marks it done, closes its tab, removes its
+   worktree and deletes its branches, each only when it can prove that safe,
+   and says why it left anything. `qm finish --dry-run NAME` shows the plan.
 8. **Wrap up with a handoff note.** When the owner asks you to wrap up,
    write a handoff note to the file named by `$QM_HANDOFF`: the work in
    progress, each worker's state, open decisions and next steps, so the

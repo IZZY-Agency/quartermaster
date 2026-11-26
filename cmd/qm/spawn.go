@@ -143,6 +143,24 @@ func spawnWorker(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// The project's prefix goes in front of the name, here, so the dry run, the
+	// launch script, the log and the summary all carry the final name.
+	projectRoot := ""
+	if req.UpProject != "" {
+		if tied, ok, err := up.LoadID(req.UpProject); err == nil && ok {
+			projectRoot = tied.Root
+		} else {
+			printLine(stderr, "qm spawn: note: project %s not read: the prefix is read from the worker's own repository", req.UpProject)
+		}
+	}
+	full, prefixNote, err := up.PrefixName(cfg, req.Cwd, upWorkspace, projectRoot, req.Name)
+	if err != nil {
+		return err
+	}
+	if prefixNote != "" {
+		printLine(stderr, "qm spawn: note: %s", prefixNote)
+	}
+	req.BaseName, req.Name = req.Name, full
 	deps := spawn.Deps{
 		Config: cfg, Ask: rd.ask, Gate: rd.gate, Claude: claudeState(stderr),
 		Codex:  rd.cachedCodex,
@@ -170,7 +188,7 @@ func spawnWorker(args []string, stdout, stderr io.Writer) error {
 		if res.TintNote != "" {
 			printLine(stderr, "qm spawn: note: %s", res.TintNote)
 		}
-		_, err = fmt.Fprintf(stdout, "%s\nlauncher: %s\n%stint: %s\nbrief: %s, to be copied to %s\nscript (dry run, not written):\n%s", decisionLine(res.Decision), plain.Line(res.LauncherNote), trust, plain.Line(tintLine(res.Tint)), plain.Line(req.Brief), plain.Line(res.BriefPath), res.Script)
+		_, err = fmt.Fprintf(stdout, "%s\nname: %s\nlauncher: %s\n%stint: %s\nbrief: %s, to be copied to %s\nscript (dry run, not written):\n%s", decisionLine(res.Decision), plain.Line(req.Name), plain.Line(res.LauncherNote), trust, plain.Line(tintLine(res.Tint)), plain.Line(req.Brief), plain.Line(res.BriefPath), res.Script)
 		return err
 	}
 	return reportStarted(res, stdout, stderr)

@@ -29,7 +29,7 @@ import (
 )
 
 const watchUsage = `usage:
-  qm watch [--silent DURATION] [--timeout DURATION] [--interval DURATION] [NAME...]
+  qm watch [--silent DURATION] [--timeout DURATION] [--interval DURATION] [--wait-start DURATION] [NAME...]
 
 Waits until a worker of this project stops, goes silent or goes away, prints
 why and exits 0. Run it in the background: its exit wakes the coordinator.
@@ -45,6 +45,9 @@ itself.
   --silent DURATION    silence threshold (default: watch.silent_minutes, 10m)
   --timeout DURATION   give up after this long, exit 0 (default: none)
   --interval DURATION  time between checks (default 15s)
+  --wait-start DURATION  with names: how long a worker already reported
+                       stopped is waited for to work again (default 2m, 0: not
+                       waited for); --timeout still caps it
 `
 
 // watchNow and watchSleep are qm watch's clock; tests replace them.
@@ -105,7 +108,7 @@ func watchExit(err error, sig int, stderr io.Writer) int {
 			sig = int(syscall.SIGINT)
 		}
 		return 128 + sig
-	case errors.Is(err, errUsage), errors.Is(err, watch.ErrUnknownName), errors.Is(err, errNoProject):
+	case errors.Is(err, errUsage), errors.Is(err, watch.ErrUnknownName), errors.Is(err, up.ErrInput), errors.Is(err, errNoProject):
 		printErr(stderr, "qm watch", err)
 		if !errors.Is(err, errNoProject) {
 			_, _ = fmt.Fprint(stderr, watchUsage)
@@ -118,8 +121,8 @@ func watchExit(err error, sig int, stderr io.Writer) int {
 }
 
 type watchFlags struct {
-	silent, timeout, interval time.Duration
-	names                     []string
+	silent, timeout, interval, waitStart time.Duration
+	names                                []string
 }
 
 // parseWatch reads flags and names in any order.
@@ -128,12 +131,13 @@ func parseWatch(args []string, cfg config.Config) (watchFlags, error) {
 	if err != nil {
 		return watchFlags{}, err
 	}
-	f := watchFlags{silent: silent, interval: 15 * time.Second}
+	f := watchFlags{silent: silent, interval: 15 * time.Second, waitStart: 2 * time.Minute}
 	fl := flag.NewFlagSet("watch", flag.ContinueOnError)
 	fl.SetOutput(io.Discard)
 	fl.DurationVar(&f.silent, "silent", f.silent, "")
 	fl.DurationVar(&f.timeout, "timeout", 0, "")
 	fl.DurationVar(&f.interval, "interval", f.interval, "")
+	fl.DurationVar(&f.waitStart, "wait-start", f.waitStart, "")
 	for {
 		if err := fl.Parse(args); err != nil {
 			return watchFlags{}, fmt.Errorf("%w: %v", errUsage, err)
@@ -150,6 +154,8 @@ func parseWatch(args []string, cfg config.Config) (watchFlags, error) {
 		return watchFlags{}, fmt.Errorf("%w: --silent must be positive", errUsage)
 	case f.interval <= 0:
 		return watchFlags{}, fmt.Errorf("%w: --interval must be positive", errUsage)
+	case f.waitStart < 0:
+		return watchFlags{}, fmt.Errorf("%w: --wait-start must not be negative", errUsage)
 	case f.timeout < 0:
 		return watchFlags{}, fmt.Errorf("%w: --timeout must not be negative", errUsage)
 	}
@@ -181,7 +187,7 @@ func watchMain(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if err != nil {
 		printLine(stderr, "qm watch: note: %s", tintNotes("", err)[0])
 	}
-	return watch.Run(ctx, watch.Options{Names: f.names, Timeout: f.timeout, Start: start, Interval: f.interval}, watch.Deps{
+	return watch.Run(ctx, watch.Options{Names: f.names, Prefixes: up.Prefixes(cfg, p), Timeout: f.timeout, Start: start, Interval: f.interval, WaitStart: f.waitStart}, watch.Deps{
 		Snapshot: func(ctx context.Context) (watch.Snapshot, error) { return workersSnapshot(ctx, p.ID, f.silent) },
 		Now:      watchNow,
 		Sleep:    watchSleep,

@@ -18,17 +18,11 @@ import (
 // marks a running one. It returns the session's id; ErrInput when the
 // project has no worker of that name. The caller saves p.
 func MarkDone(p *Project, cands []Candidate, name string, now time.Time) (string, error) {
-	var marked *Candidate
 	// Gather lists the recorded workers, then the hand-started ones, each
 	// oldest first: the newest is the latest start across both, a tie going
 	// to the later listed.
-	for i := range cands {
-		c := &cands[i]
-		if c.Role == RoleWorker && c.Name == name && (marked == nil || !c.Started.Before(marked.Started)) {
-			marked = c
-		}
-	}
-	if marked == nil {
+	marked, ok := NewestWorker(cands, name)
+	if !ok {
 		return "", fmt.Errorf("%w: no worker %q in project %s", ErrInput, name, p.ID)
 	}
 	if p.Done == nil {

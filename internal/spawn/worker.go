@@ -23,10 +23,14 @@ import (
 
 // WorkerRequest is one qm spawn worker call.
 type WorkerRequest struct {
-	Brief     string // the brief file
-	Type      string // task type; review routes with the review table
-	Size      string // S, M or L
-	Name      string // the session's name
+	Brief string // the brief file
+	Type  string // task type; review routes with the review table
+	Size  string // S, M or L
+	Name  string // the session's name
+	// BaseName is Name before the project prefix was put in front of it
+	// (logged in the Record, so a bare name finds the worker); "" when the
+	// caller added none.
+	BaseName  string
 	Cwd       string // the folder the worker starts in
 	Workspace string // agterm workspace; "" is the current one
 	// WorkspaceName names the workspace instead (agterm, created when
@@ -296,7 +300,7 @@ func workerRecords(d route.Decision, req WorkerRequest, repo, branch string, rou
 	}
 	return append(recs, route.Record{
 		Time: now, Kind: "worker", Project: repo, Branch: branch, Name: req.Name,
-		Cwd: req.Cwd, UpProject: req.UpProject,
+		Cwd: req.Cwd, UpProject: req.UpProject, BaseName: req.BaseName,
 		ClaudeSession: sid, Type: req.Type, Size: req.Size,
 		Round: round, Override: req.ForceWhy, Decision: &d,
 	})

@@ -6,6 +6,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/IZZY-Agency/quartermaster/internal/config"
 	"github.com/IZZY-Agency/quartermaster/internal/declog"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
 	"github.com/IZZY-Agency/quartermaster/internal/spawn"
@@ -66,6 +67,35 @@ func spawnsResult(err error, ok bool) error {
 		return errQuiet
 	}
 	return err
+}
+
+// resolveWorkerName is the name of the worker of p that input means: input
+// itself, or the bare name of a prefixed worker (up.ResolveName: by the bare
+// name stored in its Record, else by the project's prefixes). Workers that are
+// finished (marked done, or their folder gone) are set aside when two answer
+// to the name. A config that does not read is noted on stderr, and no prefix is
+// guessed then (a stored bare name still matches).
+func resolveWorkerName(stderr io.Writer, cmd string, p up.Project, cands []up.Candidate, input string) (string, error) {
+	var prefixes []string
+	cfg, cerr := config.Load()
+	if cerr != nil {
+		printLine(stderr, "%s: note: the config does not read, so no prefix is guessed: %v", cmd, cerr)
+	} else {
+		prefixes = up.Prefixes(cfg, p)
+	}
+	var ws []up.NamedWorker
+	for _, c := range cands {
+		if c.Role != up.RoleWorker {
+			continue
+		}
+		w := up.NamedWorker{Name: c.Name, Finished: func() bool { return up.MarkedOrGone(p, c) }}
+		if c.Record != nil {
+			w.Base = c.Record.BaseName
+		}
+		ws = append(ws, w)
+	}
+	full, _, err := up.ResolveName(ws, input, prefixes)
+	return full, err
 }
 
 // doneOf is cands without the sessions of worker name that never ran (not

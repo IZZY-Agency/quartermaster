@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.0
+
+- **`qm finish NAME`** cleans up a worker whose pull request is merged, in
+  one step: it marks the worker done, closes its tab, removes its worktree,
+  deletes its local and remote branch and fast-forwards the main checkout,
+  each only when it can prove that safe, and says why it left anything.
+  `--dry-run` prints the plan and changes nothing. The coordinator skill now
+  runs it after a merge.
+- **`qm watch NAME` waits for a stopped worker.** With names, a worker already
+  reported stopped is waited for, up to `--wait-start` (2 minutes; `0` to not
+  wait), to work again, then watched as usual; so a coordinator can run it
+  right after a message to a stopped worker.
+- **Worker names carry the project.** `qm spawn worker` puts the project's
+  prefix in front of `--name` (`db-sync` becomes `<project>-db-sync`), so a
+  worker's tab, `qm status` line and notifications show its project. The
+  prefix is the project's workspace name, or a short one per repository in
+  `project_name_prefix`; `worker.name_prefix: ""` turns it off, and a name
+  that already has it is kept. `qm finish`, `qm up done` and `qm watch` take
+  the short name too, and refuse one that two unfinished workers answer to.
+
 ## 0.3.0
 
 - **Colours in agterm.** Coordinator tabs are purple and worker tabs teal,

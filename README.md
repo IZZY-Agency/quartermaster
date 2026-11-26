@@ -116,8 +116,10 @@ optional (see [Optional providers](#optional-providers)).
      --hint sonnet/low --name example-docs --cwd <repo>
    ```
 
-   It prints the decision (model, effort, the table row and the reasons) and the
-   launch script, and starts nothing. At a real spawn, qm copies the brief into
+   It prints the decision (model, effort, the table row and the reasons), the
+   worker's name and the launch script, and starts nothing. The name is the
+   project's prefix and `--name`, here `<project>-example-docs`: see
+   `worker.name_prefix` below. At a real spawn, qm copies the brief into
    its state folder and the worker's first prompt is one line that points to the
    copy, so the text is on no command line. `qm route worker` and `qm route review`
    print only the decision.
@@ -379,6 +381,8 @@ worker, without permission prompts.
 | `project_mcp` | `{}` | an MCP config file for a repository's workers: `{"<repo>": "<path to a .mcp.json>"}`; without one, workers get no MCP servers |
 | `rules` | `{}` | a rule's switch, `on`, `note` or `off`; see [The plugins' rules](#the-plugins-rules) |
 | `read_budget` | `8` | exploration reads a worker may do in one phase |
+| `worker.name_prefix` | `"auto"` | what `qm spawn worker` puts in front of `--name`, as `PREFIX-NAME`, so a worker's tab, `qm status` line and notifications show its project: `auto` is the project's workspace name (the one `qm up` uses for `<workspace>-coord`; before the project has one, the main repository folder's base name; a worker in a linked worktree belongs to the main repository's project), `""` is no prefix. A name that already is the prefix or starts with `PREFIX-` is kept. `qm finish`, `qm up done` and `qm watch` take the bare name as well as the full one, and refuse a bare name that two workers answer to, listing both. A prefix that is not a valid name is skipped with a note |
+| `project_name_prefix` | `{}` | a short prefix per repository, over `worker.name_prefix`: `{"<repo>": "ut"}`, keyed by the repository's absolute path (its main worktree's); `""` turns the prefix off for that repository; an unusable one is an error naming the key |
 | `worker.handoff_percent` | `85` | the share of its compact window at which a worker is told to finish its step, write a handoff note and report; a whole number from 1 to 99 (another value is shown by `qm status` and the default is used). Lower means shorter, cheaper sessions and more handoffs |
 | `worker_window` | `{"sonnet": 250000, "opus": 400000, "fable": 400000}` | each worker model's auto-compact window, in tokens |
 | `typesafe_api_key` | unset | the TypeSafe key; the `TYPESAFE_API_KEY` environment variable wins, and `qm init` never stores a key it read from there |
@@ -447,6 +451,7 @@ qm up --full       # resume every unfinished session in full
 qm up --adopt      # first run: take over the sessions already running here
 qm up --here       # start the coordinator in this tab, after the workers
 qm up done NAME    # mark a worker finished; it is never restored
+qm finish NAME     # a merged worker: done, tab closed, worktree and branches gone
 qm up note         # from any folder: the projects left without qm down
 qm down            # record the state and close the project's sessions
 ```
@@ -461,6 +466,25 @@ tied to the project. The coordinator's plugin tells it to run `qm up done NAME`
 when it accepts a worker's report as finished (in a coordinator started by
 `qm up`). That also ends the sessions of the name that never ran (a launch
 without an answer, then spawned again), when qm can see all running sessions.
+
+**Cleaning up a merged worker.** `qm finish NAME` does what follows a merge in
+one step, and only what it can prove safe. The proof comes first: the branch
+checked out in the worker's folder has a pull request that `gh` reports merged
+(asked in the worker's own repository, whatever `GH_REPO` says), its head is
+the branch's tip, and no pull request of the branch is still open. Without it
+nothing changes, and qm says why. With it, qm marks the worker done (as `qm up
+done`), takes the tint off its tab and closes it when it still runs the worker
+or an idle shell; removes its worktree with `git worktree remove` (never
+`--force`) when it has no uncommitted or untracked files, holds no other
+worktree or repository, and is no running process's current folder (its
+ignored files go with it, and qm names them); deletes the local branch only at
+the merged head and when no worktree has it checked out, and the remote branch
+with `git push --force-with-lease`, so only while its tip there is that head
+too; then fast-forwards the main checkout when it is on the default branch with
+no uncommitted changes. Each step prints one line, done or left and why, and a
+step that cannot run does not stop the ones that do not depend on it; a step
+that fails makes the exit status 1.
+`qm finish --dry-run NAME` prints each step and its proof, and changes nothing.
 
 **The coordinator's model.** A coordinator that starts from scratch (a first
 run, `--new`, or a restore that starts it fresh, in a new tab or here) starts
@@ -732,7 +756,7 @@ lives and can stop (qm keeps these marks in
 `~/.local/state/quartermaster/watch/`). Keep one watch per project (overlapping
 ones can report one stop twice, never lose one); restart it after dealing with
 what it reported. Without names it watches every worker;
-with names, only those. `--silent` overrides the threshold for one run, and
+with names, only those. With names, a worker already reported `stopped` is waited for, up to `--wait-start` (default 2 minutes, `0` to not wait; `--timeout` still caps it), to work again, then watched as usual; if it does not, the watch says so and exits: use it after a message to a stopped worker when no other watch of the project runs. `--silent` overrides the threshold for one run, and
 `--timeout` gives up after a while, exiting 0: it is one deadline for the
 whole watch, the marks lock and the notifier included. It runs no daemon and
 types into no session.
@@ -748,8 +772,8 @@ types into no session.
 | `qm spawn review ...` | route, run a review and return structured findings |
 | `qm report [--since DAY] [--baseline [--before DAY] [--project TEXT]]` | what workers cost and how their reviews went, by tier and by worker; with `--baseline`, flags rows that did worse than your earlier sessions |
 | `qm statusline [-- COMMAND]` | record Claude's usage limits from the status line, then run your own status-line command |
-| `qm up`, `qm up done NAME`, `qm up note [--notify]`, `qm down` | see [Projects](#projects-qm-up-and-qm-down) |
-| `qm watch [--silent D] [--timeout D] [--interval D] [NAME...]` | wait until a worker of this project stops, goes silent or goes away; see [Watching workers](#watching-workers-qm-watch) |
+| `qm up`, `qm up done NAME`, `qm up note [--notify]`, `qm down`, `qm finish [--dry-run] NAME` | see [Projects](#projects-qm-up-and-qm-down) |
+| `qm watch [--silent D] [--timeout D] [--interval D] [--wait-start D] [NAME...]` | wait until a worker of this project stops, goes silent or goes away; see [Watching workers](#watching-workers-qm-watch) |
 | `qm version` | print the version and commit |
 
 `qm hook NAME` and `qm feedback-analyze` are run by the plugins; you never run

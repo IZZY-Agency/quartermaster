@@ -655,7 +655,7 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 		newRec = &route.Record{
 			Kind: "worker", Project: old.Project, Branch: s.Branch, Name: s.Name,
 			Type: old.Type, Size: old.Size, Decision: &dec,
-			ClaudeSession: sid, Replaces: replaces(s), Cwd: s.Cwd, UpProject: p.ID,
+			ClaudeSession: sid, Replaces: replaces(s), Cwd: s.Cwd, UpProject: p.ID, BaseName: old.BaseName,
 		}
 	}
 	if err != nil {

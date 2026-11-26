@@ -529,3 +529,135 @@ func TestWatchTimeoutCutsTheNotifierAndLeavesTheRestUnclaimed(t *testing.T) {
 		t.Fatalf("marks %v, notified %q", f.store.marks, f.notified)
 	}
 }
+
+// A named worker already reported stopped is waited for to work again.
+func TestWatchNamedStoppedWaitsForStart(t *testing.T) {
+	f := &fake{store: memStore{marks: Marks{"s-a": {Stop: t0.UnixNano()}}},
+		snaps: []Snapshot{snap(row("a", Stopped, t0)), snap(row("a", Stopped, t0)), snap(row("a", Working, t0.Add(20*time.Second))), snap(row("a", Working, t0.Add(20*time.Second)), row("b", Stopped, t0))}}
+	o := opts()
+	o.Names = []string{"a"}
+	o.WaitStart = 2 * time.Minute
+	o.Timeout = time.Minute
+	if err := run(t, f, o); err != nil {
+		t.Fatal(err)
+	}
+	// It resumed, so the watch went on as usual until the timeout.
+	if f.calls < 4 || !strings.Contains(f.out.String(), "timeout after 1m0s") || strings.Contains(f.out.String(), "no worker") {
+		t.Fatalf("calls %d, out:\n%s", f.calls, f.out.String())
+	}
+}
+
+func TestWatchNamedStoppedResumesThenStops(t *testing.T) {
+	f := &fake{store: memStore{marks: Marks{"s-a": {Stop: t0.UnixNano()}}},
+		snaps: []Snapshot{snap(row("a", Stopped, t0)), snap(row("a", Working, t0.Add(20*time.Second))), snap(row("a", Stopped, t0.Add(40*time.Second)))}}
+	o := opts()
+	o.Names = []string{"a"}
+	o.WaitStart = 2 * time.Minute
+	if err := run(t, f, o); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.notified) != 1 || f.notified[0] != "a stopped" || f.calls != 3 {
+		t.Fatalf("calls %d notified %q out:\n%s", f.calls, f.notified, f.out.String())
+	}
+}
+
+func TestWatchNamedStoppedNeverResumes(t *testing.T) {
+	f := &fake{store: memStore{marks: Marks{"s-a": {Stop: t0.UnixNano()}}}, snaps: []Snapshot{snap(row("a", Stopped, t0))}}
+	o := opts()
+	o.Names = []string{"a"}
+	o.WaitStart = time.Minute
+	if err := run(t, f, o); err != nil {
+		t.Fatal(err)
+	}
+	out := f.out.String()
+	if !strings.Contains(out, "qm watch: no worker left to wait for") || !strings.Contains(out, "a did not start working within 1m0s") || !f.now.Equal(t0.Add(time.Minute)) || len(f.notified) != 0 {
+		t.Fatalf("now %v, out:\n%s", f.now, out)
+	}
+}
+
+func TestWatchNamedStoppedTimeoutCapsWait(t *testing.T) {
+	f := &fake{store: memStore{marks: Marks{"s-a": {Stop: t0.UnixNano()}}}, snaps: []Snapshot{snap(row("a", Stopped, t0))}}
+	o := opts()
+	o.Names = []string{"a"}
+	o.WaitStart = 2 * time.Minute
+	o.Timeout = 30 * time.Second
+	if err := run(t, f, o); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.out.String(), "timeout after 30s; no change") || !f.now.Equal(t0.Add(30*time.Second)) {
+		t.Fatalf("now %v, out:\n%s", f.now, f.out.String())
+	}
+}
+
+// Without names, and for a name that is not stopped, nothing changes.
+func TestWatchWaitStartOnlyForNamedStopped(t *testing.T) {
+	marks := Marks{"s-a": {Stop: t0.UnixNano()}}
+	f := &fake{store: memStore{marks: marks}, snaps: []Snapshot{snap(row("a", Stopped, t0))}}
+	o := opts()
+	o.WaitStart = 2 * time.Minute
+	if err := run(t, f, o); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.out.String(), "qm watch: no worker to wait for") || f.calls != 1 || strings.Contains(f.out.String(), "did not start") {
+		t.Fatalf("no names: calls %d out:\n%s", f.calls, f.out.String())
+	}
+	// A named worker that is gone is not waited for.
+	g := &fake{store: memStore{marks: Marks{"s-b": {Gone: "s-b"}}}, snaps: []Snapshot{snap(row("b", Gone, t0))}}
+	o.Names = []string{"b"}
+	if err := run(t, g, o); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(g.out.String(), "no worker to wait for") || g.calls != 1 {
+		t.Fatalf("gone: calls %d out:\n%s", g.calls, g.out.String())
+	}
+}
+
+// A worker that was working, or stopped again and another watch claimed it,
+// is not reported as one that never started.
+func TestWatchNamedStoppedNoFalseNeverStarted(t *testing.T) {
+	// a and b named; a reported stopped; b working, then its stop claimed elsewhere.
+	f := &fake{store: memStore{marks: Marks{"s-a": {Stop: t0.UnixNano()}, "s-b": {Stop: t0.Add(5 * time.Minute).UnixNano()}}},
+		snaps: []Snapshot{snap(row("a", Stopped, t0), row("b", Working, t0))}}
+	o := opts()
+	o.Names = []string{"a", "b"}
+	o.WaitStart = time.Minute
+	f.snapFn = func(context.Context) error {
+		if f.calls == 2 {
+			f.snaps = []Snapshot{snap(row("a", Stopped, t0), row("b", Stopped, t0.Add(5*time.Minute)))}
+		}
+		return nil
+	}
+	if err := run(t, f, o); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(f.out.String(), "b did not start") || !strings.Contains(f.out.String(), "a did not start") {
+		t.Fatalf("out:\n%s", f.out.String())
+	}
+}
+
+// The sleep is cut to the wait's end only while a start is awaited.
+func TestWatchSleepNotCutWithoutAwaitedStart(t *testing.T) {
+	f := &fake{snaps: []Snapshot{snap(row("a", Working, t0)), snap(row("a", Working, t0)), snap(row("a", Working, t0)), snap(row("a", Stopped, t0))}}
+	o := opts()
+	o.Interval = 50 * time.Second
+	o.WaitStart = 2 * time.Minute
+	if err := run(t, f, o); err != nil {
+		t.Fatal(err)
+	}
+	if !f.now.Equal(t0.Add(150*time.Second)) || f.calls != 4 {
+		t.Fatalf("now %v calls %d", f.now, f.calls)
+	}
+}
+
+func TestWatchAwaitedStartSaysSo(t *testing.T) {
+	f := &fake{store: memStore{marks: Marks{"s-a": {Stop: t0.UnixNano()}}}, snaps: []Snapshot{snap(row("a", Stopped, t0))}}
+	o := opts()
+	o.Names = []string{"a"}
+	o.WaitStart = time.Minute
+	if err := run(t, f, o); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(f.out.String(), "waiting up to 1m0s") != 1 {
+		t.Fatalf("out:\n%s", f.out.String())
+	}
+}

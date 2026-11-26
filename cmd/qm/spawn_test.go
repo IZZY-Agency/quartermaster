@@ -124,6 +124,7 @@ func TestReportStartedPrintsPinWarning(t *testing.T) {
 
 func TestSpawnWorkerDryRunShowsTheTint(t *testing.T) {
 	routeHermetic(t)
+	t.Setenv("QM_PROJECT_ID", "")
 	t.Setenv("AGTERM_SESSION_ID", "")
 	t.Setenv("TMUX", "")
 	t.Setenv("CLAUDE_PID", "")

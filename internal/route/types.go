@@ -81,6 +81,9 @@ type Record struct {
 	Cwd string `json:"cwd,omitempty"`
 	// UpProject ties a session to the qm up project it belongs to.
 	UpProject string `json:"up_project,omitempty"`
+	// BaseName is the name a worker was given with --name, before qm added the
+	// project prefix (Name has it); "" for a worker spawned without one.
+	BaseName string `json:"base_name,omitempty"`
 	// Replaces is the Claude session id a fresh session took over from.
 	Replaces string `json:"replaces,omitempty"`
 	// TermLauncher and TermID name the terminal session a worker was

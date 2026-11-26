@@ -228,7 +228,7 @@ func runUp(args []string, stdout, stderr io.Writer) int {
 	var err error
 	switch {
 	case len(args) > 0 && args[0] == "done":
-		err = upDone(args[1:], stdout)
+		err = upDone(args[1:], stdout, stderr)
 	case len(args) > 0 && args[0] == "handoff":
 		err = upHandoff(args[1:], stdout)
 	case len(args) > 0 && args[0] == "note":
@@ -1084,7 +1084,7 @@ func doneCandidates(p up.Project, recs []route.Record) (cands []up.Candidate, al
 // upDone runs qm up done NAME: the worker is finished and never restored.
 // The project is QM_PROJECT_ID's when set (a coordinator whose shell sits
 // in a worker's worktree), else the current folder's.
-func upDone(args []string, stdout io.Writer) error {
+func upDone(args []string, stdout, stderr io.Writer) error {
 	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
 		return fmt.Errorf("%w: qm up done takes one worker name", errUsage)
 	}
@@ -1105,13 +1105,13 @@ func upDone(args []string, stdout io.Writer) error {
 		}
 		id = found.ID
 	}
-	sid, never, tabs, err := markDone(id, where, args[0], stdout)
+	sid, never, tabs, err := markDone(id, where, args[0], "", stdout, stderr)
 	if err != nil {
 		return err
 	}
 	// Once it is saved, so a watch that still saw it recorded leaves no tint,
 	// and without the project's lock, which nobody waits for.
-	printNotes(stdout, clearTabs(tabs...))
+	printNotes(stdout, clearTabs(slices.Collect(maps.Values(tabs))...))
 	also := ""
 	if never > 0 {
 		also = fmt.Sprintf(", nor %d other session(s) of the name that never ran", never)
@@ -1123,8 +1123,9 @@ func upDone(args []string, stdout io.Writer) error {
 // markDone marks worker name of project id done under the project's lock. It
 // returns its session, how many sessions of the name that never ran it marked
 // besides (doneOf, when the running sessions are known), and the terminal
-// sessions recorded for those marked.
-func markDone(id, where, name string, stdout io.Writer) (sid string, never int, tabs []launch.SessionRef, err error) {
+// sessions recorded for those marked, by session id. With want set, it marks
+// nothing unless the session it would mark is want.
+func markDone(id, where, name, want string, stdout, stderr io.Writer) (sid string, never int, tabs map[string]launch.SessionRef, err error) {
 	unlock, err := up.Lock(id)
 	if err != nil {
 		return "", 0, nil, err
@@ -1149,6 +1150,9 @@ func markDone(id, where, name string, stdout io.Writer) (sid string, never int, 
 	if err != nil {
 		return "", 0, nil, err
 	}
+	if name, err = resolveWorkerName(stderr, "qm up", p, cands, name); err != nil {
+		return "", 0, nil, err
+	}
 	cands, failed, err := doneOf(name, cands, starting)
 	if err != nil {
 		return "", 0, nil, err
@@ -1156,6 +1160,9 @@ func markDone(id, where, name string, stdout io.Writer) (sid string, never int, 
 	now := time.Now().UTC()
 	if sid, err = up.MarkDone(&p, cands, name, now); err != nil {
 		return "", 0, nil, err
+	}
+	if want != "" && sid != want {
+		return "", 0, nil, fmt.Errorf("the newest worker %s is session %s now, not %s: nothing marked", name, sid, want)
 	}
 	for _, c := range failed {
 		if !allLive {
@@ -1171,9 +1178,10 @@ func markDone(id, where, name string, stdout io.Writer) (sid string, never int, 
 	if err := up.Save(p); err != nil {
 		return "", 0, nil, err
 	}
+	tabs = map[string]launch.SessionRef{}
 	for s, ref := range up.RecordedTabs(p, recs) {
 		if at, ok := p.Done[s]; ok && at.Equal(now) {
-			tabs = append(tabs, ref)
+			tabs[s] = ref
 		}
 	}
 	return sid, never, tabs, nil

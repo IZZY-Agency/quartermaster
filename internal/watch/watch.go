@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/IZZY-Agency/quartermaster/internal/plain"
+	"github.com/IZZY-Agency/quartermaster/internal/up"
 )
 
 // ErrUnknownName marks a watched name the project has no worker of.
@@ -141,10 +142,17 @@ type MarkStore interface {
 // to wait at most (0: no limit), counted from Start (zero: the first call of
 // Now), and how often to check.
 type Options struct {
-	Names    []string
+	Names []string
+	// Prefixes are the project's worker-name prefixes (up.Prefixes): a bare
+	// name in Names also means PREFIX-name.
+	Prefixes []string
 	Timeout  time.Duration
 	Start    time.Time
 	Interval time.Duration
+	// WaitStart is how long a named worker already reported stopped is waited
+	// for to work again (0: not waited for); it counts from Start and the
+	// timeout caps it.
+	WaitStart time.Duration
 }
 
 // Deps is what a watch reads and writes through. Snapshot, the marks and
@@ -232,7 +240,7 @@ func Run(ctx context.Context, o Options, d Deps) error {
 			reliable = rows
 		}
 		if first {
-			if err := w.checkNames(rows); err != nil {
+			if err := w.resolveNames(rows); err != nil {
 				return err
 			}
 		}
@@ -272,7 +280,8 @@ func (w *watcher) step(ctx context.Context, rows []Row, observed time.Time, firs
 	}
 	labels := map[string]string{}
 	var events []Row
-	left := 0 // the workers to wait for
+	left := 0         // the workers to wait for
+	var stopped []Row // named workers reported stopped: waited for to start again
 	for _, r := range rows {
 		switch r.State {
 		case Working, Waiting, Silent, Unknown:
@@ -285,6 +294,9 @@ func (w *watcher) step(ctx context.Context, rows []Row, observed time.Time, firs
 		case !isEvent:
 		case marks.reported(r):
 			labels[r.SessionID] = "reported"
+			if r.State == Stopped && len(w.o.Names) > 0 {
+				stopped = append(stopped, r)
+			}
 		default:
 			events = append(events, r)
 		}
@@ -308,7 +320,21 @@ func (w *watcher) step(ctx context.Context, rows []Row, observed time.Time, firs
 		}
 		// Every event was claimed by another watch: keep waiting for the rest.
 	}
+	w.trackAwaited(rows, stopped, first)
+	w.awaiting = false
+	if left == 0 && len(w.awaited) > 0 && w.waitingStart() {
+		if first {
+			w.print(fmt.Sprintf("qm watch: waiting up to %v for a stopped worker to start working\n", w.o.WaitStart))
+		}
+		w.awaiting = true
+		return false, nil
+	}
 	if left == 0 {
+		for _, r := range stopped {
+			if _, ok := w.awaited[r.SessionID]; ok {
+				w.print(fmt.Sprintf("qm watch: %s did not start working within %v\n", plain.Text(r.Name), w.o.WaitStart))
+			}
+		}
 		if first {
 			w.print("qm watch: no worker to wait for\n")
 		} else {
@@ -318,6 +344,35 @@ func (w *watcher) step(ctx context.Context, rows []Row, observed time.Time, firs
 	}
 	return false, nil
 }
+
+// trackAwaited keeps the workers waited for to start: at the first check the
+// named ones reported stopped (when WaitStart allows); later it drops each
+// that is no longer stopped with the same stop, since it started, or stopped
+// again.
+func (w *watcher) trackAwaited(rows, stopped []Row, first bool) {
+	if first {
+		w.awaited = map[string]int64{}
+		if w.o.WaitStart > 0 {
+			for _, r := range stopped {
+				w.awaited[r.SessionID] = r.StopAt.UnixNano()
+			}
+		}
+		return
+	}
+	for id, at := range w.awaited {
+		if !slices.ContainsFunc(stopped, func(r Row) bool { return r.SessionID == id && r.StopAt.UnixNano() == at }) {
+			delete(w.awaited, id)
+		}
+	}
+}
+
+// waitStartLeft is the time left to wait for a stopped worker to start.
+func (w *watcher) waitStartLeft() time.Duration {
+	return w.o.WaitStart - w.d.Now().Sub(w.start)
+}
+
+// waitingStart says whether the wait for a stopped worker to start goes on.
+func (w *watcher) waitingStart() bool { return w.waitStartLeft() > 0 }
 
 // bound is ctx limited to the time left to the timeout.
 func (w *watcher) bound(ctx context.Context, start time.Time) (context.Context, context.CancelFunc) {
@@ -333,7 +388,12 @@ type watcher struct {
 	d     Deps
 	start time.Time
 	noted bool
-	tints tinter
+	// awaited: named workers reported stopped at the first check, by session id
+	// (their stop's time), still waited for to start; awaiting says the last
+	// check kept waiting for one.
+	awaited  map[string]int64
+	awaiting bool
+	tints    tinter
 }
 
 // left is the time to the timeout; ok is false without one.
@@ -351,6 +411,11 @@ func (w *watcher) sleep(ctx context.Context, start time.Time) error {
 			return errTimeout
 		}
 		wait = min(wait, left)
+	}
+	if w.awaiting {
+		if left := w.waitStartLeft(); left > 0 {
+			wait = min(wait, left)
+		}
 	}
 	return w.d.Sleep(ctx, wait)
 }
@@ -387,6 +452,30 @@ func (w *watcher) end(ctx context.Context, err error) error {
 		return nil
 	}
 	return err
+}
+
+// resolveNames makes each watched name the full name of a worker: a bare name
+// is read with the project's prefixes in front (up.ResolveName), and an
+// ambiguous one is refused. Then it fails on a name no worker has.
+func (w *watcher) resolveNames(rows []Row) error {
+	if len(w.o.Names) == 0 {
+		return nil
+	}
+	existing := make([]up.NamedWorker, len(rows))
+	for i, r := range rows {
+		cwd := r.Cwd
+		existing[i] = up.NamedWorker{Name: r.Name, Base: r.Base, Finished: func() bool { return up.MarkedOrGone(up.Project{}, up.Candidate{Cwd: cwd}) }}
+	}
+	resolved := make([]string, len(w.o.Names))
+	for i, n := range w.o.Names {
+		full, _, err := up.ResolveName(existing, n, w.o.Prefixes)
+		if err != nil {
+			return err
+		}
+		resolved[i] = full
+	}
+	w.o.Names = resolved
+	return w.checkNames(rows)
 }
 
 // checkNames fails on a name no worker has.
