@@ -74,10 +74,12 @@ func TestUpScriptsUseStableBrewPaths(t *testing.T) {
 			wantBin := filepath.Join(prefix, "opt", "quartermaster", "bin")
 			wantPlugin := filepath.Join(prefix, "opt", "quartermaster", "share", "quartermaster", "plugins", "qm-worker")
 			script := readFile(t, o.Script)
-			for _, want := range []string{"PATH='" + wantBin + ":", "--plugin-dir " + wantPlugin + " "} {
-				if !strings.Contains(script, want) {
-					t.Errorf("script lacks %q:\n%s", want, script)
-				}
+			// The PATH line is quoted only when the inherited PATH needs it.
+			if !strings.Contains(script, "PATH='"+wantBin+":") && !strings.Contains(script, "PATH="+wantBin+":") {
+				t.Errorf("script's PATH does not start with %s:\n%s", wantBin, script)
+			}
+			if want := "--plugin-dir " + wantPlugin + " "; !strings.Contains(script, want) {
+				t.Errorf("script lacks %q:\n%s", want, script)
 			}
 			if strings.Contains(script, filepath.Join(prefix, "Cellar")) {
 				t.Errorf("script names the keg:\n%s", script)
