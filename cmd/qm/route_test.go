@@ -231,6 +231,53 @@ func TestRouteReviewFirstRound(t *testing.T) {
 	}
 }
 
+// TestRouteReviewDiff: qm route review, the preview of qm spawn review, sizes
+// the --diff range and refuses what qm spawn review refuses.
+func TestRouteReviewDiff(t *testing.T) {
+	routeHermetic(t)
+	repo := routeRepo(t)
+	routeFile(t, repo, "notes.txt", "one\ntwo\nthree\nfour\n")
+	routeGit(t, repo, "commit", "-q", "-am", "third")
+	prompt := routeFile(t, t.TempDir(), "prompt.md", "Check that the notes file reads well.\n")
+
+	d := routeJSON(t, "review", "--prompt", prompt, "--base", "main", "--diff", "HEAD~1..HEAD", "--repo", repo, "--json")
+	if !strings.Contains(strings.Join(d.Reasons, "|"), "diff 1 lines in 1 files") {
+		t.Errorf("reasons %v: want the size of the --diff range, not the branch's", d.Reasons)
+	}
+	for _, c := range []struct{ name, diff, want string }{
+		{"empty", "HEAD..HEAD", "nothing to review"},
+		{"not a range", "main", "want A..B or A...B"},
+		{"unknown", "nosuch..HEAD", "not a commit"},
+	} {
+		var out, errOut bytes.Buffer
+		if code := run([]string{"route", "review", "--prompt", prompt, "--base", "main", "--diff", c.diff, "--repo", repo}, &out, &errOut); code != 1 || !strings.Contains(errOut.String(), c.want) {
+			t.Errorf("%s: exit %d, stderr %q; want 1 and %q", c.name, code, errOut.String(), c.want)
+		}
+	}
+	if recs := routeLogged(t); len(recs) != 0 {
+		t.Errorf("%d records logged, want none", len(recs))
+	}
+}
+
+// TestRouteReviewTooLarge: the preview refuses a change over the 20 MB that
+// qm spawn review refuses, rather than routing it.
+func TestRouteReviewTooLarge(t *testing.T) {
+	routeHermetic(t)
+	repo := routeRepo(t)
+	line := strings.Repeat("x", 99) + "\n"
+	routeFile(t, repo, "big.txt", strings.Repeat(line, 21<<20/len(line)+1))
+	routeGit(t, repo, "add", ".")
+	routeGit(t, repo, "commit", "-q", "-m", "big")
+	prompt := routeFile(t, t.TempDir(), "prompt.md", "Check the big file.\n")
+	var out, errOut bytes.Buffer
+	if code := run([]string{"route", "review", "--prompt", prompt, "--base", "main", "--repo", repo}, &out, &errOut); code != 1 || !strings.Contains(errOut.String(), "larger than 20 MB") || !strings.Contains(errOut.String(), "--diff") {
+		t.Errorf("exit %d, stderr %q; want 1 and the size refusal", code, errOut.String())
+	}
+	if out.Len() != 0 {
+		t.Errorf("a decision was printed: %q", out.String())
+	}
+}
+
 func TestForceNeedsWhy(t *testing.T) {
 	routeHermetic(t)
 	brief := routeFile(t, t.TempDir(), "brief.md", "Fix a typo in the README.\n")

@@ -36,7 +36,8 @@ type Deps struct {
 	Lister      launch.Lister
 	Closer      launch.Closer
 	Pin         func(ctx context.Context, id string) error
-	Exe         string
+	Exe         string // the path qm was invoked as, "" when unknown
+	Running     string // the running executable, symlinks resolved
 	Coordinator []string
 	// Model is the config's model and fallback for a coordinator that starts
 	// from scratch (none when empty). ModelCheck says why claude cannot use
@@ -572,11 +573,13 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 		newRec *route.Record
 		err    error
 	)
+	// The plugin folder and qm's folder come from one look.
+	inst := spawn.Locate(d.Exe, d.Running)
 	sid := s.SessionID
 	switch {
 	case s.Role == RoleCoordinator && s.Action == Resume:
 		o.Model = resumeModel(p, sid, d)
-		script, err = coordinatorScript(p, sid, "", true, o.Model, d.Exe)
+		script, err = coordinatorScript(p, sid, "", true, o.Model, inst.Bin)
 	case s.Role == RoleCoordinator:
 		var summary string
 		if summary, err = writeSummary(p, steps, s, d); err == nil {
@@ -585,7 +588,7 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 					break
 				}
 				o.Model = FreshModel(p.ClaudeArgs, d)
-				script, err = coordinatorScript(p, sid, summary, false, o.Model, d.Exe)
+				script, err = coordinatorScript(p, sid, summary, false, o.Model, inst.Bin)
 			}
 		}
 	case s.Adopted != nil:
@@ -613,7 +616,7 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 			err = fmt.Errorf("hand-started worker %s: not started, %w", s.Name, err)
 			break
 		}
-		script = spawn.PlainResumeScript(args, env, s.Name, sid, s.Cwd, qmDirOf(d.Exe))
+		script = spawn.PlainResumeScript(args, env, s.Name, sid, s.Cwd, inst.Bin)
 	default:
 		if !spawn.ValidName(s.Name) {
 			err = fmt.Errorf("worker %s: name %q is not a usable session name: not started", s.SessionID, s.Name)
@@ -628,10 +631,10 @@ func start(ctx context.Context, p *Project, steps []Step, s Step, d Deps, sp *St
 			break
 		}
 		var prof route.Profile
-		if prof, o.warn, err = workerProfile(p, s, d.Exe, capArgs, d.MCPConfigs); err != nil {
+		if prof, o.warn, err = workerProfile(p, s, inst, capArgs, d.MCPConfigs); err != nil {
 			break
 		}
-		tier, qmDir := s.Record.Decision.Tier, qmDirOf(d.Exe)
+		tier, qmDir := s.Record.Decision.Tier, inst.Bin
 		if s.Action == Resume {
 			script = spawn.ResumeScript(prof, tier, s.Name, sid, s.Cwd, qmDir)
 			break

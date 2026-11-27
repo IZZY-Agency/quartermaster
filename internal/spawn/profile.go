@@ -44,37 +44,154 @@ var lspPlugins = []struct {
 	{"php", "php-lsp", []string{".php"}},
 }
 
-// WorkerPluginDir finds the qm-worker plugin: QM_WORKER_PLUGIN when set, else
-// next to qm's executable exe (symlinks resolved):
-// <exe dir>/../share/quartermaster/plugins/qm-worker (Homebrew, make install),
-// then <exe dir>/../plugins/qm-worker (a source build), then
-// <exe dir>/share/quartermaster/plugins/qm-worker (an unpacked release
-// archive). The error lists the paths tried.
-func WorkerPluginDir(exe string) (string, error) {
+// Install is where qm and its qm-worker plugin sit, found from qm's
+// executable. Bin and Plugin come from one look, so they always describe the
+// same keg: the running keg's bin and the plugin beside it, or, when a
+// Homebrew-style opt link is verified to be that very keg, the link's paths,
+// which survive an upgrade. Err is set when the executable could not be
+// resolved (Bin and Plugin are then empty); Tried lists the plugin paths looked
+// at.
+type Install struct {
+	Bin, Plugin string
+	Tried       []string
+	Err         error
+}
+
+// Locate finds the install of the qm that is running. running is that
+// executable's path with symlinks resolved, read once (paths.Executable); ""
+// resolves invoked instead. invoked is the path qm was called by, "" when
+// unknown; it is used only to infer the prefix of the opt link, which is then
+// verified against running.
+func Locate(invoked, running string) Install {
+	var in Install
+	if running == "" {
+		if invoked == "" {
+			return Install{Err: errors.New("no executable path")}
+		}
+		abs := invoked
+		if !filepath.IsAbs(abs) {
+			var err error
+			if abs, err = filepath.Abs(abs); err != nil {
+				return Install{Err: err}
+			}
+		}
+		r, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			return Install{Err: err}
+		}
+		running = r
+		invoked = abs
+	}
+	dir := filepath.Dir(running)
+	up := filepath.Dir(dir)
+	in.Bin = dir
+	in.Tried = []string{
+		filepath.Join(up, "share", "quartermaster", "plugins", "qm-worker"),
+		filepath.Join(up, "plugins", "qm-worker"),
+		filepath.Join(dir, "share", "quartermaster", "plugins", "qm-worker"),
+	}
+	for _, p := range in.Tried {
+		if isDir(p) {
+			in.Plugin = p
+			break
+		}
+	}
+	if in.Plugin != "" {
+		if opt := stable(invoked, running, in.Plugin); opt != "" {
+			in.Bin = filepath.Join(opt, "bin")
+			in.Plugin = filepath.Join(opt, "share", "quartermaster", "plugins", "qm-worker")
+		}
+	}
+	return in
+}
+
+// PluginDir is the qm-worker plugin folder: QM_WORKER_PLUGIN when set, else
+// the one found beside qm. The error lists the paths tried.
+func (in Install) PluginDir() (string, error) {
 	if p := os.Getenv("QM_WORKER_PLUGIN"); p != "" {
 		if !isDir(p) {
 			return "", fmt.Errorf("qm-worker plugin: QM_WORKER_PLUGIN %s is not a folder", p)
 		}
 		return p, nil
 	}
-	real, err := filepath.EvalSymlinks(exe)
-	if err != nil {
-		return "", fmt.Errorf("qm-worker plugin: %w", err)
+	if in.Err != nil {
+		return "", fmt.Errorf("qm-worker plugin: %w", in.Err)
 	}
-	up := filepath.Dir(filepath.Dir(real))
-	tried := []string{
-		filepath.Join(up, "share", "quartermaster", "plugins", "qm-worker"),
-		filepath.Join(up, "plugins", "qm-worker"),
-		// an unpacked release archive: qm beside share/
-		filepath.Join(filepath.Dir(real), "share", "quartermaster", "plugins", "qm-worker"),
+	if in.Plugin == "" {
+		return "", fmt.Errorf("qm-worker plugin not found; tried %s (or set QM_WORKER_PLUGIN)", strings.Join(in.Tried, ", "))
 	}
-	for _, p := range tried {
-		if isDir(p) {
-			return p, nil
+	return in.Plugin, nil
+}
+
+// WorkerPluginDir is Locate(exe, "").PluginDir(): the plugin folder for the
+// executable exe.
+func WorkerPluginDir(exe string) (string, error) {
+	return Locate(exe, "").PluginDir()
+}
+
+// stable is <prefix>/opt/quartermaster when it is Homebrew's link to the very
+// keg that is running, else "". The candidates are named by running
+// (<prefix>/Cellar/quartermaster/<version>/bin/<name>) and by invoked, when
+// that resolves to running too: <prefix>/bin/<name>, or
+// <prefix>/opt/quartermaster/bin/<name>. A candidate holds when
+//   - <opt>/bin resolves to the folder of running, the keg's own bin (so a
+//     link to a shared bin never gets onto a worker's PATH),
+//   - <opt>/bin/<name> resolves to running, and
+//   - <opt>/share/quartermaster/plugins/qm-worker resolves to the same folder
+//     as plugin.
+func stable(invoked, running, plugin string) string {
+	var opts []string
+	if d := filepath.Dir(running); filepath.Base(d) == "bin" {
+		name := filepath.Dir(filepath.Dir(d)) // <prefix>/Cellar/quartermaster
+		if filepath.Base(name) == formula && filepath.Base(filepath.Dir(name)) == "Cellar" {
+			opts = append(opts, filepath.Join(filepath.Dir(filepath.Dir(name)), "opt", formula))
 		}
 	}
-	return "", fmt.Errorf("qm-worker plugin not found; tried %s (or set QM_WORKER_PLUGIN)", strings.Join(tried, ", "))
+	if invoked != "" {
+		// Cleaned only after checking it still names running.
+		if c := filepath.Clean(invoked); c == invoked || sameFile(c, running) {
+			if d := filepath.Dir(c); filepath.Base(d) == "bin" {
+				prefix := filepath.Dir(d)
+				if filepath.Base(prefix) == formula && filepath.Base(filepath.Dir(prefix)) == "opt" {
+					opts = append(opts, prefix) // called through the opt link
+				} else {
+					opts = append(opts, filepath.Join(prefix, "opt", formula))
+				}
+			}
+		}
+	}
+	wantPlugin, err := filepath.EvalSymlinks(plugin)
+	if err != nil {
+		return ""
+	}
+	wantBin, err := filepath.EvalSymlinks(filepath.Dir(running))
+	if err != nil {
+		return ""
+	}
+	for _, opt := range opts {
+		if gotBin, err := filepath.EvalSymlinks(filepath.Join(opt, "bin")); err != nil || gotBin != wantBin {
+			continue
+		}
+		if !sameFile(filepath.Join(opt, "bin", filepath.Base(running)), running) {
+			continue
+		}
+		if got, err := filepath.EvalSymlinks(filepath.Join(opt, "share", "quartermaster", "plugins", "qm-worker")); err != nil || got != wantPlugin {
+			continue
+		}
+		return opt
+	}
+	return ""
 }
+
+// sameFile tells whether path resolves, through symlinks, to real.
+func sameFile(path, real string) bool {
+	r, err := filepath.EvalSymlinks(path)
+	return err == nil && r == real
+}
+
+// formula is the Homebrew formula name: <prefix>/opt/<formula> is the link
+// Homebrew keeps to the current version, which survives an upgrade.
+const formula = "quartermaster"
 
 func isDir(p string) bool {
 	fi, err := os.Stat(p)

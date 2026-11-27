@@ -23,7 +23,7 @@ import (
 
 const spawnUsage = `usage:
   qm spawn worker --brief FILE --type T --size S|M|L --hint m/e --name NAME --cwd DIR [--workspace ID] [--launcher agterm|tmux] [--force m/e --why TEXT] [--dry-run]
-  qm spawn review --prompt FILE [--round N] [--base REF] [--repo DIR] [--wait] [--force m/e --why TEXT]
+  qm spawn review --prompt FILE [--round N] [--base REF] [--diff A..B] [--repo DIR] [--wait] [--force m/e --why TEXT]
   qm spawn review --status ID [--wait]
 `
 
@@ -139,7 +139,7 @@ func spawnWorker(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	exe, err := os.Executable()
+	running, exe, err := paths.Executable()
 	if err != nil {
 		return err
 	}
@@ -164,7 +164,7 @@ func spawnWorker(args []string, stdout, stderr io.Writer) error {
 	deps := spawn.Deps{
 		Config: cfg, Ask: rd.ask, Gate: rd.gate, Claude: claudeState(stderr),
 		Codex:  rd.cachedCodex,
-		Getenv: os.Getenv, PS: spawn.PS, ProcExe: spawn.ProcExe, Pick: launch.Pick, Exe: exe, Mark: rd.mark,
+		Getenv: os.Getenv, PS: spawn.PS, ProcExe: spawn.ProcExe, Pick: launch.Pick, Exe: exe, Running: running, Mark: rd.mark,
 		Trusted: func(dir string) (bool, error) {
 			cj, err := paths.ClaudeJSON()
 			if err != nil {

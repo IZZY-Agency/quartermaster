@@ -36,7 +36,7 @@ var codexLook = exec.LookPath
 
 const routeUsage = `usage:
   qm route worker --brief FILE --type T --size S|M|L [--hint m/e] [--force m/e --why TEXT] [--repo DIR] [--json]
-  qm route review --prompt FILE [--round N] [--base REF] [--repo DIR] [--json]
+  qm route review --prompt FILE [--round N] [--base REF] [--diff A..B] [--repo DIR] [--json]
 `
 
 // workerTypes are the values of qm route worker --type (design 5.3).
@@ -158,6 +158,7 @@ func routeReview(args []string, stdout, stderr io.Writer) error {
 	promptFile := fs.String("prompt", "", "the review prompt file")
 	round := fs.Int("round", 0, "review round (default: 1 plus the reviews logged for this branch)")
 	base := fs.String("base", "", "the ref the diff under review is taken against (default: origin/HEAD's branch, else "+reviewin.DefaultBase+")")
+	diff := fs.String("diff", "", "route for this range, A..B or A...B, instead of BASE...HEAD")
 	repo := fs.String("repo", ".", "the repository under review")
 	asJSON := fs.Bool("json", false, "print the decision as JSON")
 	if err := parseFlags(fs, args); err != nil {
@@ -169,8 +170,13 @@ func routeReview(args []string, stdout, stderr io.Writer) error {
 	case *round < 0:
 		return fmt.Errorf("%w: --round %d is negative", errUsage, *round)
 	}
-	in, err := reviewin.For(*repo, *base, *promptFile, *round)
+	in, rng, err := reviewInput(*repo, *base, *diff, *promptFile, *round)
 	if err != nil {
+		return err
+	}
+	// qm spawn review refuses a change too large to hand to a reviewer; the
+	// preview refuses it alike.
+	if err := reviewin.CheckSize(in.Repo, rng); err != nil {
 		return err
 	}
 

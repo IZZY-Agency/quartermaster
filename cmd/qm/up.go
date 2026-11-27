@@ -399,7 +399,7 @@ func upResolveHere(o *upOptions, cfg config.Config) error {
 // upRunLocked is qm up's run under the project's lock, released when it
 // returns.
 func upRunLocked(o upOptions, cfg config.Config, stdout, stderr io.Writer) error {
-	exe, err := os.Executable()
+	running, exe, err := paths.Executable()
 	if err != nil {
 		return err
 	}
@@ -445,13 +445,13 @@ func upRunLocked(o upOptions, cfg config.Config, stdout, stderr io.Writer) error
 		if o.argsGiven || o.full {
 			return fmt.Errorf("%w: on a project with state, --adopt adopts workers only: it does not go with --full or coordinator arguments after --", errUsage)
 		}
-		return spawnsResult(upAdoptLater(&p, recs, o, upDeps(nil, exe, cfg), stdout, stderr), spawnsOK)
+		return spawnsResult(upAdoptLater(&p, recs, o, upDeps(nil, running, exe, cfg), stdout, stderr), spawnsOK)
 	}
 	l, pickErr := upPick(choice)
 	if pickErr != nil && !errors.Is(pickErr, launch.ErrNoLauncher) {
 		return fmt.Errorf("%w: %v", errUsage, pickErr)
 	}
-	d := upDeps(l, exe, cfg)
+	d := upDeps(l, running, exe, cfg)
 	if o.here {
 		d.Here = upHere(l)
 	}
@@ -484,9 +484,9 @@ func upRunLocked(o upOptions, cfg config.Config, stdout, stderr io.Writer) error
 var upLog = declog.Append
 
 // upDeps wires the launcher l (nil: none) and the real machine into up.Deps.
-func upDeps(l launch.Launcher, exe string, cfg config.Config) up.Deps {
+func upDeps(l launch.Launcher, running, exe string, cfg config.Config) up.Deps {
 	d := up.Deps{
-		Launcher: l, Exe: exe, Coordinator: cfg.Up.ClaudeArgs, Log: upLog,
+		Launcher: l, Exe: exe, Running: running, Coordinator: cfg.Up.ClaudeArgs, Log: upLog,
 		MCPConfigs: slices.Collect(maps.Values(cfg.ProjectMCP)),
 		Now:        func() time.Time { return time.Now().UTC() },
 		Self:       selfSessions(),

@@ -50,30 +50,46 @@ func DefaultBranch(dir string) string {
 // for this repository and branch since the branch forked from base.
 // Input.Repo is the top-level path.
 func For(repo, base, promptFile string, round int) (route.ReviewInput, error) {
+	in, _, err := ForRange(repo, base, "", promptFile, round)
+	return in, err
+}
+
+// ForRange is For with the diff taken from spec (see ParseRange; "" is
+// BASE...HEAD): the size and paths in the input are those of that range. The
+// round is still counted from base. It also returns the range, resolved.
+func ForRange(repo, base, spec, promptFile string, round int) (route.ReviewInput, Range, error) {
 	if round < 0 {
-		return route.ReviewInput{}, fmt.Errorf("review input: round %d is negative", round)
+		return route.ReviewInput{}, Range{}, fmt.Errorf("review input: round %d is negative", round)
 	}
 	prompt, err := os.ReadFile(promptFile)
 	if err != nil {
-		return route.ReviewInput{}, fmt.Errorf("review input: %w", err)
+		return route.ReviewInput{}, Range{}, fmt.Errorf("review input: %w", err)
 	}
 	top, branch, err := Repo(repo)
 	if err != nil {
-		return route.ReviewInput{}, err
+		return route.ReviewInput{}, Range{}, err
 	}
-	if base == "" {
-		base = Base(top)
-	}
-	if strings.HasPrefix(base, "-") {
-		return route.ReviewInput{}, fmt.Errorf("review input: base %q starts with \"-\"", base)
-	}
-	lines, paths, err := diffStat(top, base)
+	rng, err := ParseRange(top, base, spec)
 	if err != nil {
-		return route.ReviewInput{}, err
+		return route.ReviewInput{}, Range{}, err
 	}
+	rng.Branch = branch
+	// The branch and the head are read twice, once each way round; a checkout
+	// that switched in between has no one branch to count the review for.
+	if _, again, err := Repo(top); err != nil || again != branch {
+		return route.ReviewInput{}, Range{}, fmt.Errorf("review input: the checkout changed branch while qm read it (%q, then %q); run the review again", branch, again)
+	}
+	stats, err := numstat(top, rng.Diff)
+	if err != nil {
+		return route.ReviewInput{}, Range{}, err
+	}
+	lines, paths := sumStats(stats)
 	if round == 0 {
-		if round, err = Round(top, branch, base); err != nil {
-			return route.ReviewInput{}, err
+		if rng.Base == "" && branch != "" {
+			return route.ReviewInput{}, Range{}, fmt.Errorf("review input: %s is not a commit in this repository, so there is nothing to count the review rounds against; pass --base or --round", Base(top))
+		}
+		if round, err = Round(top, branch, rng.Base); err != nil {
+			return route.ReviewInput{}, Range{}, err
 		}
 	}
 	return route.ReviewInput{
@@ -83,7 +99,7 @@ func For(repo, base, promptFile string, round int) (route.ReviewInput, error) {
 		DiffFiles: len(paths),
 		Paths:     paths,
 		Repo:      top,
-	}, nil
+	}, rng, nil
 }
 
 // Repo returns the top-level path of the repository that holds dir ("" is
@@ -213,37 +229,6 @@ func oldestCommitTime(dir, base string) time.Time {
 		}
 	}
 	return oldest
-}
-
-// diffStat returns the lines added plus removed, and the changed paths, of
-// base...HEAD. A binary file counts as a path with no lines; a rename counts
-// as a removed and an added path.
-func diffStat(top, base string) (lines int, paths []string, err error) {
-	out, err := git(top, "diff", "--numstat", "-z", "--no-renames", "--end-of-options", base+"...HEAD", "--")
-	if err != nil {
-		return 0, nil, err
-	}
-	for _, entry := range strings.Split(out, "\x00") {
-		if entry == "" {
-			continue
-		}
-		f := strings.SplitN(entry, "\t", 3)
-		if len(f) != 3 {
-			return 0, nil, fmt.Errorf("review input: unexpected git diff --numstat line %q", entry)
-		}
-		for _, n := range f[:2] {
-			if n == "-" {
-				continue
-			}
-			v, err := strconv.Atoi(n)
-			if err != nil {
-				return 0, nil, fmt.Errorf("review input: unexpected git diff --numstat line %q", entry)
-			}
-			lines += v
-		}
-		paths = append(paths, f[2])
-	}
-	return lines, paths, nil
 }
 
 // git runs git in dir and returns its stdout. A failure carries git's stderr

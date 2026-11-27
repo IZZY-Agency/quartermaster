@@ -22,13 +22,13 @@ import (
 // session sid with prompt (a summary file, "" for none). What m adds comes
 // before the project's own arguments, so no flag left without a value there
 // takes it as one.
-func coordinatorScript(p *Project, sid, prompt string, resume bool, m ModelChoice, exe string) (string, error) {
+func coordinatorScript(p *Project, sid, prompt string, resume bool, m ModelChoice, qmDir string) (string, error) {
 	note, err := HandoffPath(p.ID, p.Coordinator.Name)
 	if err != nil {
 		return "", err
 	}
 	return spawn.CoordinatorScript(spawn.CoordinatorLaunch{
-		Name: p.Coordinator.Name, SessionID: sid, Cwd: p.Root, QMDir: qmDirOf(exe),
+		Name: p.Coordinator.Name, SessionID: sid, Cwd: p.Root, QMDir: qmDir,
 		ProjectID: p.ID, Workspace: p.Workspace, HandoffPath: note,
 		PromptPath: prompt, Args: append(m.flags(), p.ClaudeArgs...), Resume: resume,
 	})
@@ -64,19 +64,6 @@ func HandoffPath(projectID, name string) (string, error) {
 	return filepath.Join(dir, name+".md"), nil
 }
 
-// qmDirOf is the folder of qm's executable, symlinks resolved; "" when it
-// cannot be read.
-func qmDirOf(exe string) string {
-	if exe == "" {
-		return ""
-	}
-	real, err := filepath.EvalSymlinks(exe)
-	if err != nil {
-		return ""
-	}
-	return filepath.Dir(real)
-}
-
 // workerProfile is the logged launch profile of a worker step, re-resolved
 // for today (spec 5.5): the qm-worker plugin folder found again, and no
 // other plugin folder (BuildProfile writes that one only, so another in the
@@ -84,7 +71,7 @@ func qmDirOf(exe string) string {
 // config's project_mcp files, else none, with a warning; the permission
 // flags capped at the coordinator's current ones (coordinator: its claude
 // arguments, coordinatorCap); and the project tie in the environment.
-func workerProfile(p *Project, s Step, exe string, coordinator, mcpConfigs []string) (prof route.Profile, warning string, err error) {
+func workerProfile(p *Project, s Step, inst spawn.Install, coordinator, mcpConfigs []string) (prof route.Profile, warning string, err error) {
 	if !hasProfile(s.Record) {
 		return route.Profile{}, "", fmt.Errorf("%s: no launch profile in its Record", s.Name)
 	}
@@ -92,7 +79,7 @@ func workerProfile(p *Project, s Step, exe string, coordinator, mcpConfigs []str
 	prof.PluginsOn = slices.Clone(prof.PluginsOn)
 	prof.PluginsOff = slices.Clone(prof.PluginsOff)
 	prof.Env = maps.Clone(prof.Env)
-	dir, err := spawn.WorkerPluginDir(exe)
+	dir, err := inst.PluginDir()
 	if err != nil {
 		return route.Profile{}, "", err
 	}

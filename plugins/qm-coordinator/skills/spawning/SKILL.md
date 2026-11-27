@@ -42,7 +42,11 @@ description: How the coordinator starts workers and reviews through qm. Use befo
    qm counts the round and measures the diff itself, for the branch checked
    out in the folder it runs in: run it in the worktree of the branch under
    review, or name that folder with `--repo`. Run from another checkout it
-   sizes no diff and counts the wrong branch's rounds.
+   has no diff to review and qm refuses it.
+   The reviewer gets the change from qm as files (the diff, the commits, the
+   changed files, the pull request) and has no git or gh, so the prompt names
+   what to look at and what to check, not git commands. For a fix round pass
+   `--diff A..B`, the commits of that round, so the reviewer reads only them.
 4. **Overrides need a reason.** `--force MODEL/EFFORT` replaces qm's pick
    and must come with `--why "..."`; use it only when you know better than
    the table, and say why in one line.

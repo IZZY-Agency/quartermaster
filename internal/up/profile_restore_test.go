@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/IZZY-Agency/quartermaster/internal/route"
+	"github.com/IZZY-Agency/quartermaster/internal/spawn"
 )
 
 // A restored worker's profile takes its plugin folder and its MCP config
@@ -19,7 +20,7 @@ func TestWorkerProfileRestore(t *testing.T) {
 	p := &Project{ID: "proj-1", Workspace: "ws"}
 
 	t.Run("only this qm's plugin folder", func(t *testing.T) {
-		got, warn, err := workerProfile(p, step(route.Profile{PluginDirs: []string{"/old/qm-worker", "/elsewhere/plugin"}}), "", nil, nil)
+		got, warn, err := workerProfile(p, step(route.Profile{PluginDirs: []string{"/old/qm-worker", "/elsewhere/plugin"}}), spawn.Install{}, nil, nil)
 		if err != nil || warn != "" {
 			t.Fatalf("err %v, warning %q", err, warn)
 		}
@@ -28,19 +29,19 @@ func TestWorkerProfileRestore(t *testing.T) {
 		}
 	})
 	t.Run("no plugin folder logged", func(t *testing.T) {
-		got, _, err := workerProfile(p, step(route.Profile{}), "", nil, nil)
+		got, _, err := workerProfile(p, step(route.Profile{}), spawn.Install{}, nil, nil)
 		if err != nil || !slices.Equal(got.PluginDirs, []string{plugin}) {
 			t.Errorf("plugin folders = %v, err %v", got.PluginDirs, err)
 		}
 	})
 	t.Run("MCP config the config names is kept", func(t *testing.T) {
-		got, warn, err := workerProfile(p, step(route.Profile{MCPConfig: "/cfg/a.mcp.json"}), "", nil, []string{"/cfg/b.mcp.json", "/cfg/a.mcp.json"})
+		got, warn, err := workerProfile(p, step(route.Profile{MCPConfig: "/cfg/a.mcp.json"}), spawn.Install{}, nil, []string{"/cfg/b.mcp.json", "/cfg/a.mcp.json"})
 		if err != nil || warn != "" || got.MCPConfig != "/cfg/a.mcp.json" {
 			t.Errorf("MCP config %q, warning %q, err %v", got.MCPConfig, warn, err)
 		}
 	})
 	t.Run("MCP config the config does not name is left out", func(t *testing.T) {
-		got, warn, err := workerProfile(p, step(route.Profile{MCPConfig: "/elsewhere/x.mcp.json"}), "", nil, []string{"/cfg/a.mcp.json"})
+		got, warn, err := workerProfile(p, step(route.Profile{MCPConfig: "/elsewhere/x.mcp.json"}), spawn.Install{}, nil, []string{"/cfg/a.mcp.json"})
 		if err != nil || got.MCPConfig != "" {
 			t.Fatalf("MCP config %q, err %v", got.MCPConfig, err)
 		}
@@ -49,7 +50,7 @@ func TestWorkerProfileRestore(t *testing.T) {
 		}
 	})
 	t.Run("no MCP config logged, no warning", func(t *testing.T) {
-		got, warn, err := workerProfile(p, step(route.Profile{}), "", nil, []string{"/cfg/a.mcp.json"})
+		got, warn, err := workerProfile(p, step(route.Profile{}), spawn.Install{}, nil, []string{"/cfg/a.mcp.json"})
 		if err != nil || warn != "" || got.MCPConfig != "" {
 			t.Errorf("MCP config %q, warning %q, err %v", got.MCPConfig, warn, err)
 		}

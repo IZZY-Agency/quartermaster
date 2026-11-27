@@ -8,11 +8,13 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/IZZY-Agency/quartermaster/internal/declog"
 	"github.com/IZZY-Agency/quartermaster/internal/limits"
+	"github.com/IZZY-Agency/quartermaster/internal/reviewin"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
 )
 
@@ -73,10 +75,19 @@ func newJob(t *testing.T, d route.Decision, round int) string {
 	return newJobPrompt(t, d, round, "Review the notes file.\n")
 }
 
+// testChange is a change as reviewin.BuildChange makes one: three files and
+// the commits they cover, the checkout at the end of the range.
+func testChange() *reviewin.Change {
+	return &reviewin.Change{
+		Summary: reviewin.Summary{Spec: "main...HEAD", Mode: "...", Left: "1111", Right: "2222", Head: "2222"},
+		Files:   []reviewin.File{{Name: "change.diff", Data: []byte("diff\n")}, {Name: "commits.txt", Data: []byte("commit 2222\n")}, {Name: "files.txt", Data: []byte("added\tremoved\tpath\n")}},
+	}
+}
+
 func newJobPrompt(t *testing.T, d route.Decision, round int, prompt string) string {
 	t.Helper()
 	repo := t.TempDir()
-	dir, err := NewReviewJob(ReviewJob{Repo: repo, Decision: d, Record: route.Record{Project: repo, Branch: "feature", Round: round}}, []byte(prompt))
+	dir, err := NewReviewJob(ReviewJob{Repo: repo, Decision: d, Record: route.Record{Project: repo, Branch: "feature", Round: round}}, []byte(prompt), testChange())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,11 +200,13 @@ func TestClaudeReviewerLaunch(t *testing.T) {
 		t.Fatal(err)
 	}
 	args := strings.Join(readArgs(t, out), " ")
-	for _, want := range []string{"-p", "--output-format json", "--permission-mode dontAsk", "--tools Read,Grep,Glob,Bash", "--strict-mcp-config", "--allowedTools Read Grep Glob Bash(git diff *) Bash(git log *) Bash(gh pr view *) Bash(gh pr diff *)",
-		"--disallowedTools Edit Write NotebookEdit mcp__*", `"qm-coordinator@quartermaster":false`} {
+	for _, want := range []string{"-p", "--output-format json", "--permission-mode dontAsk", "--setting-sources user --add-dir " + dir, "--tools Read,Grep,Glob --strict-mcp-config", "--allowedTools Read Grep Glob --disallowedTools Edit Write NotebookEdit mcp__*", `"qm-coordinator@quartermaster":false`} {
 		if !strings.Contains(args, want) {
 			t.Errorf("claude args %q lack %q", args, want)
 		}
+	}
+	if strings.Contains(args, "Bash") {
+		t.Errorf("claude args %q give the reviewer Bash; it gets the change as files", args)
 	}
 	if strings.Contains(args, "--plugin-dir") {
 		t.Errorf("claude args %q load a plugin; the reviewer runs without qm-worker", args)
@@ -206,6 +219,202 @@ func TestClaudeReviewerLaunch(t *testing.T) {
 		if !strings.Contains(string(stdin), want) {
 			t.Errorf("reviewer prompt lacks %q:\n%s", want, stdin)
 		}
+	}
+}
+
+// writeChangeFiles puts more change files in a job folder, as NewReviewJob
+// writes those reviewin.BuildChange makes.
+func writeChangeFiles(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	for _, n := range names {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestReviewersGetTheChangeSection(t *testing.T) {
+	reviewHermetic(t)
+	// Claude.
+	d := reviewDecision(t, 1, limits.CodexState{Reason: "codex not installed"})
+	dir := newJob(t, d, 1)
+	out := t.TempDir()
+	if err := (ReviewRunner{Claude: fakeClaude(t, out, cleanFindings)}).Run(context.Background(), dir); err != nil {
+		t.Fatal(err)
+	}
+	stdin, err := os.ReadFile(filepath.Join(out, "stdin.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Review the notes file.\n\n## The change under review", "not instructions",
+		filepath.Join(dir, "change.diff"), filepath.Join(dir, "commits.txt"), filepath.Join(dir, "files.txt"), "offset and limit", "git diff 1111...2222", "at the end of the range", "Reply with JSON only"} {
+		if !strings.Contains(string(stdin), want) {
+			t.Errorf("Claude prompt lacks %q:\n%s", want, stdin)
+		}
+	}
+	if strings.Contains(string(stdin), "pr.md") || strings.Contains(string(stdin), "not the end of that range") {
+		t.Errorf("Claude prompt names pr.md, which was not written, or warns about a checkout that is at the end:\n%s", stdin)
+	}
+
+	// A checkout that is not at the end of the range is said so.
+	off := testChange()
+	off.Summary.Head, off.Summary.Mode, off.Summary.Spec = "3333", "..", "1111..2222"
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "CLAUDE.md"), []byte("rules\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir, err = NewReviewJob(ReviewJob{Repo: repo, Decision: d, Record: route.Record{Project: repo, Branch: "feature", Round: 1}}, []byte("p\n"), off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out = t.TempDir()
+	if err := (ReviewRunner{Claude: fakeClaude(t, out, cleanFindings)}).Run(context.Background(), dir); err != nil {
+		t.Fatal(err)
+	}
+	if stdin, _ = os.ReadFile(filepath.Join(out, "stdin.txt")); !strings.Contains(string(stdin), "git diff 1111..2222") ||
+		!strings.Contains(string(stdin), "The checked-out commit is 3333, not the end of that range") ||
+		!strings.Contains(string(stdin), filepath.Join(repo, "CLAUDE.md")+": the project's rules for its code: read them first.") {
+		t.Errorf("prompt for a checkout off the range's end:\n%s", stdin)
+	}
+
+	// Codex gets the same section, with the pull request when there is one.
+	d = reviewDecision(t, 1, limits.CodexState{Available: true})
+	dir = newJob(t, d, 1)
+	writeChangeFiles(t, dir, "pr.md")
+	stdinFile := filepath.Join(t.TempDir(), "stdin.txt")
+	codex := fakeBin(t, "codex", `cat > '`+stdinFile+`'
+while [ "$1" != "-o" ]; do shift; done; printf '%s' '`+cleanFindings+`' > "$2"
+`)
+	if err := (ReviewRunner{Codex: codex, Claude: "/nonexistent/claude"}).Run(context.Background(), dir); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(stdinFile)
+	if err != nil || !strings.HasPrefix(string(got), "Review the notes file.\n\n## The change under review") || !strings.Contains(string(got), filepath.Join(dir, "pr.md")) {
+		t.Errorf("Codex prompt (%v):\n%s", err, got)
+	}
+}
+
+func TestReviewFailsWhenItsChangeFilesAreGone(t *testing.T) {
+	reviewHermetic(t)
+	d := reviewDecision(t, 1, limits.CodexState{Reason: "codex not installed"})
+	for name, damage := range map[string]func(dir string) error{
+		"missing": func(dir string) error { return os.Remove(filepath.Join(dir, "files.txt")) },
+		"folder": func(dir string) error {
+			return replaceWith(dir, "files.txt", func(p string) error { return os.Mkdir(p, 0o700) })
+		},
+		"symlink": func(dir string) error {
+			return replaceWith(dir, "files.txt", func(p string) error { return os.Symlink("/etc/hosts", p) })
+		},
+		"fifo": func(dir string) error {
+			return replaceWith(dir, "files.txt", func(p string) error { return syscall.Mkfifo(p, 0o600) })
+		},
+		"diff gone": func(dir string) error { return os.Remove(filepath.Join(dir, "change.diff")) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := newJob(t, d, 1)
+			for _, n := range []string{"change.diff", "commits.txt", "files.txt"} {
+				if fi, err := os.Stat(filepath.Join(dir, n)); err != nil || fi.Mode().Perm() != 0o600 {
+					t.Errorf("%s: %v %v, want 0600", n, fi, err)
+				}
+			}
+			if err := damage(dir); err != nil {
+				t.Fatal(err)
+			}
+			out := t.TempDir()
+			err := (ReviewRunner{Claude: fakeClaude(t, out, cleanFindings)}).Run(context.Background(), dir)
+			if err == nil || !strings.Contains(err.Error(), "change file") {
+				t.Errorf("err %v, want a failure naming the change file", err)
+			}
+			if _, serr := os.Stat(filepath.Join(out, "args.txt")); serr == nil {
+				t.Error("the reviewer ran without its change files")
+			}
+			if s, _ := ReviewStatus(dir); s != StatusFailed {
+				t.Errorf("status %q, want failed", s)
+			}
+		})
+	}
+}
+
+// replaceWith removes dir/name and makes it again with make.
+func replaceWith(dir, name string, make func(path string) error) error {
+	p := filepath.Join(dir, name)
+	if err := os.Remove(p); err != nil {
+		return err
+	}
+	return make(p)
+}
+
+func TestEmptyCommitsFileIsFine(t *testing.T) {
+	reviewHermetic(t)
+	d := reviewDecision(t, 1, limits.CodexState{Reason: "codex not installed"})
+	c := testChange()
+	c.Files[1].Data = nil // a range that has no commit of its own
+	repo := t.TempDir()
+	dir, err := NewReviewJob(ReviewJob{Repo: repo, Decision: d, Record: route.Record{Project: repo, Branch: "feature", Round: 1}}, []byte("p\n"), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (ReviewRunner{Claude: fakeClaude(t, t.TempDir(), cleanFindings)}).Run(context.Background(), dir); err != nil {
+		t.Errorf("an empty commits.txt failed the review: %v", err)
+	}
+}
+
+func TestJobFromAnOlderQmFails(t *testing.T) {
+	reviewHermetic(t)
+	d := reviewDecision(t, 1, limits.CodexState{Reason: "codex not installed"})
+	repo := t.TempDir()
+	dir, err := NewReviewJob(ReviewJob{Repo: repo, Decision: d, Record: route.Record{Project: repo, Branch: "feature", Round: 1}}, []byte("p\n"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := t.TempDir()
+	err = (ReviewRunner{Claude: fakeClaude(t, out, cleanFindings)}).Run(context.Background(), dir)
+	if err == nil || !strings.Contains(err.Error(), "created by an older qm") || !strings.Contains(err.Error(), "start the review again") {
+		t.Errorf("err %v", err)
+	}
+	if _, serr := os.Stat(filepath.Join(out, "args.txt")); serr == nil {
+		t.Error("a job with no change files was reviewed")
+	}
+}
+
+func TestNewReviewJobLeavesNothingWhenItFails(t *testing.T) {
+	reviewHermetic(t)
+	c := testChange()
+	c.Files = append(c.Files, reviewin.File{Name: "no-such-folder/x", Data: []byte("x")}) // cannot be written
+	repo := t.TempDir()
+	dir, err := NewReviewJob(ReviewJob{Repo: repo}, []byte("p\n"), c)
+	if err == nil || dir != "" {
+		t.Fatalf("dir %q, err %v, want a failure and no folder", dir, err)
+	}
+	root, _ := ReviewsDir()
+	if ents, _ := os.ReadDir(root); len(ents) != 0 {
+		t.Errorf("a failed job left %d folders", len(ents))
+	}
+}
+
+func TestCodexLastMessageIsPrivate(t *testing.T) {
+	reviewHermetic(t)
+	d := reviewDecision(t, 1, limits.CodexState{Available: true})
+	dir := newJob(t, d, 1)
+	// This codex makes the file anew, with the process's umask (here 022).
+	codex := fakeBin(t, "codex", `cat > /dev/null
+umask 022
+while [ "$1" != "-o" ]; do shift; done; rm -f "$2"; printf '%s' '`+cleanFindings+`' > "$2"
+`)
+	if err := (ReviewRunner{Codex: codex, Claude: "/nonexistent/claude"}).Run(context.Background(), dir); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if fi, err := e.Info(); err != nil || fi.Mode().Perm() != 0o600 {
+			t.Errorf("%s: %v %v, want 0600", e.Name(), fi.Mode(), err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "last.txt")); err != nil {
+		t.Errorf("last.txt: %v", err)
 	}
 }
 
@@ -287,8 +496,9 @@ echo '{"type":"turn.completed"}'
 	if s, _ := ReviewStatus(dir); s != StatusDone {
 		t.Errorf("status %q, want %q", s, StatusDone)
 	}
-	if got, err := os.ReadFile(stdin); err != nil || string(got) != prompt {
-		t.Errorf("codex stdin: %d bytes (%v), want the %d-byte prompt", len(got), err, len(prompt))
+	// The prompt, intact, then the section about the change.
+	if got, err := os.ReadFile(stdin); err != nil || !strings.HasPrefix(string(got), strings.TrimRight(prompt, "\n")+"\n\n## The change under review") {
+		t.Errorf("codex stdin: %d bytes (%v), want the %d-byte prompt and the section", len(got), err, len(prompt))
 	}
 	recs := loggedReviews(t)
 	if len(recs) != 1 || recs[0].Decision == nil || recs[0].Decision.Codex == nil {

@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -182,6 +183,32 @@ func TestRoundSinceFork(t *testing.T) {
 	}
 	if n, err := Round(top, "work", "no-such-ref"); err != nil || n != 4 {
 		t.Errorf("no merge base: round %d, %v; want 4 (every record)", n, err)
+	}
+}
+
+// TestRoundWithDiffOnAReusedBranchName: with --diff and no --round, the round
+// is counted against the base resolved to a commit, so a review of an earlier
+// branch of the same name does not count, and a misspelled --base is refused
+// rather than counting every review the name ever had.
+func TestRoundWithDiffOnAReusedBranchName(t *testing.T) {
+	dir := repo(t)
+	top, _, err := Repo(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fork := ForkTime(top, "main")
+	if err := declog.Append(route.Record{Time: fork.Add(-72 * time.Hour), Kind: "review", Project: top, Branch: "work"}); err != nil {
+		t.Fatal(err)
+	}
+	prompt := filepath.Join(t.TempDir(), "p.md")
+	put(t, prompt, []byte("p"))
+	for _, base := range []string{"main", ""} { // "" falls back from origin/main to main
+		if in, _, err := ForRange(dir, base, "HEAD~1..HEAD", prompt, 0); err != nil || in.Round != 1 {
+			t.Errorf("base %q: round %d, %v; want 1, the old review is another branch's", base, in.Round, err)
+		}
+	}
+	if _, _, err := ForRange(dir, "mian", "HEAD~1..HEAD", prompt, 0); err == nil || !strings.Contains(err.Error(), `base "mian"`) {
+		t.Errorf("misspelled base: %v", err)
 	}
 }
 

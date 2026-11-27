@@ -111,7 +111,7 @@ func Start(ctx context.Context, root string, args []string, d Deps) (Project, Ou
 	}
 	o.Model = FreshModel(p.ClaudeArgs, d)
 	p.setDefaultModel(id, o.Model.Model)
-	script, err := coordinatorScript(&p, id, "", false, o.Model, d.Exe)
+	script, err := coordinatorScript(&p, id, "", false, o.Model, spawn.Locate(d.Exe, d.Running).Bin)
 	if err == nil {
 		o.Script, err = spawn.WriteScript(p.Coordinator.Name, script)
 	}

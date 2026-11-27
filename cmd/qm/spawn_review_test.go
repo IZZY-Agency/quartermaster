@@ -34,7 +34,7 @@ func spawnHermetic(t *testing.T, result string) (argsFile string) {
 	replyFile := routeFile(t, dir, "reply.json", string(reply))
 	argsFile = filepath.Join(dir, "args.txt")
 	claude := filepath.Join(dir, "claude")
-	script := "#!/bin/sh\necho \"$*\" >> '" + argsFile + "'\ncat > /dev/null\ncat '" + replyFile + "'\n"
+	script := "#!/bin/sh\necho \"$*\" >> '" + argsFile + "'\ncat > '" + filepath.Join(dir, "stdin.txt") + "'\ncat '" + replyFile + "'\n"
 	if err := os.WriteFile(claude, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestSpawnReviewRunnerGone(t *testing.T) {
 
 func TestWaitRunnerEndedAfterDone(t *testing.T) {
 	spawnHermetic(t, oneP1)
-	dir, err := spawn.NewReviewJob(spawn.ReviewJob{Repo: t.TempDir()}, []byte("Check.\n"))
+	dir, err := spawn.NewReviewJob(spawn.ReviewJob{Repo: t.TempDir()}, []byte("Check.\n"), testChange())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +272,7 @@ func gone(t *testing.T, file string) bool {
 
 func newReviewJobID(t *testing.T) (id, dir string) {
 	t.Helper()
-	dir, err := spawn.NewReviewJob(spawn.ReviewJob{Repo: t.TempDir(), Decision: route.Decision{Kind: "review", Tier: route.Tier{Model: "sonnet", Effort: "medium"}}}, []byte("Check.\n"))
+	dir, err := spawn.NewReviewJob(spawn.ReviewJob{Repo: t.TempDir(), Decision: route.Decision{Kind: "review", Tier: route.Tier{Model: "sonnet", Effort: "medium"}}}, []byte("Check.\n"), testChange())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,37 +348,122 @@ func TestStartFailureMarksFailed(t *testing.T) {
 	}
 }
 
-func TestSpawnReviewEmptyDiffNoteOnDetachedHead(t *testing.T) {
-	spawnHermetic(t, oneP1)
-	repo := routeRepo(t)
-	routeGit(t, repo, "checkout", "-q", "--detach")
-	prompt := routeFile(t, t.TempDir(), "prompt.md", "Check that the notes file reads well.\n")
-	code, _, errOut := spawnRun(t, "--prompt", prompt, "--base", "HEAD", "--repo", repo, "--wait")
-	if code != 0 {
-		t.Fatalf("exit %d, stderr %q", code, errOut)
+// onlyJob is the one review job folder.
+func onlyJob(t *testing.T) string {
+	t.Helper()
+	root, err := spawn.ReviewsDir()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(errOut, "detached HEAD) has no diff against its base") || !strings.Contains(errOut, "round is 1") || strings.Contains(errOut, "counted for that branch") {
-		t.Errorf("stderr %q: want the detached-HEAD wording (no branch to count for; round 1)", errOut)
+	ents, err := os.ReadDir(root)
+	if err != nil || len(ents) != 1 {
+		t.Fatalf("review folders %v (%v), want one", ents, err)
+	}
+	return filepath.Join(root, ents[0].Name())
+}
+
+func TestSpawnReviewRefusesAnEmptyDiff(t *testing.T) {
+	prompt := func() string {
+		return routeFile(t, t.TempDir(), "prompt.md", "Check that the notes file reads well.\n")
+	}
+	for name, tc := range map[string]struct {
+		detach bool
+		want   string
+	}{
+		"branch":   {false, "branch feature has no changes in git diff HEAD...HEAD"},
+		"detached": {true, "this checkout (detached HEAD) has no changes"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			spawnHermetic(t, oneP1)
+			repo := routeRepo(t)
+			if tc.detach {
+				routeGit(t, repo, "checkout", "-q", "--detach")
+			}
+			code, out, errOut := spawnRun(t, "--prompt", prompt(), "--base", "HEAD", "--repo", repo, "--wait")
+			if code != 1 || out != "" || !strings.Contains(errOut, tc.want) || !strings.Contains(errOut, "nothing to review") || !strings.Contains(errOut, "--repo") {
+				t.Errorf("exit %d, stdout %q, stderr %q: want a refusal containing %q", code, out, errOut, tc.want)
+			}
+			if root, err := spawn.ReviewsDir(); err == nil {
+				if ents, _ := os.ReadDir(root); len(ents) != 0 {
+					t.Errorf("a refused review left %d job folders", len(ents))
+				}
+			}
+		})
 	}
 }
 
-func TestSpawnReviewNotesAnEmptyDiff(t *testing.T) {
-	spawnHermetic(t, oneP1)
+func TestSpawnReviewHandsTheChangeToTheReviewer(t *testing.T) {
+	argsFile := spawnHermetic(t, oneP1)
 	repo := routeRepo(t)
 	prompt := routeFile(t, t.TempDir(), "prompt.md", "Check that the notes file reads well.\n")
+	if code, _, errOut := spawnRun(t, "--prompt", prompt, "--base", "main", "--repo", repo, "--wait"); code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, errOut)
+	}
+	job := onlyJob(t)
+	for name, want := range map[string]string{"change.diff": "+three", "commits.txt": "second", "files.txt": "3\t0\tnotes.txt"} {
+		b, err := os.ReadFile(filepath.Join(job, name))
+		if err != nil || !strings.Contains(string(b), want) {
+			t.Errorf("%s (%v) lacks %q:\n%s", name, err, want, b)
+		}
+		if fi, err := os.Stat(filepath.Join(job, name)); err != nil || fi.Mode().Perm() != 0o600 {
+			t.Errorf("%s: %v, %v, want 0600", name, fi, err)
+		}
+	}
+	if b, _ := os.ReadFile(filepath.Join(job, "prompt.md")); string(b) != "Check that the notes file reads well.\n" {
+		t.Errorf("prompt.md changed: %q", b)
+	}
+	stdin, err := os.ReadFile(filepath.Join(filepath.Dir(argsFile), "stdin.txt"))
+	if err != nil || !strings.Contains(string(stdin), "## The change under review") || !strings.Contains(string(stdin), filepath.Join(job, "change.diff")) {
+		t.Errorf("reviewer prompt (%v):\n%s", err, stdin)
+	}
+	if args, _ := os.ReadFile(argsFile); !strings.Contains(string(args), "--tools Read,Grep,Glob ") || !strings.Contains(string(args), "--add-dir "+job+" ") || strings.Contains(string(args), "Bash") {
+		t.Errorf("claude args %q", args)
+	}
+}
 
-	code, _, errOut := spawnRun(t, "--prompt", prompt, "--base", "HEAD", "--repo", repo, "--wait")
+func TestSpawnReviewDiffRange(t *testing.T) {
+	spawnHermetic(t, oneP1)
+	repo := routeRepo(t)
+	routeFile(t, repo, "notes.txt", "one\ntwo\nthree\nfour\n")
+	routeGit(t, repo, "commit", "-q", "-am", "fix round")
+	prompt := routeFile(t, t.TempDir(), "prompt.md", "Check the fix.\n")
+
+	code, _, errOut := spawnRun(t, "--prompt", prompt, "--diff", "HEAD~1..HEAD", "--repo", repo, "--wait")
 	if code != 0 {
 		t.Fatalf("exit %d, stderr %q", code, errOut)
 	}
-	if want := "note: branch feature has no diff against its base"; !strings.Contains(errOut, want) || !strings.Contains(errOut, "pass --repo") {
-		t.Errorf("stderr %q lacks %q and the --repo hint", errOut, want)
+	job := onlyJob(t)
+	diff, _ := os.ReadFile(filepath.Join(job, "change.diff"))
+	commits, _ := os.ReadFile(filepath.Join(job, "commits.txt"))
+	files, _ := os.ReadFile(filepath.Join(job, "files.txt"))
+	if !strings.Contains(string(diff), "+four") || strings.Contains(string(diff), "README") || strings.Contains(string(diff), "+two") ||
+		!strings.Contains(string(commits), "fix round") || strings.Contains(string(commits), "second") || !strings.Contains(string(files), "1\t0\tnotes.txt") {
+		t.Errorf("a fix round got the whole branch:\ndiff:\n%s\ncommits:\n%s\nfiles:\n%s", diff, commits, files)
 	}
-	code, _, errOut = spawnRun(t, "--prompt", prompt, "--base", "main", "--repo", repo, "--wait")
-	if code != 0 {
-		t.Fatalf("exit %d, stderr %q", code, errOut)
+}
+
+func TestSpawnReviewDiffRefused(t *testing.T) {
+	spawnHermetic(t, oneP1)
+	repo := routeRepo(t)
+	prompt := routeFile(t, t.TempDir(), "prompt.md", "Check.\n")
+	for _, spec := range []string{"main", "--output=/tmp/x..HEAD", "main..--output=/tmp/x", "nosuch..HEAD", "main.."} {
+		code, out, errOut := spawnRun(t, "--prompt", prompt, "--diff", spec, "--repo", repo, "--wait")
+		if code != 1 || out != "" || !strings.Contains(errOut, "--diff") {
+			t.Errorf("--diff %q: exit %d, stdout %q, stderr %q", spec, code, out, errOut)
+		}
 	}
-	if strings.Contains(errOut, "no diff against") {
-		t.Errorf("a review with a diff got the note: %q", errOut)
+	if root, err := spawn.ReviewsDir(); err == nil {
+		if ents, _ := os.ReadDir(root); len(ents) != 0 {
+			t.Errorf("refused ranges left %d job folders", len(ents))
+		}
+	}
+}
+
+// testChange is the change files of a job started by hand, as qm spawn review
+// makes them.
+func testChange() *reviewin.Change {
+	return &reviewin.Change{
+		Summary: reviewin.Summary{Spec: "main...HEAD", Mode: "...", Left: "1111", Right: "2222", Head: "2222"},
+		Files:   []reviewin.File{{Name: "change.diff", Data: []byte("diff\n")}, {Name: "commits.txt", Data: []byte("commit 2222\n")}, {Name: "files.txt", Data: []byte("added\tremoved\tpath\n")}},
 	}
 }

@@ -528,67 +528,174 @@ func TestScriptNamesUnique(t *testing.T) {
 	}
 }
 
+// realTemp is a temporary folder with symlinks resolved (on macOS /var is a
+// link to /private/var), the form qm's lookup returns.
+func realTemp(t *testing.T) string {
+	t.Helper()
+	d, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+// locate is Locate for a qm called as exe, whose running path is what exe
+// resolves to.
+func locate(t *testing.T, exe string) Install {
+	t.Helper()
+	running, err := filepath.EvalSymlinks(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Locate(exe, running)
+}
+
+func link(t *testing.T, target, name string) {
+	t.Helper()
+	mkdir(t, filepath.Dir(name))
+	if err := os.Symlink(target, name); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWorkerPluginDirLookup(t *testing.T) {
 	t.Setenv("QM_WORKER_PLUGIN", "")
-	real := func(t *testing.T, p string) string {
+	eq := func(t *testing.T, in Install, bin, plugin string) {
 		t.Helper()
-		r, err := filepath.EvalSymlinks(p)
-		if err != nil {
-			t.Fatal(err)
+		if in.Err != nil || in.Bin != bin || in.Plugin != plugin {
+			t.Errorf("Bin %q, Plugin %q, %v; want %q, %q", in.Bin, in.Plugin, in.Err, bin, plugin)
 		}
-		return r
 	}
 
-	t.Run("share layout through a symlinked bin", func(t *testing.T) {
-		prefix := t.TempDir()
-		share := filepath.Join(prefix, "share", "quartermaster", "plugins", "qm-worker")
-		mkdir(t, share)
+	t.Run("share layout", func(t *testing.T) {
+		prefix := realTemp(t)
+		mkdir(t, filepath.Join(prefix, "share", "quartermaster", "plugins", "qm-worker"))
 		exe := writeFile(t, filepath.Join(prefix, "bin", "qm"), "")
-		links := t.TempDir()
-		link := filepath.Join(links, "qm")
-		if err := os.Symlink(exe, link); err != nil {
-			t.Fatal(err)
-		}
-		got, err := WorkerPluginDir(link)
-		if err != nil || got != real(t, share) {
-			t.Errorf("got %q, %v; want %s", got, err, share)
-		}
+		eq(t, locate(t, exe), filepath.Join(prefix, "bin"), filepath.Join(prefix, "share", "quartermaster", "plugins", "qm-worker"))
 	})
 	t.Run("repository layout", func(t *testing.T) {
-		repo := t.TempDir()
-		plug := filepath.Join(repo, "plugins", "qm-worker")
-		mkdir(t, plug)
+		repo := realTemp(t)
+		mkdir(t, filepath.Join(repo, "plugins", "qm-worker"))
 		exe := writeFile(t, filepath.Join(repo, "bin", "qm"), "")
-		got, err := WorkerPluginDir(exe)
-		if err != nil || got != real(t, plug) {
-			t.Errorf("got %q, %v; want %s", got, err, plug)
-		}
+		eq(t, locate(t, exe), filepath.Join(repo, "bin"), filepath.Join(repo, "plugins", "qm-worker"))
 	})
 	t.Run("unpacked release archive", func(t *testing.T) {
-		dir := t.TempDir()
-		share := filepath.Join(dir, "share", "quartermaster", "plugins", "qm-worker")
-		mkdir(t, share)
+		dir := realTemp(t)
+		mkdir(t, filepath.Join(dir, "share", "quartermaster", "plugins", "qm-worker"))
 		exe := writeFile(t, filepath.Join(dir, "qm"), "")
-		got, err := WorkerPluginDir(exe)
-		if err != nil || got != real(t, share) {
-			t.Errorf("got %q, %v; want %s", got, err, share)
+		eq(t, locate(t, exe), dir, filepath.Join(dir, "share", "quartermaster", "plugins", "qm-worker"))
+	})
+	t.Run("a link elsewhere does not pick up a stray plugin folder", func(t *testing.T) {
+		repo := realTemp(t)
+		real := writeFile(t, filepath.Join(repo, "bin", "qm"), "")
+		mkdir(t, filepath.Join(repo, "plugins", "qm-worker"))
+		tools := realTemp(t)
+		mkdir(t, filepath.Join(tools, "share", "quartermaster", "plugins", "qm-worker"))
+		l := filepath.Join(tools, "bin", "qm")
+		link(t, real, l)
+		eq(t, locate(t, l), filepath.Join(repo, "bin"), filepath.Join(repo, "plugins", "qm-worker"))
+	})
+	t.Run("a .. after a symlink keeps its meaning", func(t *testing.T) {
+		root := realTemp(t)
+		sub := filepath.Join(root, "sub")
+		mkdir(t, filepath.Join(sub, "deep"))
+		mkdir(t, filepath.Join(sub, "plugins", "qm-worker"))
+		real := writeFile(t, filepath.Join(sub, "bin", "qm"), "")
+		front := filepath.Join(root, "front")
+		link(t, filepath.Join(sub, "deep"), filepath.Join(front, "link"))
+		invoked := front + "/link/../bin/qm" // not cleaned: front/bin/qm does not exist
+		in := Locate(invoked, real)
+		eq(t, in, filepath.Join(sub, "bin"), filepath.Join(sub, "plugins", "qm-worker"))
+		// without the running path, the symlinks are read before the ..
+		eq(t, Locate(invoked, ""), filepath.Join(sub, "bin"), filepath.Join(sub, "plugins", "qm-worker"))
+	})
+
+	t.Run("homebrew: every way qm is called", func(t *testing.T) {
+		h := newKegs(t, false)
+		for name, exe := range map[string]string{
+			"prefix bin link": h.called,
+			"direct keg call": h.kegQM,
+			"renamed link":    h.renamed(t),
+			"through the opt": filepath.Join(h.optBin()+"", "qm"),
+		} {
+			t.Run(name, func(t *testing.T) { eq(t, locate(t, exe), h.optBin(), h.optPlugin()) })
 		}
 	})
+	t.Run("homebrew: Cellar on separate storage", func(t *testing.T) {
+		h := newKegs(t, true)
+		for name, exe := range map[string]string{
+			"prefix bin link": h.called,
+			"through the opt": filepath.Join(h.optBin(), "qm"),
+		} {
+			t.Run(name, func(t *testing.T) { eq(t, locate(t, exe), h.optBin(), h.optPlugin()) })
+		}
+		// A direct call into the separate storage names no prefix at all: the
+		// resolved paths are used.
+		eq(t, locate(t, h.kegQM), h.kegBin(), filepath.Join(h.keg, "share", "quartermaster", "plugins", "qm-worker"))
+	})
+	t.Run("homebrew: the recorded paths survive an upgrade", func(t *testing.T) {
+		h := newKegs(t, false)
+		in := locate(t, h.called)
+		h.upgrade(t)
+		for _, p := range []string{in.Bin, in.Plugin, filepath.Join(in.Bin, "qm")} {
+			if _, err := os.Stat(p); err != nil {
+				t.Errorf("after the upgrade %s: %v", p, err)
+			}
+		}
+	})
+	t.Run("homebrew: opt pointing at another keg is not used", func(t *testing.T) {
+		h := newKegs(t, false)
+		oldQM := h.kegQM
+		oldKeg := h.keg
+		h.upgrade(t)
+		// keg 1.0 comes back as a stale keg while opt names 2.0
+		mkdir(t, filepath.Join(oldKeg, "share", "quartermaster", "plugins", "qm-worker"))
+		writeFile(t, oldQM, "")
+		eq(t, locate(t, oldQM), filepath.Join(oldKeg, "bin"), filepath.Join(oldKeg, "share", "quartermaster", "plugins", "qm-worker"))
+	})
+	t.Run("homebrew: invoked through a link that was repointed to the new keg", func(t *testing.T) {
+		h := newKegs(t, false)
+		running := h.kegQM
+		next := h.nextKeg(t) // opt and prefix/bin/qm now name 2.0; 1.0 still runs
+		_ = next
+		eq(t, Locate(h.called, running), h.kegBin(), filepath.Join(h.keg, "share", "quartermaster", "plugins", "qm-worker"))
+	})
+	t.Run("homebrew: opt/bin linking to a shared bin is not used", func(t *testing.T) {
+		h := newKegs(t, false)
+		opt := filepath.Join(h.prefix, "opt", "quartermaster")
+		if err := os.Remove(opt); err != nil {
+			t.Fatal(err)
+		}
+		mkdir(t, opt)
+		link(t, filepath.Join(h.prefix, "bin"), filepath.Join(opt, "bin"))
+		link(t, filepath.Join(h.keg, "share"), filepath.Join(opt, "share"))
+		eq(t, locate(t, h.called), h.kegBin(), filepath.Join(h.keg, "share", "quartermaster", "plugins", "qm-worker"))
+	})
+	t.Run("homebrew: opt whose plugin is another folder is not used", func(t *testing.T) {
+		h := newKegs(t, false)
+		opt := filepath.Join(h.prefix, "opt", "quartermaster")
+		if err := os.Remove(opt); err != nil {
+			t.Fatal(err)
+		}
+		mkdir(t, filepath.Join(opt, "share", "quartermaster", "plugins", "qm-worker")) // exists, but not the bundled one
+		link(t, h.kegBin(), filepath.Join(opt, "bin"))
+		eq(t, locate(t, h.called), h.kegBin(), filepath.Join(h.keg, "share", "quartermaster", "plugins", "qm-worker"))
+	})
 	t.Run("neither", func(t *testing.T) {
-		dir := t.TempDir()
+		dir := realTemp(t)
 		exe := writeFile(t, filepath.Join(dir, "bin", "qm"), "")
-		_, err := WorkerPluginDir(exe)
+		_, err := locate(t, exe).PluginDir()
 		if err == nil {
 			t.Fatal("want an error")
 		}
 		for _, p := range []string{"share/quartermaster/plugins/qm-worker", "plugins/qm-worker"} {
-			if !strings.Contains(err.Error(), filepath.Join(real(t, dir), p)) {
+			if !strings.Contains(err.Error(), filepath.Join(dir, p)) {
 				t.Errorf("error %q does not list %s", err, p)
 			}
 		}
 	})
 	t.Run("QM_WORKER_PLUGIN", func(t *testing.T) {
-		dir := t.TempDir()
+		dir := realTemp(t)
 		t.Setenv("QM_WORKER_PLUGIN", dir)
 		if got, err := WorkerPluginDir("/nonexistent/qm"); err != nil || got != dir {
 			t.Errorf("got %q, %v; want %s", got, err, dir)
@@ -598,6 +705,77 @@ func TestWorkerPluginDirLookup(t *testing.T) {
 			t.Error("a missing QM_WORKER_PLUGIN folder: want an error")
 		}
 	})
+}
+
+// kegSet is a hand-made Homebrew prefix: a keg under Cellar holding qm and the
+// plugin, <prefix>/bin/qm a link into it, and <prefix>/opt/quartermaster a
+// link to the keg. With separate set, Cellar is a link to another folder.
+type kegSet struct {
+	prefix, keg, kegQM, called string
+}
+
+func newKegs(t *testing.T, separate bool) kegSet {
+	t.Helper()
+	prefix := realTemp(t)
+	h := kegSet{prefix: prefix}
+	if separate {
+		link(t, realTemp(t), filepath.Join(prefix, "Cellar"))
+	}
+	h.keg = filepath.Join(prefix, "Cellar", "quartermaster", "1.0")
+	mkdir(t, filepath.Join(h.keg, "share", "quartermaster", "plugins", "qm-worker"))
+	h.kegQM = writeFile(t, filepath.Join(h.keg, "bin", "qm"), "")
+	if separate {
+		r, err := filepath.EvalSymlinks(h.kegQM)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.kegQM = r
+		h.keg = filepath.Dir(filepath.Dir(r))
+	}
+	h.called = filepath.Join(prefix, "bin", "qm")
+	link(t, h.kegQM, h.called)
+	link(t, h.keg, filepath.Join(prefix, "opt", "quartermaster"))
+	return h
+}
+
+func (h kegSet) kegBin() string { return filepath.Dir(h.kegQM) }
+func (h kegSet) optBin() string { return filepath.Join(h.prefix, "opt", "quartermaster", "bin") }
+func (h kegSet) optPlugin() string {
+	return filepath.Join(h.prefix, "opt", "quartermaster", "share", "quartermaster", "plugins", "qm-worker")
+}
+
+// renamed is a link to qm under another name, beside the prefix bin link.
+func (h kegSet) renamed(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(h.prefix, "bin", "qm-preview")
+	link(t, h.kegQM, p)
+	return p
+}
+
+// nextKeg installs keg 2.0 and repoints opt and the prefix bin link to it, as
+// brew upgrade does before it removes the old keg.
+func (h kegSet) nextKeg(t *testing.T) string {
+	t.Helper()
+	next := filepath.Join(h.prefix, "Cellar", "quartermaster", "2.0")
+	mkdir(t, filepath.Join(next, "share", "quartermaster", "plugins", "qm-worker"))
+	nextQM := writeFile(t, filepath.Join(next, "bin", "qm"), "")
+	for _, l := range []string{filepath.Join(h.prefix, "opt", "quartermaster"), h.called} {
+		if err := os.Remove(l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link(t, next, filepath.Join(h.prefix, "opt", "quartermaster"))
+	link(t, nextQM, h.called)
+	return next
+}
+
+// upgrade is nextKeg followed by the removal of keg 1.0.
+func (h kegSet) upgrade(t *testing.T) {
+	t.Helper()
+	h.nextKeg(t)
+	if err := os.RemoveAll(h.keg); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestReviewSessionDropsCodex(t *testing.T) {
@@ -655,6 +833,35 @@ func TestScriptPathFromExe(t *testing.T) {
 	real, _ := filepath.EvalSymlinks(filepath.Dir(exe))
 	if want := "PATH=" + launch.Quote(real) + ":"; !strings.Contains(res.Script, want) {
 		t.Errorf("script lacks %q:\n%s", want, res.Script)
+	}
+}
+
+// With QM_WORKER_PLUGIN cleared, a worker started from a Homebrew prefix gets
+// the opt link's plugin folder and PATH entry, and they survive an upgrade.
+func TestWorkerScriptUsesStableBrewPaths(t *testing.T) {
+	hermetic(t)
+	t.Setenv("QM_WORKER_PLUGIN", "")
+	repo := repoWith(t, "README.md")
+	h := newKegs(t, false)
+	deps := testDeps(&fakeLauncher{})
+	deps.Exe, deps.Running = h.called, h.kegQM
+	req := request(t, repo, "docs")
+	req.DryRun = true
+	res, err := Worker(context.Background(), req, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"PATH=" + launch.Quote(h.optBin()) + ":", "--plugin-dir " + launch.Quote(h.optPlugin())} {
+		if !strings.Contains(res.Script, want) {
+			t.Errorf("script lacks %q:\n%s", want, res.Script)
+		}
+	}
+	if strings.Contains(res.Script, "Cellar") {
+		t.Errorf("script names the Cellar:\n%s", res.Script)
+	}
+	h.upgrade(t)
+	if !isDir(h.optPlugin()) || !isDir(h.optBin()) {
+		t.Error("recorded paths do not resolve after the upgrade")
 	}
 }
 

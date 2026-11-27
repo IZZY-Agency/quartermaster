@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.1
+
+- **Reviewers get the change from qm.** Before a review, qm writes the change
+  into the review's folder: the diff (`change.diff`), the commits, the changed
+  files and, when the branch has an open pull request at that commit, its
+  title and body. The prompt points to them, and to the repository's
+  `CLAUDE.md` and `AGENTS.md`. A Claude reviewer has no Bash: a hook or rule
+  that rewrites `git` (most Claude reviews had their git calls denied) no
+  longer leaves it without the diff. It loads only your user settings, so the
+  reviewed repository's own settings and hooks do not run in it.
+- **`qm spawn review --diff A..B`** (and `qm route review`) reviews one range,
+  for example the commits of a fix round; the size used to route follows it.
+  An empty range, a diff over 20 MB, and `A..B` where A is not an ancestor
+  of B (after a rebase) are refused before anything starts.
+- **Workers survive `brew upgrade`.** A worker's plugin folder and the qm
+  folder on its PATH are Homebrew's `opt/quartermaster` link when that link is
+  the running qm, so an upgrade no longer removes them from under running
+  workers (their hooks used to fail until restarted).
+- Every file in a review's folder is readable by you only, Codex's reply
+  included.
+
 ## 0.4.0
 
 - **`qm finish NAME`** cleans up a worker whose pull request is merged, in

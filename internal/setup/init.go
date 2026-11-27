@@ -86,40 +86,8 @@ const (
 
 // Tests replace these.
 var (
-	executable = invokedExecutable
+	executable = paths.InvokedExecutable
 )
-
-// invokedExecutable is qm's path as the user invoked it (os.Args[0], looked
-// up on PATH when it has no slash) when that names the running binary, else
-// os.Executable. On Linux os.Executable reads /proc/self/exe, which resolves
-// symlinks: a Linuxbrew install would get the versioned Cellar path, gone
-// after an upgrade, where the invoked path is the stable link.
-func invokedExecutable() (string, error) {
-	return invokedPath(os.Args[0], exec.LookPath, os.Executable)
-}
-
-func invokedPath(arg0 string, look func(string) (string, error), exe func() (string, error)) (string, error) {
-	self, err := exe()
-	if err != nil {
-		return "", err
-	}
-	p := arg0
-	if !strings.Contains(p, "/") {
-		if p, err = look(p); err != nil {
-			return self, nil
-		}
-	}
-	abs, err := filepath.Abs(p)
-	if err != nil {
-		return self, nil
-	}
-	a, err1 := filepath.EvalSymlinks(abs)
-	b, err2 := filepath.EvalSymlinks(self)
-	if err1 != nil || err2 != nil || a != b {
-		return self, nil
-	}
-	return abs, nil
-}
 
 // Init is qm init: it writes or completes the config, reports the providers,
 // asks for the TypeSafe key, offers to wrap the status line, records what it

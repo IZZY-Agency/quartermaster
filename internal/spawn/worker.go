@@ -66,7 +66,10 @@ type Deps struct {
 	// Trusted reports whether Claude Code trusts a folder; nil skips the
 	// check.
 	Trusted func(dir string) (bool, error)
-	Exe     string // qm's own executable
+	// Exe is the path qm was invoked as ("" when unknown); Running is the
+	// running executable with symlinks resolved, read once with Exe
+	// (paths.Executable). Both only locate the plugin and qm's folder.
+	Exe, Running string
 	// Mark, when set, amends the decision before it is used (fake Jev).
 	Mark func(route.Decision) route.Decision
 }
@@ -153,14 +156,12 @@ func Worker(ctx context.Context, req WorkerRequest, deps Deps) (Result, error) {
 	if err != nil {
 		return res, err
 	}
-	workerDir, err := WorkerPluginDir(deps.Exe)
+	inst := Locate(deps.Exe, deps.Running)
+	workerDir, err := inst.PluginDir()
 	if err != nil {
 		return res, err
 	}
-	qmDir := ""
-	if exe, err := filepath.EvalSymlinks(deps.Exe); err == nil {
-		qmDir = filepath.Dir(exe)
-	}
+	qmDir := inst.Bin
 	enabled, err := EnabledPlugins(repo)
 	if err != nil {
 		return res, err

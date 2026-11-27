@@ -30,7 +30,7 @@ var (
 	// procExe reads the executable a process runs, for the same.
 	procExe = spawn.ProcExe
 	// executable is qm's own path, for the qm-worker plugin lookup.
-	executable = os.Executable
+	executable = paths.InvokedExecutable
 )
 
 // helperTimeout bounds "qm-privcheck status".

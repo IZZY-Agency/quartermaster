@@ -52,6 +52,7 @@ func spawnReview(args []string, stdout, stderr io.Writer) int {
 	promptFile := fs.String("prompt", "", "the review prompt file")
 	round := fs.Int("round", 0, "review round (default: 1 plus the reviews logged for this branch)")
 	base := fs.String("base", "", "the ref the diff under review is taken against (default: origin/HEAD's branch, else "+reviewin.DefaultBase+")")
+	diff := fs.String("diff", "", "review this range, A..B or A...B (e.g. the commits of one fix round), instead of BASE...HEAD; the size used to route follows it")
 	repo := fs.String("repo", ".", "the repository under review")
 	wait := fs.Bool("wait", false, "wait for the review to end and print its findings")
 	force := fs.String("force", "", "override the table, model/effort: a Claude tier or a Codex one (needs --why)")
@@ -66,7 +67,7 @@ func spawnReview(args []string, stdout, stderr io.Writer) int {
 		case *status != "":
 			err = reviewStatus(*status, *wait, stdout)
 		default:
-			err = newReview(reviewRequest{prompt: *promptFile, round: *round, base: *base, repo: *repo, force: *force, why: *why, wait: *wait}, stdout, stderr)
+			err = newReview(reviewRequest{prompt: *promptFile, round: *round, base: *base, diff: *diff, repo: *repo, force: *force, why: *why, wait: *wait}, stdout, stderr)
 		}
 	}
 	switch {
@@ -83,9 +84,25 @@ func spawnReview(args []string, stdout, stderr io.Writer) int {
 }
 
 type reviewRequest struct {
-	prompt, base, repo, force, why string
-	round                          int
-	wait                           bool
+	prompt, base, diff, repo, force, why string
+	round                                int
+	wait                                 bool
+}
+
+// reviewInput is the input of a review, from reviewin.ForRange, refused when
+// the range has no change in it: a review started in the wrong folder (the
+// main checkout, for a branch that lives in a worktree) would be sized and
+// counted for the wrong branch, and the reviewer would be given nothing to
+// review. qm route review is the preview of qm spawn review and refuses alike.
+func reviewInput(repo, base, diff, prompt string, round int) (route.ReviewInput, reviewin.Range, error) {
+	in, rng, err := reviewin.ForRange(repo, base, diff, prompt, round)
+	if err != nil {
+		return in, rng, err
+	}
+	if in.DiffFiles == 0 {
+		return in, rng, fmt.Errorf("%s has no changes in git diff %s, so there is nothing to review; commit the change, run qm in the folder of the branch under review, or pass --repo, --base or --diff", branchLabel(rng.Branch), rng.Spec)
+	}
+	return in, rng, nil
 }
 
 func newReview(r reviewRequest, stdout, stderr io.Writer) error {
@@ -103,29 +120,22 @@ func newReview(r reviewRequest, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	in, err := reviewin.For(r.repo, r.base, r.prompt, r.round)
+	in, rng, err := reviewInput(r.repo, r.base, r.diff, r.prompt, r.round)
 	if err != nil {
 		return err
 	}
+	branch := rng.Branch
 	if forced != nil && slices.Contains(policy.CodexModels, forced.Model) {
 		in.ForceCodex = &route.CodexTier{Model: forced.Model, Effort: forced.Effort}
 	} else {
 		in.Force = forced
 	}
-	_, branch, err := reviewin.Repo(in.Repo)
+
+	// The change is read before the job exists, so a failure leaves no job
+	// behind, and the files are those of the commits the size was taken from.
+	change, err := reviewin.BuildChange(in.Repo, rng)
 	if err != nil {
-		return err
-	}
-	if in.DiffLines == 0 && in.DiffFiles == 0 {
-		// A review started in the wrong folder (the main checkout, for a
-		// branch that lives in a worktree) is sized and counted for the
-		// wrong branch; say so, the reviewer may still be given the diff
-		// by its prompt.
-		counted := "its round is counted for that branch"
-		if branch == "" {
-			counted = "with no --round its round is 1, a detached HEAD having no branch history to count"
-		}
-		_, _ = fmt.Fprintf(stderr, "note: %s has no diff against its base, so the review is sized without one and %s; run qm spawn review in the folder of the branch under review, or pass --repo\n", branchLabel(branch), counted)
+		return fmt.Errorf("reading the change under review: %w", err)
 	}
 
 	deps, err := routeDeps()
@@ -139,7 +149,7 @@ func newReview(r reviewRequest, stdout, stderr io.Writer) error {
 	d = deps.mark(d)
 
 	rec := route.Record{Project: in.Repo, Branch: branch, Round: in.Round, Override: strings.TrimSpace(r.why)}
-	dir, err := spawn.NewReviewJob(spawn.ReviewJob{Repo: in.Repo, Decision: d, Record: rec}, []byte(in.Prompt))
+	dir, err := spawn.NewReviewJob(spawn.ReviewJob{Repo: in.Repo, Decision: d, Record: rec}, []byte(in.Prompt), change)
 	if err != nil {
 		return err
 	}

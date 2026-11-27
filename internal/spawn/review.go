@@ -23,6 +23,7 @@ import (
 	"github.com/IZZY-Agency/quartermaster/internal/limits"
 	"github.com/IZZY-Agency/quartermaster/internal/paths"
 	"github.com/IZZY-Agency/quartermaster/internal/policy"
+	"github.com/IZZY-Agency/quartermaster/internal/reviewin"
 	"github.com/IZZY-Agency/quartermaster/internal/route"
 )
 
@@ -57,10 +58,14 @@ const (
 // ReviewJob is one review: what route decided and the decision-log record to
 // write when it ends. ID is set by NewReviewJob.
 type ReviewJob struct {
-	ID       string         `json:"id"`
-	Repo     string         `json:"repo"`
-	Decision route.Decision `json:"decision"`
-	Record   route.Record   `json:"record"`
+	ID string `json:"id"`
+	// Change is what the job's change files cover (reviewin.BuildChange); a
+	// job without it was made by an older qm, which handed the reviewer no
+	// files, and does not run.
+	Change   *reviewin.Summary `json:"change,omitempty"`
+	Repo     string            `json:"repo"`
+	Decision route.Decision    `json:"decision"`
+	Record   route.Record      `json:"record"`
 }
 
 // Finding is one review finding.
@@ -111,9 +116,12 @@ func ReviewJobDir(id string) (string, error) {
 }
 
 // NewReviewJob creates the job's folder (0700) under ReviewsDir with the
-// job, the prompt, the findings schema and status "running"; it returns the
-// folder. The job's ID is set here.
-func NewReviewJob(job ReviewJob, prompt []byte) (string, error) {
+// job, the prompt, the findings schema, the change files (change, from
+// reviewin.BuildChange; nil for a job that has none) and status "running"; it
+// returns the folder. The job's ID is set here. The status is written last,
+// and the folder is removed when anything fails, so no job is left running
+// without what it needs.
+func NewReviewJob(job ReviewJob, prompt []byte, change *reviewin.Change) (string, error) {
 	parent, err := ReviewsDir()
 	if err != nil {
 		return "", err
@@ -126,23 +134,37 @@ func NewReviewJob(job ReviewJob, prompt []byte) (string, error) {
 		return "", err
 	}
 	job.ID = time.Now().UTC().Format("20060102-150405") + "-" + hex.EncodeToString(suffix)
-	dir := filepath.Join(parent, job.ID)
-	if err := os.Mkdir(dir, 0o700); err != nil {
+	folder := filepath.Join(parent, job.ID)
+	if err := os.Mkdir(folder, 0o700); err != nil {
 		return "", err
+	}
+	// One cleanup for every failure below: a return sets dir to "" before
+	// this runs, so the folder is named by its own variable.
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.RemoveAll(folder)
+		}
+	}()
+	var extra []reviewin.File
+	if change != nil {
+		job.Change, extra = &change.Summary, change.Files
 	}
 	b, err := json.MarshalIndent(job, "", "  ")
 	if err != nil {
 		return "", err
 	}
-	for name, data := range map[string][]byte{jobFile: append(b, '\n'), promptFile: prompt, schemaFile: FindingsSchema} {
-		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
+	files := []reviewin.File{{Name: jobFile, Data: append(b, '\n')}, {Name: promptFile, Data: prompt}, {Name: schemaFile, Data: FindingsSchema}}
+	for _, f := range append(files, extra...) {
+		if err := os.WriteFile(filepath.Join(folder, f.Name), f.Data, 0o600); err != nil {
 			return "", err
 		}
 	}
-	if err := writeStatus(dir, StatusRunning); err != nil {
+	if err := writeStatus(folder, StatusRunning); err != nil {
 		return "", err
 	}
-	return dir, nil
+	ok = true
+	return folder, nil
 }
 
 // ReviewStatus reads a job's status: running, done or failed.
@@ -198,23 +220,32 @@ const DefaultReviewTimeout = 45 * time.Minute
 // hooks do not fire on the review (preflight F16).
 const reviewerSettings = `{"enabledPlugins":{"qm-coordinator@quartermaster":false}}`
 
-// ClaudeArgs is the claude command line for a reviewer at tier t: print
-// mode, JSON output, reading tools only. --tools leaves only Read, Grep, Glob
-// and Bash (naming Grep and Glob also brings them back on builds that search
-// through Bash), --strict-mcp-config with no --mcp-config loads no MCP
-// server, the allowlist names the Bash commands it may run, edits, writes and
-// MCP tools are denied, and dontAsk turns any other call that would prompt
-// into a denial. The user's own allow rules and hooks still apply. The
+// ClaudeArgs is the claude command line for a reviewer at tier t, whose job
+// folder is dir: print mode, JSON output, reading tools only. --tools leaves
+// only Read, Grep and Glob, with no Bash: the change reaches the reviewer as
+// files (reviewin.BuildChange makes them, NewReviewJob writes them), so it
+// needs no git or gh, which a user's hook or rule can make unusable.
+// --strict-mcp-config with no --mcp-config loads no MCP server, edits, writes
+// and MCP tools are denied, and dontAsk turns any other call that would
+// prompt into a denial. The reviewer starts in the repository under review,
+// so it loads only the user's settings (--setting-sources user): that
+// repository's project and local settings and its hooks do not load, since
+// they are part of the code under review, not something the reviewer should
+// run. Its rule files (CLAUDE.md and the like, reviewin.RuleFiles), which
+// that also leaves out, are handed over as files named in the prompt
+// section. The user's own allow rules and hooks still apply. --add-dir makes the job folder,
+// which holds the change files and lies outside the repository, readable even
+// where Claude Code blocks file reads outside the working directory. The
 // prompt goes on stdin.
-func ClaudeArgs(t route.Tier) ([]string, error) {
+func ClaudeArgs(t route.Tier, dir string) ([]string, error) {
 	id, ok := policy.ModelIDs[t.Model]
 	if !ok {
 		return nil, fmt.Errorf("no Claude model id for %q", t.Model)
 	}
 	return []string{"-p", "--model", id, "--effort", t.Effort, "--output-format", "json",
 		"--settings", reviewerSettings, "--permission-mode", "dontAsk",
-		"--tools", "Read,Grep,Glob,Bash", "--strict-mcp-config",
-		"--allowedTools", "Read", "Grep", "Glob", "Bash(git diff *)", "Bash(git log *)", "Bash(gh pr view *)", "Bash(gh pr diff *)",
+		"--setting-sources", "user", "--add-dir", dir, "--tools", "Read,Grep,Glob", "--strict-mcp-config",
+		"--allowedTools", "Read", "Grep", "Glob",
 		"--disallowedTools", "Edit", "Write", "NotebookEdit", "mcp__*"}, nil
 }
 
@@ -255,6 +286,15 @@ func (r ReviewRunner) Run(ctx context.Context, dir string) error {
 	if err != nil {
 		return r.fail(dir, job, err)
 	}
+	// The change files qm wrote at spawn time go to every reviewer, Codex and
+	// Claude alike. A job without them was made by an older qm.
+	if job.Change == nil {
+		return r.fail(dir, job, errors.New("the job was created by an older qm, which wrote no change files; start the review again"))
+	}
+	if err := reviewin.Check(dir); err != nil {
+		return r.fail(dir, job, err)
+	}
+	prompt = append(bytes.TrimRight(prompt, "\n"), reviewin.Section(dir, job.Repo, *job.Change)...)
 
 	d := job.Decision
 	var f Findings
@@ -373,7 +413,18 @@ func signaled(err error) bool {
 // file last, which is removed first. A usage-limit error marks login, the one
 // Codex starts under, limited and returns errCodexLimited.
 func (r ReviewRunner) runCodex(ctx context.Context, login limits.Login, last, repo string, c route.CodexTier, prompt string, log io.Writer) (Findings, error) {
+	if err := reviewin.Check(filepath.Dir(last)); err != nil {
+		return Findings{}, err
+	}
 	if err := os.Remove(last); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return Findings{}, err
+	}
+	// Codex writes its last message to last (-o), with its own mode when it
+	// makes the file; made here first, and set again after the run, the file
+	// is private like the rest of the folder.
+	if f, err := os.OpenFile(last, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600); err != nil {
+		return Findings{}, err
+	} else if err := f.Close(); err != nil {
 		return Findings{}, err
 	}
 	var out bytes.Buffer
@@ -383,7 +434,11 @@ func (r ReviewRunner) runCodex(ctx context.Context, login limits.Login, last, re
 	cmd.Stdout = io.MultiWriter(log, &out)
 	cmd.Stderr = cmd.Stdout
 	runErr := cmd.Run()
+	_ = os.Chmod(last, 0o600) // a missing file is the read error below
 	reply, readErr := os.ReadFile(last)
+	if readErr == nil && len(bytes.TrimSpace(reply)) == 0 {
+		readErr = errors.New("its last message is empty")
+	}
 	if runErr == nil && readErr == nil {
 		return ParseFindings(reply)
 	}
@@ -467,7 +522,10 @@ const reviewerInstructions = "\n\nReply with JSON only, no other text, matching 
 // with qm-coordinator off, QM_ROLE=reviewer (preflight F16). Its raw reply is
 // kept in reply.txt.
 func (r ReviewRunner) runClaude(ctx context.Context, dir, repo string, t route.Tier, prompt string, log io.Writer) (Findings, error) {
-	args, err := ClaudeArgs(t)
+	if err := reviewin.Check(dir); err != nil {
+		return Findings{}, err
+	}
+	args, err := ClaudeArgs(t, dir)
 	if err != nil {
 		return Findings{}, err
 	}

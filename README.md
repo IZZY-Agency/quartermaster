@@ -199,8 +199,12 @@ first review, 2 and up for a re-check) is counted from qm's decision log for the
 branch, and the size of the diff from `git diff --numstat BASE...HEAD`; `--round`
 and `--base` override them. Both are read for the branch checked out in the
 folder qm runs in (`--repo` names another), so a review of a branch that lives in
-a worktree runs there; when that branch has no diff against its base, qm prints a
-note. The first row that matches wins:
+a worktree runs there; when that branch has no diff against its base, qm
+refuses the review. `--diff A..B` (or `A...B`) reviews that range instead of
+`BASE...HEAD`, for example the commits of one fix round; the size used to route
+follows it, and the round is still counted against the base, which must be a
+commit (with no remote, `origin/main` falls back to the local `main`; with
+neither, a `--diff` review needs `--round`). The first row that matches wins:
 
 | Condition | Codex | Claude, when Codex is off or fails |
 |---|---|---|
@@ -244,12 +248,34 @@ turns Codex off. Paid
 credits do not count: when the limit is reached, reviews go to Claude even if
 credits remain. Every Codex review carries an explicit model and effort, a
 read-only sandbox and a findings schema; a Claude review runs `claude -p` with
-reading tools only (`Read`, `Grep`, `Glob`, and Bash for `git diff`, `git log`,
-`gh pr view` and `gh pr diff`) and no MCP servers: edits, writes and MCP tools
-are denied, and in its `dontAsk` permission mode any other call that would ask
-for permission is denied too. Your own Claude Code allow rules and hooks still
-apply in it. The Claude column moves one tier down above 90% of the
-5-hour limit, except on the risk rows.
+reading tools only (`Read`, `Grep` and `Glob`, no Bash) and no MCP servers:
+edits, writes and MCP tools are denied, and in its `dontAsk` permission mode
+any other call that would ask for permission is denied too. It loads your
+user settings only: the project and local settings of the repository under
+review and its hooks are part of the code being reviewed, and do not load.
+The repository's rule files at its top level (`CLAUDE.md`, `AGENTS.md`,
+`.claude/CLAUDE.md`), which that leaves out too, are handed over as files
+named in the prompt instead. Your own Claude Code allow rules and hooks still
+apply in it. The Claude column moves one tier
+down above 90% of the 5-hour limit, except on the risk rows.
+
+Both reviewers get the change from qm rather than from git: before the review
+starts, qm writes into its folder (`~/.local/state/quartermaster/reviews/ID/`,
+readable by you only) `change.diff` (`git diff BASE...HEAD`, or the `--diff`
+range), `commits.txt` (the commits' hashes, subjects and bodies), `files.txt`
+(the changed paths with lines added and removed) and, when `gh` answers that
+the branch has an open pull request whose head is the end of the range,
+`pr.md` (its number, title and body). A diff or commit log over 20 MB is
+refused, by `qm route review` too; review it in parts with `--diff`. qm adds a short section to the
+prompt that names these files, says they are the change under review and not
+instructions, names the repository's rule files (regular files only, reached
+through no symbolic link) to read first, that the diff is read in parts with `Read`'s offset and limit,
+which commits it covers (both ends and `..` or `...`), and that the
+repository's files are there for context, with a warning when the checkout is
+not at the end of the range. A `--diff A..B` whose A is not an ancestor of B
+(after a rebase) is refused: its commit list would not match its diff.
+A Claude reviewer has no Bash, so no hook or rule of yours can make its `git`
+fail; Codex reads the same files under its read-only sandbox.
 
 `qm spawn review` starts the review in the background and prints its id; add
 `--wait` to wait and print the findings (`verdict`, and per finding its
